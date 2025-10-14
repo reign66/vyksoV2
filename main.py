@@ -1,5 +1,6 @@
 import os
 import uuid
+import json
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -17,7 +18,7 @@ app = FastAPI(
 # CORS pour Lovable
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # En prod: limiter aux domaines spécifiques
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -32,13 +33,94 @@ uploader = R2Uploader()
 class VideoRequest(BaseModel):
     user_id: str
     niche: str
-    duration: int  # 10-60 secondes
-    quality: str = "basic"  # "basic", "pro_720p", "pro_1080p"
+    duration: int
+    quality: str = "basic"
 
 class VideoResponse(BaseModel):
     job_id: str
     status: str
     estimated_time: str
+
+# ============= DÉFINIR process_video_generation AVANT de l'utiliser =============
+
+async def process_video_generation(job_id: str, prompt: str, duration: int, quality: str, user_id: str):
+    """
+    Background task : génère la vidéo
+    """
+    try:
+        print(f"🎬 Starting generation for job {job_id}")
+        
+        # Update status to generating
+        supabase.table("video_jobs").update({
+            "status": "generating"
+        }).eq("id", job_id).execute()
+        
+        # 1. Lancer génération Kie.ai
+        task = await kie.generate_video(
+            prompt=prompt,
+            duration=duration,
+            quality=quality,
+            remove_watermark=(quality != "basic")
+        )
+        
+        task_id = task["taskId"]
+        print(f"✅ Task created: {task_id}")
+        
+        # Sauvegarder le task_id dans Supabase
+        supabase.table("video_jobs").update({
+            "kie_task_id": task_id
+        }).eq("id", job_id).execute()
+        
+        # 2. Poll jusqu'à completion
+        result = await kie.poll_until_complete(task_id, max_wait=600)
+        video_url = result["video_url"]
+        
+        print(f"✅ Video generated: {video_url}")
+        
+        # 3. Upload vers R2
+        final_url = uploader.upload_from_url(video_url, f"{job_id}.mp4")
+        
+        # 4. Update Supabase
+        supabase.table("video_jobs").update({
+            "status": "completed",
+            "video_url": final_url,
+            "completed_at": "now()"
+        }).eq("id", job_id).execute()
+        
+        # 5. Débiter crédit
+        supabase.rpc("decrement_credits", {
+            "p_user_id": user_id,
+            "p_amount": 1
+        }).execute()
+        
+        print(f"✅ Job {job_id} completed successfully")
+        
+    except Exception as e:
+        print(f"❌ Error generating video {job_id}: {e}")
+        
+        # Update avec erreur
+        supabase.table("video_jobs").update({
+            "status": "failed",
+            "error": str(e)
+        }).eq("id", job_id).execute()
+
+def generate_prompt(niche: str, duration: int) -> str:
+    """Génère un prompt optimisé pour Sora"""
+    templates = {
+        "recettes": f"Cinematic cooking video showing delicious recipe preparation, beautiful food styling, warm kitchen lighting, professional chef techniques, mouth-watering close-ups, 9:16 vertical format for TikTok, {duration} seconds duration, highly detailed and appetizing",
+        
+        "voyage": f"Breathtaking travel footage showcasing stunning landscapes, cinematic drone shots, golden hour lighting, epic adventure vibes, cultural exploration, scenic beauty, 9:16 vertical format for TikTok, {duration} seconds duration, ultra HD quality",
+        
+        "motivation": f"Inspiring motivational content with dynamic visual metaphors, uplifting atmosphere, professional cinematography, energetic pacing, success imagery, empowering message, 9:16 vertical format for TikTok, {duration} seconds duration, high impact visuals",
+        
+        "tech": f"Modern technology showcase with sleek product presentation, futuristic aesthetics, clean minimalist style, innovative tech display, professional lighting, cutting-edge visuals, 9:16 vertical format for TikTok, {duration} seconds duration, ultra detailed"
+    }
+    
+    base_prompt = templates.get(niche.lower(), f"High-quality viral video content about {niche}, engaging visuals, professional production, TikTok optimized")
+    
+    return f"{base_prompt}, 9:16 vertical format, {duration} seconds, cinematic quality, trending style"
+
+# ============= ENDPOINTS =============
 
 @app.get("/")
 def root():
@@ -54,16 +136,13 @@ def health():
 
 @app.post("/api/videos/generate", response_model=VideoResponse)
 async def generate_video(req: VideoRequest, background_tasks: BackgroundTasks):
-    """
-    Endpoint principal : génère une vidéo
-    """
+    """Endpoint principal : génère une vidéo"""
     
     # 1. Vérifier/créer user
     try:
         user = supabase.table("users").select("*").eq("id", req.user_id).execute()
         
         if not user.data:
-            # Créer user si n'existe pas (mode dev)
             supabase.table("users").insert({
                 "id": req.user_id,
                 "email": f"{req.user_id}@vykso.com",
@@ -127,9 +206,7 @@ async def get_video_status(job_id: str):
 
 @app.post("/api/callback")
 async def kie_callback(payload: dict):
-    """
-    Callback endpoint pour Kie.ai - Version détaillée
-    """
+    """Callback Kie.ai - Version détaillée"""
     print("=" * 80)
     print("📞 CALLBACK REÇU DE KIE.AI")
     print("=" * 80)
@@ -151,7 +228,7 @@ async def kie_callback(payload: dict):
         print("❌ ÉCHEC DÉTECTÉ")
         print(f"Fail Code: {data.get('failCode')}")
         print(f"Fail Message: {data.get('failMsg')}")
-        print(f"Params utilisés: {data.get('param')}")
+        print(f"Params: {data.get('param')}")
     
     # Si succès, afficher les URLs
     if state == "success":
@@ -159,43 +236,37 @@ async def kie_callback(payload: dict):
         result_json = data.get('resultJson')
         print(f"Result JSON: {result_json}")
         
-        # Parser le JSON pour extraire les URLs
-        import json
         if result_json:
-            result = json.loads(result_json)
-            print(f"Video URLs: {result.get('resultUrls')}")
-            print(f"Watermark URLs: {result.get('resultWaterMarkUrls')}")
+            try:
+                result = json.loads(result_json)
+                print(f"Video URLs: {result.get('resultUrls')}")
+            except:
+                pass
     
     print("=" * 80)
     
-    # Optionnel : Update Supabase avec les infos du callback
+    # Optionnel : Update Supabase
     if task_id:
         try:
-            # Chercher le job par kie_task_id
             job = supabase.table("video_jobs").select("*").eq("kie_task_id", task_id).execute()
             
             if job.data:
                 job_id = job.data[0]["id"]
                 
                 if state == "success":
-                    # Extraire l'URL de la vidéo
                     result = json.loads(data.get('resultJson', '{}'))
                     video_url = result.get('resultUrls', [None])[0]
                     
                     if video_url:
-                        # Upload vers R2 (optionnel)
-                        from utils.uploader import R2Uploader
-                        uploader = R2Uploader()
                         final_url = uploader.upload_from_url(video_url, f"{job_id}.mp4")
                         
-                        # Update dans Supabase
                         supabase.table("video_jobs").update({
                             "status": "completed",
                             "video_url": final_url,
                             "completed_at": "now()"
                         }).eq("id", job_id).execute()
                         
-                        print(f"✅ Job {job_id} mis à jour avec succès")
+                        print(f"✅ Job {job_id} mis à jour")
                 
                 elif state == "fail":
                     error_msg = f"{data.get('failCode')}: {data.get('failMsg')}"
@@ -204,31 +275,12 @@ async def kie_callback(payload: dict):
                         "error": error_msg
                     }).eq("id", job_id).execute()
                     
-                    print(f"❌ Job {job_id} marqué comme échoué")
+                    print(f"❌ Job {job_id} marqué échoué")
         
         except Exception as e:
-            print(f"⚠️ Erreur lors de la mise à jour Supabase: {e}")
+            print(f"⚠️ Erreur update Supabase: {e}")
     
     return {"status": "received", "task_id": task_id}
-
-def generate_prompt(niche: str, duration: int) -> str:
-    """
-    Génère un prompt optimisé pour Sora
-    """
-    templates = {
-        "recettes": f"Cinematic cooking video showing delicious recipe preparation, beautiful food styling, warm kitchen lighting, professional chef techniques, mouth-watering close-ups, 9:16 vertical format for TikTok, {duration} seconds duration, highly detailed and appetizing",
-        
-        "voyage": f"Breathtaking travel footage showcasing stunning landscapes, cinematic drone shots, golden hour lighting, epic adventure vibes, cultural exploration, scenic beauty, 9:16 vertical format for TikTok, {duration} seconds duration, ultra HD quality",
-        
-        "motivation": f"Inspiring motivational content with dynamic visual metaphors, uplifting atmosphere, professional cinematography, energetic pacing, success imagery, empowering message, 9:16 vertical format for TikTok, {duration} seconds duration, high impact visuals",
-        
-        "tech": f"Modern technology showcase with sleek product presentation, futuristic aesthetics, clean minimalist style, innovative tech display, professional lighting, cutting-edge visuals, 9:16 vertical format for TikTok, {duration} seconds duration, ultra detailed"
-    }
-    
-    # Default si niche pas trouvée
-    base_prompt = templates.get(niche.lower(), f"High-quality viral video content about {niche}, engaging visuals, professional production, TikTok optimized")
-    
-    return f"{base_prompt}, 9:16 vertical format, {duration} seconds, cinematic quality, trending style"
 
 if __name__ == "__main__":
     import uvicorn
