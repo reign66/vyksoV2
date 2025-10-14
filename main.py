@@ -128,69 +128,88 @@ async def get_video_status(job_id: str):
 @app.post("/api/callback")
 async def kie_callback(payload: dict):
     """
-    Callback endpoint pour Kie.ai
-    (optionnel - on poll quand même dans process_video_generation)
+    Callback endpoint pour Kie.ai - Version détaillée
     """
-    print(f"📞 Callback received: {payload}")
-    # On pourrait update le job ici mais on fait déjà le polling
-    return {"status": "received"}
-
-async def process_video_generation(job_id: str, prompt: str, duration: int, quality: str, user_id: str):
-    """
-    Background task : génère la vidéo
-    """
-    try:
-        print(f"🎬 Starting generation for job {job_id}")
+    print("=" * 80)
+    print("📞 CALLBACK REÇU DE KIE.AI")
+    print("=" * 80)
+    print(f"Code: {payload.get('code')}")
+    print(f"Message: {payload.get('msg')}")
+    
+    data = payload.get('data', {})
+    task_id = data.get('taskId')
+    state = data.get('state')
+    
+    print(f"Task ID: {task_id}")
+    print(f"State: {state}")
+    print(f"Model: {data.get('model')}")
+    print(f"Credits consumed: {data.get('consumeCredits')}")
+    print(f"Cost time: {data.get('costTime')}s")
+    
+    # Si échec, afficher les détails
+    if state == "fail":
+        print("❌ ÉCHEC DÉTECTÉ")
+        print(f"Fail Code: {data.get('failCode')}")
+        print(f"Fail Message: {data.get('failMsg')}")
+        print(f"Params utilisés: {data.get('param')}")
+    
+    # Si succès, afficher les URLs
+    if state == "success":
+        print("✅ SUCCÈS")
+        result_json = data.get('resultJson')
+        print(f"Result JSON: {result_json}")
         
-        # Update status to generating
-        supabase.table("video_jobs").update({
-            "status": "generating"
-        }).eq("id", job_id).execute()
+        # Parser le JSON pour extraire les URLs
+        import json
+        if result_json:
+            result = json.loads(result_json)
+            print(f"Video URLs: {result.get('resultUrls')}")
+            print(f"Watermark URLs: {result.get('resultWaterMarkUrls')}")
+    
+    print("=" * 80)
+    
+    # Optionnel : Update Supabase avec les infos du callback
+    if task_id:
+        try:
+            # Chercher le job par kie_task_id
+            job = supabase.table("video_jobs").select("*").eq("kie_task_id", task_id).execute()
+            
+            if job.data:
+                job_id = job.data[0]["id"]
+                
+                if state == "success":
+                    # Extraire l'URL de la vidéo
+                    result = json.loads(data.get('resultJson', '{}'))
+                    video_url = result.get('resultUrls', [None])[0]
+                    
+                    if video_url:
+                        # Upload vers R2 (optionnel)
+                        from utils.uploader import R2Uploader
+                        uploader = R2Uploader()
+                        final_url = uploader.upload_from_url(video_url, f"{job_id}.mp4")
+                        
+                        # Update dans Supabase
+                        supabase.table("video_jobs").update({
+                            "status": "completed",
+                            "video_url": final_url,
+                            "completed_at": "now()"
+                        }).eq("id", job_id).execute()
+                        
+                        print(f"✅ Job {job_id} mis à jour avec succès")
+                
+                elif state == "fail":
+                    error_msg = f"{data.get('failCode')}: {data.get('failMsg')}"
+                    supabase.table("video_jobs").update({
+                        "status": "failed",
+                        "error": error_msg
+                    }).eq("id", job_id).execute()
+                    
+                    print(f"❌ Job {job_id} marqué comme échoué")
         
-        # 1. Lancer génération Kie.ai
-        task = await kie.generate_video(
-            prompt=prompt,
-            duration=duration,
-            quality=quality,
-            remove_watermark=(quality != "basic")  # Enlever watermark pour Pro plans
-        )
-        
-        task_id = task["taskId"]
-        print(f"✅ Task created: {task_id}")
-        
-        # 2. Poll jusqu'à completion (peut prendre 2-5 min)
-        result = await kie.poll_until_complete(task_id, max_wait=600)
-        video_url = result["video_url"]
-        
-        print(f"✅ Video generated: {video_url}")
-        
-        # 3. Upload vers R2
-        final_url = uploader.upload_from_url(video_url, f"{job_id}.mp4")
-        
-        # 4. Update Supabase
-        supabase.table("video_jobs").update({
-            "status": "completed",
-            "video_url": final_url,
-            "kie_task_id": task_id,
-            "completed_at": "now()"
-        }).eq("id", job_id).execute()
-        
-        # 5. Débiter crédit
-        supabase.rpc("decrement_credits", {
-            "p_user_id": user_id,
-            "p_amount": 1
-        }).execute()
-        
-        print(f"✅ Job {job_id} completed successfully")
-        
-    except Exception as e:
-        print(f"❌ Error generating video {job_id}: {e}")
-        
-        # Update avec erreur
-        supabase.table("video_jobs").update({
-            "status": "failed",
-            "error": str(e)
-        }).eq("id", job_id).execute()
+        except Exception as e:
+            print(f"⚠️ Erreur lors de la mise à jour Supabase: {e}")
+    
+    return {"status": "received", "task_id": task_id}
 
 def generate_prompt(niche: str, duration: int) -> str:
     """
