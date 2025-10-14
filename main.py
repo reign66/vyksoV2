@@ -77,7 +77,7 @@ async def process_video_generation(
     user_id: str
 ):
     """
-    Background task : génère la vidéo (peut être multi-clips)
+    Background task : génère la vidéo (SANS POLLING, on attend le callback)
     """
     try:
         print(f"🎬 Starting generation for job {job_id}")
@@ -90,7 +90,7 @@ async def process_video_generation(
         # Calculer le nombre de clips nécessaires
         num_clips = duration // 10
         if duration % 10 > 0:
-            num_clips += 1  # Arrondir au sup
+            num_clips += 1
         
         print(f"📊 Need {num_clips} clips for {duration}s video")
         
@@ -98,7 +98,7 @@ async def process_video_generation(
             # ===== CAS SIMPLE : 1 seul clip (10s) =====
             prompt = generate_prompt(niche, 10)
             
-            # 1. Lancer génération Kie.ai
+            # Lancer génération Kie.ai
             task = await kie.generate_video(
                 prompt=prompt,
                 duration=10,
@@ -109,25 +109,18 @@ async def process_video_generation(
             task_id = task["taskId"]
             print(f"✅ Task created: {task_id}")
             
-            # Sauvegarder le task_id
+            # Sauvegarder le task_id et attendre le callback
             supabase.table("video_jobs").update({
-                "kie_task_id": task_id
+                "kie_task_id": task_id,
+                "status": "waiting_callback"  # Nouveau status
             }).eq("id", job_id).execute()
             
-            # 2. Poll jusqu'à completion
-            result = await kie.poll_until_complete(task_id, max_wait=600)
-            video_url = result["video_url"]
-            
-            print(f"✅ Video generated: {video_url}")
-            
-            # 3. Upload vers R2
-            final_url = uploader.upload_from_url(video_url, f"{job_id}.mp4")
+            print(f"⏳ Task {task_id} submitted, waiting for callback...")
         
         else:
-            # ===== CAS COMPLEXE : Plusieurs clips à concaténer =====
-            print(f"🎥 Generating {num_clips} clips in parallel...")
+            # ===== CAS COMPLEXE : Plusieurs clips =====
+            print(f"🎥 Generating {num_clips} clips...")
             
-            # Créer des prompts pour chaque clip
             tasks = []
             for i in range(num_clips):
                 clip_prompt = generate_prompt(niche, 10, i+1, num_clips)
@@ -143,59 +136,11 @@ async def process_video_generation(
             # Sauvegarder tous les task_ids
             task_ids = [t["taskId"] for t in tasks]
             supabase.table("video_jobs").update({
-                "kie_task_id": json.dumps(task_ids)  # Stocker comme JSON array
+                "kie_task_id": json.dumps(task_ids),
+                "status": "waiting_callback"
             }).eq("id", job_id).execute()
             
-            # Poll tous les clips en parallèle
-            print(f"⏳ Waiting for all {num_clips} clips...")
-            results = await asyncio.gather(*[
-                kie.poll_until_complete(task["taskId"], max_wait=600)
-                for task in tasks
-            ])
-            
-            video_urls = [r["video_url"] for r in results]
-            print(f"✅ All {num_clips} clips generated")
-            
-            # Concaténer les vidéos
-            print(f"🎬 Concatenating {num_clips} clips...")
-            concatenated_video = video_editor.concatenate_videos(
-                video_urls, 
-                f"{job_id}.mp4"
-            )
-            
-            # Upload vers R2
-            print(f"📤 Uploading concatenated video to R2...")
-            video_buffer = BytesIO(concatenated_video)
-            
-            uploader.s3.upload_fileobj(
-                video_buffer,
-                uploader.bucket,
-                f"{job_id}.mp4",
-                ExtraArgs={
-                    'ContentType': 'video/mp4',
-                    'CacheControl': 'public, max-age=31536000',
-                    'ACL': 'public-read'
-                }
-            )
-            
-            final_url = f"{uploader.public_base}/{job_id}.mp4"
-            print(f"✅ Uploaded: {final_url}")
-        
-        # 4. Update Supabase
-        supabase.table("video_jobs").update({
-            "status": "completed",
-            "video_url": final_url,
-            "completed_at": "now()"
-        }).eq("id", job_id).execute()
-        
-        # 5. Débiter crédits (1 crédit par clip de 10s)
-        credits_to_deduct = num_clips
-        supabase.rpc("decrement_credits", {
-            "p_user_id": user_id,
-            "p_amount": credits_to_deduct
-        }).execute()
-        
-        print(f"✅ Job {job_id} completed successfully ({credits_to_deduct} credits used)")
+            print(f"⏳ All {num_clips} tasks submitted, waiting for callbacks...")
         
     except Exception as e:
         print(f"❌ Error generating video {job_id}: {e}")
@@ -205,7 +150,6 @@ async def process_video_generation(
             "status": "failed",
             "error": str(e)
         }).eq("id", job_id).execute()
-
 # ============= ENDPOINTS =============
 
 @app.get("/")
