@@ -251,7 +251,7 @@ async def get_video_status(job_id: str):
 
 @app.post("/api/callback")
 async def kie_callback(payload: dict):
-    """Callback Kie.ai"""
+    """Callback Kie.ai - Traite la vidéo quand elle est prête"""
     print("=" * 80)
     print("📞 CALLBACK REÇU DE KIE.AI")
     print("=" * 80)
@@ -268,22 +268,153 @@ async def kie_callback(payload: dict):
     print(f"Credits consumed: {data.get('consumeCredits')}")
     print(f"Cost time: {data.get('costTime')}s")
     
+    # Si échec
     if state == "fail":
         print("❌ ÉCHEC DÉTECTÉ")
         print(f"Fail Code: {data.get('failCode')}")
         print(f"Fail Message: {data.get('failMsg')}")
+        
+        # Update job en failed
+        if task_id:
+            try:
+                job = supabase.table("video_jobs").select("*").eq("kie_task_id", task_id).execute()
+                if job.data:
+                    job_id = job.data[0]["id"]
+                    error_msg = f"{data.get('failCode')}: {data.get('failMsg')}"
+                    supabase.table("video_jobs").update({
+                        "status": "failed",
+                        "error": error_msg
+                    }).eq("id", job_id).execute()
+                    print(f"❌ Job {job_id} marqué échoué")
+            except Exception as e:
+                print(f"⚠️ Erreur update Supabase: {e}")
     
+    # Si succès
     if state == "success":
         print("✅ SUCCÈS")
         result_json = data.get('resultJson')
         print(f"Result JSON: {result_json}")
         
-        if result_json:
+        if result_json and task_id:
             try:
                 result = json.loads(result_json)
-                print(f"Video URLs: {result.get('resultUrls')}")
-            except:
-                pass
+                video_url = result.get('resultUrls', [None])[0]
+                print(f"Video URL: {video_url}")
+                
+                # Trouver le job correspondant
+                job = supabase.table("video_jobs").select("*").eq("kie_task_id", task_id).execute()
+                
+                if not job.data:
+                    # Peut-être multi-clips, chercher dans les JSON arrays
+                    all_jobs = supabase.table("video_jobs").select("*").eq("status", "waiting_callback").execute()
+                    for j in all_jobs.data:
+                        if j.get("kie_task_id"):
+                            try:
+                                task_ids = json.loads(j["kie_task_id"])
+                                if task_id in task_ids:
+                                    job = {"data": [j]}
+                                    break
+                            except:
+                                pass
+                
+                if job.data:
+                    job_data = job.data[0]
+                    job_id = job_data["id"]
+                    
+                    # Vérifier si c'est un seul clip ou multi-clips
+                    kie_task_id = job_data.get("kie_task_id")
+                    
+                    try:
+                        # Essayer de parser comme JSON (multi-clips)
+                        task_ids = json.loads(kie_task_id)
+                        is_multi = True
+                    except:
+                        # Simple string (single clip)
+                        is_multi = False
+                    
+                    if not is_multi:
+                        # CAS SIMPLE : Upload direct
+                        print(f"📤 Uploading single video to R2...")
+                        final_url = uploader.upload_from_url(video_url, f"{job_id}.mp4")
+                        
+                        supabase.table("video_jobs").update({
+                            "status": "completed",
+                            "video_url": final_url,
+                            "completed_at": "now()"
+                        }).eq("id", job_id).execute()
+                        
+                        # Débiter crédit
+                        supabase.rpc("decrement_credits", {
+                            "p_user_id": job_data["user_id"],
+                            "p_amount": 1
+                        }).execute()
+                        
+                        print(f"✅ Job {job_id} completed")
+                    
+                    else:
+                        # CAS MULTI-CLIPS : Stocker temporairement et attendre les autres
+                        print(f"📦 Multi-clip job, storing partial result...")
+                        
+                        # Stocker dans une table temporaire ou dans le job lui-même
+                        # Pour simplifier, on va stocker dans le champ "error" temporairement
+                        partial_results = job_data.get("error") or "{}"
+                        try:
+                            partial = json.loads(partial_results)
+                        except:
+                            partial = {}
+                        
+                        partial[task_id] = video_url
+                        
+                        supabase.table("video_jobs").update({
+                            "error": json.dumps(partial)
+                        }).eq("id", job_id).execute()
+                        
+                        # Vérifier si tous les clips sont prêts
+                        if len(partial) == len(task_ids):
+                            print(f"🎬 All clips ready, concatenating...")
+                            
+                            # Récupérer les URLs dans l'ordre
+                            video_urls = [partial[tid] for tid in task_ids]
+                            
+                            # Concaténer
+                            concatenated = video_editor.concatenate_videos(video_urls, f"{job_id}.mp4")
+                            
+                            # Upload
+                            video_buffer = BytesIO(concatenated)
+                            uploader.s3.upload_fileobj(
+                                video_buffer,
+                                uploader.bucket,
+                                f"{job_id}.mp4",
+                                ExtraArgs={
+                                    'ContentType': 'video/mp4',
+                                    'CacheControl': 'public, max-age=31536000',
+                                    'ACL': 'public-read'
+                                }
+                            )
+                            
+                            final_url = f"{uploader.public_base}/{job_id}.mp4"
+                            
+                            supabase.table("video_jobs").update({
+                                "status": "completed",
+                                "video_url": final_url,
+                                "completed_at": "now()",
+                                "error": None
+                            }).eq("id", job_id).execute()
+                            
+                            # Débiter crédits
+                            supabase.rpc("decrement_credits", {
+                                "p_user_id": job_data["user_id"],
+                                "p_amount": len(task_ids)
+                            }).execute()
+                            
+                            print(f"✅ Job {job_id} completed (multi-clip)")
+                        else:
+                            print(f"⏳ Waiting for {len(task_ids) - len(partial)} more clips...")
+                
+            except Exception as e:
+                print(f"⚠️ Erreur traitement callback: {e}")
+                import traceback
+                traceback.print_exc()
     
     print("=" * 80)
     
