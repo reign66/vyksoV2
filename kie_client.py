@@ -1,6 +1,7 @@
 import os
 import httpx
 import asyncio
+import json
 from typing import Literal, Optional
 
 class KieAIClient:
@@ -46,27 +47,15 @@ class KieAIClient:
         }
         model = model_map.get(quality, "sora-2-text-to-video")
         
-        # Map duration to n_frames
-        # Kie.ai only supports 10s or 15s for pro models
-        if quality != "basic" and duration > 15:
-            duration = 15  # Cap at 15s for pro models
-        
-        n_frames = str(duration) if duration in [10, 15] else "10"
-        
         payload = {
             "model": model,
-            "callBackUrl": self.callback_url,  # Optional
+            "callBackUrl": self.callback_url,
             "input": {
                 "prompt": prompt[:5000],  # Max 5000 chars
                 "aspect_ratio": "portrait",  # 9:16 for TikTok
                 "remove_watermark": remove_watermark
             }
         }
-        
-        # Add pro-specific params
-        if quality != "basic":
-            payload["input"]["n_frames"] = n_frames
-            payload["input"]["size"] = "high" if quality == "pro_1080p" else "standard"
         
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(
@@ -77,8 +66,8 @@ class KieAIClient:
             response.raise_for_status()
             result = response.json()
             
-            # API returns: {"code": 0, "data": {"taskId": "..."}, "msg": "success"}
-            if result.get("code") == 0:
+            # FIX: API returns code 200, not 0
+            if result.get("code") == 200:
                 return result["data"]
             else:
                 raise Exception(f"Kie.ai error: {result.get('msg')}")
@@ -94,15 +83,15 @@ class KieAIClient:
         
         async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.get(
-                f"{self.BASE_URL}/jobs/recordInfo",
+                f"{self.BASE_URL}/jobs/queryTask",  # FIX: correct endpoint
                 headers=self._get_headers(),
                 params=params
             )
             response.raise_for_status()
             result = response.json()
             
-            # API returns: {"code": 0, "data": {...}, "msg": "success"}
-            if result.get("code") == 0:
+            # FIX: API returns code 200, not 0
+            if result.get("code") == 200:
                 return result["data"]
             else:
                 raise Exception(f"Kie.ai error: {result.get('msg')}")
@@ -127,23 +116,76 @@ class KieAIClient:
             
             status = await self.get_task_status(task_id)
             
-            # Kie.ai status: "pending", "processing", "success", "failed"
-            task_status = status.get("status")
+            # FIX: correct field name is "state" not "status"
+            task_state = status.get("state")
             
-            if task_status == "success":
-                # Return video URL from result
+            if task_state == "success":
+                # Parse resultJson string to get video URL
+                result_json_str = status.get("resultJson", "{}")
+                result_json = json.loads(result_json_str)
+                video_url = result_json.get("resultUrls", [None])[0]
+                
                 return {
                     "status": "completed",
-                    "video_url": status.get("result", {}).get("video_url"),
+                    "video_url": video_url,
                     "task_id": task_id
                 }
-            elif task_status == "failed":
-                error_msg = status.get("error", "Unknown error")
+            elif task_state == "fail":
+                error_msg = f"{status.get('failCode')}: {status.get('failMsg')}"
                 raise Exception(f"Generation failed: {error_msg}")
             
             # Still processing, wait 5s before re-check
             await asyncio.sleep(5)
-            print(f"⏳ Task {task_id} status: {task_status} (elapsed: {int(elapsed)}s)")
+            print(f"⏳ Task {task_id} status: {task_state} (elapsed: {int(elapsed)}s)")
+    
+    async def generate_long_video(
+        self,
+        base_prompt: str,
+        target_duration: int = 60,
+        quality: str = "basic"
+    ) -> list[dict]:
+        """
+        Génère plusieurs vidéos de 10s pour créer une vidéo longue
+        
+        Args:
+            base_prompt: Prompt de base
+            target_duration: Durée cible en secondes (ex: 60 pour 1min)
+            quality: Qualité vidéo
+        
+        Returns:
+            Liste de dict avec video_url pour chaque clip
+        """
+        num_clips = target_duration // 10
+        
+        # Créer des variations du prompt pour chaque clip
+        prompts = []
+        for i in range(num_clips):
+            scene_prompt = f"{base_prompt}, scene {i+1} of {num_clips}, smooth transition"
+            prompts.append(scene_prompt)
+        
+        print(f"🎬 Generating {num_clips} clips of 10s each...")
+        
+        # Lancer toutes les générations en parallèle
+        tasks = []
+        for i, prompt in enumerate(prompts):
+            print(f"🎥 Launching clip {i+1}/{num_clips}")
+            task = await self.generate_video(
+                prompt=prompt,
+                duration=10,
+                quality=quality,
+                remove_watermark=False
+            )
+            tasks.append(task)
+        
+        # Poll toutes les vidéos en parallèle
+        print(f"⏳ Waiting for all {num_clips} clips to complete...")
+        completed = await asyncio.gather(*[
+            self.poll_until_complete(task["taskId"])
+            for task in tasks
+        ])
+        
+        print(f"✅ All {num_clips} clips generated successfully")
+        return completed
     
     async def remove_watermark(self, video_url: str) -> dict:
         """
@@ -167,7 +209,7 @@ class KieAIClient:
             response.raise_for_status()
             result = response.json()
             
-            if result.get("code") == 0:
+            if result.get("code") == 200:
                 return result["data"]
             else:
                 raise Exception(f"Kie.ai error: {result.get('msg')}")
