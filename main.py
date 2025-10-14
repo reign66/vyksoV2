@@ -7,6 +7,8 @@ from pydantic import BaseModel
 from kie_client import KieAIClient
 from supabase_client import get_client
 from utils.uploader import R2Uploader
+from utils.video_concat import VideoEditor
+from io import BytesIO
 import asyncio
 
 app = FastAPI(
@@ -28,24 +30,54 @@ app.add_middleware(
 kie = KieAIClient()
 supabase = get_client()
 uploader = R2Uploader()
+video_editor = VideoEditor()
 
 # Models
 class VideoRequest(BaseModel):
     user_id: str
     niche: str
-    duration: int
+    duration: int  # Durée totale souhaitée (ex: 60 pour 1min)
     quality: str = "basic"
 
 class VideoResponse(BaseModel):
     job_id: str
     status: str
     estimated_time: str
+    num_clips: int  # Nombre de clips à générer
 
-# ============= DÉFINIR process_video_generation AVANT de l'utiliser =============
+# ============= FUNCTIONS =============
 
-async def process_video_generation(job_id: str, prompt: str, duration: int, quality: str, user_id: str):
+def generate_prompt(niche: str, duration: int, clip_number: int = None, total_clips: int = None) -> str:
+    """Génère un prompt optimisé pour Sora"""
+    templates = {
+        "recettes": "Cinematic cooking video showing delicious recipe preparation, beautiful food styling, warm kitchen lighting, professional chef techniques, mouth-watering close-ups",
+        
+        "voyage": "Breathtaking travel footage showcasing stunning landscapes, cinematic drone shots, golden hour lighting, epic adventure vibes, cultural exploration, scenic beauty",
+        
+        "motivation": "Inspiring motivational content with dynamic visual metaphors, uplifting atmosphere, professional cinematography, energetic pacing, success imagery, empowering message",
+        
+        "tech": "Modern technology showcase with sleek product presentation, futuristic aesthetics, clean minimalist style, innovative tech display, professional lighting, cutting-edge visuals"
+    }
+    
+    base_prompt = templates.get(niche.lower(), f"High-quality viral video content about {niche}, engaging visuals, professional production")
+    
+    # Ajouter info de séquence si multi-clips
+    if clip_number is not None and total_clips is not None:
+        scene_info = f", scene {clip_number} of {total_clips}, smooth cinematic transition"
+    else:
+        scene_info = ""
+    
+    return f"{base_prompt}{scene_info}, 9:16 vertical format, TikTok optimized, cinematic quality, trending style"
+
+async def process_video_generation(
+    job_id: str, 
+    niche: str,
+    duration: int, 
+    quality: str, 
+    user_id: str
+):
     """
-    Background task : génère la vidéo
+    Background task : génère la vidéo (peut être multi-clips)
     """
     try:
         print(f"🎬 Starting generation for job {job_id}")
@@ -55,30 +87,99 @@ async def process_video_generation(job_id: str, prompt: str, duration: int, qual
             "status": "generating"
         }).eq("id", job_id).execute()
         
-        # 1. Lancer génération Kie.ai
-        task = await kie.generate_video(
-            prompt=prompt,
-            duration=duration,
-            quality=quality,
-            remove_watermark=(quality != "basic")
-        )
+        # Calculer le nombre de clips nécessaires
+        num_clips = duration // 10
+        if duration % 10 > 0:
+            num_clips += 1  # Arrondir au sup
         
-        task_id = task["taskId"]
-        print(f"✅ Task created: {task_id}")
+        print(f"📊 Need {num_clips} clips for {duration}s video")
         
-        # Sauvegarder le task_id dans Supabase
-        supabase.table("video_jobs").update({
-            "kie_task_id": task_id
-        }).eq("id", job_id).execute()
+        if num_clips == 1:
+            # ===== CAS SIMPLE : 1 seul clip (10s) =====
+            prompt = generate_prompt(niche, 10)
+            
+            # 1. Lancer génération Kie.ai
+            task = await kie.generate_video(
+                prompt=prompt,
+                duration=10,
+                quality=quality,
+                remove_watermark=(quality != "basic")
+            )
+            
+            task_id = task["taskId"]
+            print(f"✅ Task created: {task_id}")
+            
+            # Sauvegarder le task_id
+            supabase.table("video_jobs").update({
+                "kie_task_id": task_id
+            }).eq("id", job_id).execute()
+            
+            # 2. Poll jusqu'à completion
+            result = await kie.poll_until_complete(task_id, max_wait=600)
+            video_url = result["video_url"]
+            
+            print(f"✅ Video generated: {video_url}")
+            
+            # 3. Upload vers R2
+            final_url = uploader.upload_from_url(video_url, f"{job_id}.mp4")
         
-        # 2. Poll jusqu'à completion
-        result = await kie.poll_until_complete(task_id, max_wait=600)
-        video_url = result["video_url"]
-        
-        print(f"✅ Video generated: {video_url}")
-        
-        # 3. Upload vers R2
-        final_url = uploader.upload_from_url(video_url, f"{job_id}.mp4")
+        else:
+            # ===== CAS COMPLEXE : Plusieurs clips à concaténer =====
+            print(f"🎥 Generating {num_clips} clips in parallel...")
+            
+            # Créer des prompts pour chaque clip
+            tasks = []
+            for i in range(num_clips):
+                clip_prompt = generate_prompt(niche, 10, i+1, num_clips)
+                task = await kie.generate_video(
+                    prompt=clip_prompt,
+                    duration=10,
+                    quality=quality,
+                    remove_watermark=False
+                )
+                tasks.append(task)
+                print(f"✅ Clip {i+1}/{num_clips} task created: {task['taskId']}")
+            
+            # Sauvegarder tous les task_ids
+            task_ids = [t["taskId"] for t in tasks]
+            supabase.table("video_jobs").update({
+                "kie_task_id": json.dumps(task_ids)  # Stocker comme JSON array
+            }).eq("id", job_id).execute()
+            
+            # Poll tous les clips en parallèle
+            print(f"⏳ Waiting for all {num_clips} clips...")
+            results = await asyncio.gather(*[
+                kie.poll_until_complete(task["taskId"], max_wait=600)
+                for task in tasks
+            ])
+            
+            video_urls = [r["video_url"] for r in results]
+            print(f"✅ All {num_clips} clips generated")
+            
+            # Concaténer les vidéos
+            print(f"🎬 Concatenating {num_clips} clips...")
+            concatenated_video = video_editor.concatenate_videos(
+                video_urls, 
+                f"{job_id}.mp4"
+            )
+            
+            # Upload vers R2
+            print(f"📤 Uploading concatenated video to R2...")
+            video_buffer = BytesIO(concatenated_video)
+            
+            uploader.s3.upload_fileobj(
+                video_buffer,
+                uploader.bucket,
+                f"{job_id}.mp4",
+                ExtraArgs={
+                    'ContentType': 'video/mp4',
+                    'CacheControl': 'public, max-age=31536000',
+                    'ACL': 'public-read'
+                }
+            )
+            
+            final_url = f"{uploader.public_base}/{job_id}.mp4"
+            print(f"✅ Uploaded: {final_url}")
         
         # 4. Update Supabase
         supabase.table("video_jobs").update({
@@ -87,13 +188,14 @@ async def process_video_generation(job_id: str, prompt: str, duration: int, qual
             "completed_at": "now()"
         }).eq("id", job_id).execute()
         
-        # 5. Débiter crédit
+        # 5. Débiter crédits (1 crédit par clip de 10s)
+        credits_to_deduct = num_clips
         supabase.rpc("decrement_credits", {
             "p_user_id": user_id,
-            "p_amount": 1
+            "p_amount": credits_to_deduct
         }).execute()
         
-        print(f"✅ Job {job_id} completed successfully")
+        print(f"✅ Job {job_id} completed successfully ({credits_to_deduct} credits used)")
         
     except Exception as e:
         print(f"❌ Error generating video {job_id}: {e}")
@@ -103,22 +205,6 @@ async def process_video_generation(job_id: str, prompt: str, duration: int, qual
             "status": "failed",
             "error": str(e)
         }).eq("id", job_id).execute()
-
-def generate_prompt(niche: str, duration: int) -> str:
-    """Génère un prompt optimisé pour Sora"""
-    templates = {
-        "recettes": f"Cinematic cooking video showing delicious recipe preparation, beautiful food styling, warm kitchen lighting, professional chef techniques, mouth-watering close-ups, 9:16 vertical format for TikTok, {duration} seconds duration, highly detailed and appetizing",
-        
-        "voyage": f"Breathtaking travel footage showcasing stunning landscapes, cinematic drone shots, golden hour lighting, epic adventure vibes, cultural exploration, scenic beauty, 9:16 vertical format for TikTok, {duration} seconds duration, ultra HD quality",
-        
-        "motivation": f"Inspiring motivational content with dynamic visual metaphors, uplifting atmosphere, professional cinematography, energetic pacing, success imagery, empowering message, 9:16 vertical format for TikTok, {duration} seconds duration, high impact visuals",
-        
-        "tech": f"Modern technology showcase with sleek product presentation, futuristic aesthetics, clean minimalist style, innovative tech display, professional lighting, cutting-edge visuals, 9:16 vertical format for TikTok, {duration} seconds duration, ultra detailed"
-    }
-    
-    base_prompt = templates.get(niche.lower(), f"High-quality viral video content about {niche}, engaging visuals, professional production, TikTok optimized")
-    
-    return f"{base_prompt}, 9:16 vertical format, {duration} seconds, cinematic quality, trending style"
 
 # ============= ENDPOINTS =============
 
@@ -136,7 +222,7 @@ def health():
 
 @app.post("/api/videos/generate", response_model=VideoResponse)
 async def generate_video(req: VideoRequest, background_tasks: BackgroundTasks):
-    """Endpoint principal : génère une vidéo"""
+    """Endpoint principal : génère une vidéo (peut faire plusieurs clips)"""
     
     # 1. Vérifier/créer user
     try:
@@ -157,12 +243,18 @@ async def generate_video(req: VideoRequest, background_tasks: BackgroundTasks):
         print(f"❌ Error checking user: {e}")
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
     
-    # 2. Vérifier crédits
-    if user_data["credits"] < 1:
-        raise HTTPException(status_code=402, detail="Crédits insuffisants")
+    # 2. Calculer nombre de clips nécessaires
+    num_clips = req.duration // 10
+    if req.duration % 10 > 0:
+        num_clips += 1
     
-    # 3. Générer prompt optimisé
-    prompt = generate_prompt(req.niche, req.duration)
+    # 3. Vérifier crédits (1 crédit = 1 clip de 10s)
+    required_credits = num_clips
+    if user_data["credits"] < required_credits:
+        raise HTTPException(
+            status_code=402, 
+            detail=f"Crédits insuffisants. Besoin de {required_credits} crédits, vous avez {user_data['credits']}"
+        )
     
     # 4. Créer job dans Supabase
     try:
@@ -172,7 +264,7 @@ async def generate_video(req: VideoRequest, background_tasks: BackgroundTasks):
             "niche": req.niche,
             "duration": req.duration,
             "quality": req.quality,
-            "prompt": prompt
+            "prompt": f"Multi-clip video: {req.niche}"
         }).execute()
         
         job_id = job.data[0]["id"]
@@ -181,13 +273,22 @@ async def generate_video(req: VideoRequest, background_tasks: BackgroundTasks):
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
     
     # 5. Lancer génération en background
-    background_tasks.add_task(process_video_generation, job_id, prompt, req.duration, req.quality, req.user_id)
+    background_tasks.add_task(
+        process_video_generation, 
+        job_id, 
+        req.niche,
+        req.duration, 
+        req.quality, 
+        req.user_id
+    )
     
     # 6. Réponse immédiate
+    estimated_time = num_clips * 30  # ~30s par clip
     return VideoResponse(
         job_id=job_id,
         status="pending",
-        estimated_time=f"{req.duration * 3}-{req.duration * 5}s"
+        estimated_time=f"{estimated_time}s - {estimated_time + 60}s",
+        num_clips=num_clips
     )
 
 @app.get("/api/videos/{job_id}/status")
@@ -206,7 +307,7 @@ async def get_video_status(job_id: str):
 
 @app.post("/api/callback")
 async def kie_callback(payload: dict):
-    """Callback Kie.ai - Version détaillée"""
+    """Callback Kie.ai"""
     print("=" * 80)
     print("📞 CALLBACK REÇU DE KIE.AI")
     print("=" * 80)
@@ -223,14 +324,11 @@ async def kie_callback(payload: dict):
     print(f"Credits consumed: {data.get('consumeCredits')}")
     print(f"Cost time: {data.get('costTime')}s")
     
-    # Si échec, afficher les détails
     if state == "fail":
         print("❌ ÉCHEC DÉTECTÉ")
         print(f"Fail Code: {data.get('failCode')}")
         print(f"Fail Message: {data.get('failMsg')}")
-        print(f"Params: {data.get('param')}")
     
-    # Si succès, afficher les URLs
     if state == "success":
         print("✅ SUCCÈS")
         result_json = data.get('resultJson')
@@ -244,41 +342,6 @@ async def kie_callback(payload: dict):
                 pass
     
     print("=" * 80)
-    
-    # Optionnel : Update Supabase
-    if task_id:
-        try:
-            job = supabase.table("video_jobs").select("*").eq("kie_task_id", task_id).execute()
-            
-            if job.data:
-                job_id = job.data[0]["id"]
-                
-                if state == "success":
-                    result = json.loads(data.get('resultJson', '{}'))
-                    video_url = result.get('resultUrls', [None])[0]
-                    
-                    if video_url:
-                        final_url = uploader.upload_from_url(video_url, f"{job_id}.mp4")
-                        
-                        supabase.table("video_jobs").update({
-                            "status": "completed",
-                            "video_url": final_url,
-                            "completed_at": "now()"
-                        }).eq("id", job_id).execute()
-                        
-                        print(f"✅ Job {job_id} mis à jour")
-                
-                elif state == "fail":
-                    error_msg = f"{data.get('failCode')}: {data.get('failMsg')}"
-                    supabase.table("video_jobs").update({
-                        "status": "failed",
-                        "error": error_msg
-                    }).eq("id", job_id).execute()
-                    
-                    print(f"❌ Job {job_id} marqué échoué")
-        
-        except Exception as e:
-            print(f"⚠️ Erreur update Supabase: {e}")
     
     return {"status": "received", "task_id": task_id}
 
