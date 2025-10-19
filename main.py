@@ -184,7 +184,7 @@ async def generate_video(req: VideoRequest, background_tasks: BackgroundTasks):
             supabase.table("users").insert({
                 "id": req.user_id,
                 "email": f"{req.user_id}@vykso.com",
-                "credits": 10,
+                "credits": 50,
                 "plan": "starter"
             }).execute()
             user = supabase.table("users").select("*").eq("id", req.user_id).execute()
