@@ -346,7 +346,6 @@ async def kie_callback(payload: dict):
                             try:
                                 task_ids = json.loads(kie_task_id)
                                 if task_id in task_ids:
-                                    # FIX: On crée un objet mock avec .data
                                     job_result = type('obj', (object,), {'data': [j]})()
                                     break
                             except:
@@ -412,46 +411,64 @@ async def kie_callback(payload: dict):
                     if len(clips_urls) == num_clips:
                         print(f"🎬 All {num_clips} clips ready, starting concatenation...")
                         
-                        # Mettre en ordre les URLs
-                        ordered_urls = [clips_urls[str(i)] for i in range(num_clips)]
-                        print(f"📹 Ordered URLs: {ordered_urls}")
+                        try:
+                            # Mettre en ordre les URLs
+                            ordered_urls = [clips_urls[str(i)] for i in range(num_clips)]
+                            print(f"📹 Ordered URLs: {ordered_urls}")
+                            
+                            # Concaténer les vidéos
+                            print(f"🎞️ Concatenating {num_clips} videos with ffmpeg...")
+                            concatenated_data = video_editor.concatenate_videos(ordered_urls, f"{job_id}.mp4")
+                            
+                            # VÉRIFIER que les données sont bien chargées
+                            if not concatenated_data or len(concatenated_data) == 0:
+                                raise Exception("Concatenation returned empty data")
+                            
+                            print(f"✅ Concatenation successful, video size: {len(concatenated_data)} bytes")
+                            
+                            # Upload vers R2
+                            print(f"📤 Uploading concatenated video to R2...")
+                            video_buffer = BytesIO(concatenated_data)
+                            
+                            uploader.s3.upload_fileobj(
+                                video_buffer,
+                                uploader.bucket,
+                                f"{job_id}.mp4",
+                                ExtraArgs={
+                                    'ContentType': 'video/mp4',
+                                    'CacheControl': 'public, max-age=31536000',
+                                    'ACL': 'public-read'
+                                }
+                            )
+                            
+                            final_url = f"{uploader.public_base}/{job_id}.mp4"
+                            print(f"✅ Concatenated video uploaded: {final_url}")
+                            
+                            # Update Supabase
+                            supabase.table("video_jobs").update({
+                                "status": "completed",
+                                "video_url": final_url,
+                                "completed_at": "now()"
+                            }).eq("id", job_id).execute()
+                            
+                            # Débiter crédits
+                            supabase.rpc("decrement_credits", {
+                                "p_user_id": user_id,
+                                "p_amount": num_clips
+                            }).execute()
+                            
+                            print(f"✅ Job {job_id} completed (multi-clip, {num_clips} clips concatenated)!")
                         
-                        # Concaténer les vidéos
-                        print(f"🎞️ Concatenating {num_clips} videos with ffmpeg...")
-                        concatenated_data = video_editor.concatenate_videos(ordered_urls, f"{job_id}.mp4")
-                        
-                        # Upload vers R2
-                        print(f"📤 Uploading concatenated video to R2...")
-                        video_buffer = BytesIO(concatenated_data)
-                        
-                        uploader.s3.upload_fileobj(
-                            video_buffer,
-                            uploader.bucket,
-                            f"{job_id}.mp4",
-                            ExtraArgs={
-                                'ContentType': 'video/mp4',
-                                'CacheControl': 'public, max-age=31536000',
-                                'ACL': 'public-read'
-                            }
-                        )
-                        
-                        final_url = f"{uploader.public_base}/{job_id}.mp4"
-                        print(f"✅ Concatenated video uploaded: {final_url}")
-                        
-                        # Update Supabase
-                        supabase.table("video_jobs").update({
-                            "status": "completed",
-                            "video_url": final_url,
-                            "completed_at": "now()"
-                        }).eq("id", job_id).execute()
-                        
-                        # Débiter crédits
-                        supabase.rpc("decrement_credits", {
-                            "p_user_id": user_id,
-                            "p_amount": num_clips
-                        }).execute()
-                        
-                        print(f"✅ Job {job_id} completed (multi-clip, {num_clips} clips concatenated)!")
+                        except Exception as concat_error:
+                            print(f"❌ Concatenation or upload failed: {concat_error}")
+                            import traceback
+                            traceback.print_exc()
+                            
+                            # Marquer le job en erreur
+                            supabase.table("video_jobs").update({
+                                "status": "failed",
+                                "error": f"Concatenation failed: {str(concat_error)}"
+                            }).eq("id", job_id).execute()
                     else:
                         print(f"⏳ Waiting for {num_clips - len(clips_urls)} more clips...")
                 
