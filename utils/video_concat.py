@@ -16,10 +16,11 @@ class VideoEditor:
             response.raise_for_status()
             with open(output_path, 'wb') as f:
                 f.write(response.content)
-        print(f"✅ Downloaded to {output_path}")
+        file_size = os.path.getsize(output_path)
+        print(f"✅ Downloaded to {output_path} ({file_size} bytes)")
     
     @staticmethod
-    def concatenate_videos(video_urls: List[str], output_filename: str) -> str:
+    def concatenate_videos(video_urls: List[str], output_filename: str) -> bytes:
         """
         Concatène plusieurs vidéos en une seule
         
@@ -28,9 +29,11 @@ class VideoEditor:
             output_filename: Nom du fichier de sortie
         
         Returns:
-            Chemin du fichier vidéo final
+            Bytes de la vidéo concaténée
         """
         with tempfile.TemporaryDirectory() as tmpdir:
+            print(f"🎞️ Starting concatenation of {len(video_urls)} videos...")
+            
             # 1. Download toutes les vidéos
             video_files = []
             for i, url in enumerate(video_urls):
@@ -38,15 +41,21 @@ class VideoEditor:
                 VideoEditor.download_video(url, video_path)
                 video_files.append(video_path)
             
+            print(f"✅ All {len(video_files)} clips downloaded successfully")
+            
             # 2. Créer le fichier de liste pour ffmpeg
             list_file = os.path.join(tmpdir, "filelist.txt")
             with open(list_file, 'w') as f:
                 for video_file in video_files:
-                    f.write(f"file '{video_file}'\n")
+                    # Échapper les apostrophes pour ffmpeg
+                    escaped_path = video_file.replace("'", "'\\''")
+                    f.write(f"file '{escaped_path}'\n")
+            
+            print(f"📝 Created filelist with {len(video_files)} entries")
             
             # 3. Concaténer avec ffmpeg
             output_path = os.path.join(tmpdir, output_filename)
-            print(f"🎬 Concatenating {len(video_files)} videos...")
+            print(f"🎬 Running ffmpeg to concatenate {len(video_files)} videos...")
             
             cmd = [
                 'ffmpeg',
@@ -54,19 +63,57 @@ class VideoEditor:
                 '-safe', '0',
                 '-i', list_file,
                 '-c', 'copy',
+                '-y',  # Overwrite output file
                 output_path
             ]
             
             try:
-                subprocess.run(cmd, check=True, capture_output=True)
-                print(f"✅ Video concatenated: {output_path}")
+                result = subprocess.run(
+                    cmd, 
+                    check=True, 
+                    capture_output=True,
+                    text=True,
+                    timeout=300  # 5 minutes max
+                )
                 
-                # Lire le fichier pour le retourner
+                print(f"✅ FFmpeg completed successfully")
+                
+                # Vérifier que le fichier existe
+                if not os.path.exists(output_path):
+                    raise Exception(f"Output file was not created: {output_path}")
+                
+                # Vérifier la taille du fichier
+                file_size = os.path.getsize(output_path)
+                if file_size == 0:
+                    raise Exception(f"Output file is empty (0 bytes)")
+                
+                print(f"✅ Concatenated video created: {output_path} ({file_size} bytes)")
+                
+                # Lire le fichier et retourner les bytes
                 with open(output_path, 'rb') as f:
                     video_data = f.read()
+                
+                # Vérifier que les données ont bien été lues
+                if len(video_data) != file_size:
+                    raise Exception(f"File size mismatch: read {len(video_data)} bytes, expected {file_size}")
+                
+                print(f"✅ Video data loaded into memory ({len(video_data)} bytes)")
                 
                 return video_data
             
             except subprocess.CalledProcessError as e:
-                print(f"❌ FFmpeg error: {e.stderr.decode()}")
-                raise Exception(f"Video concatenation failed: {e.stderr.decode()}")
+                error_msg = e.stderr if e.stderr else str(e)
+                print(f"❌ FFmpeg error:")
+                print(f"  stdout: {e.stdout}")
+                print(f"  stderr: {e.stderr}")
+                raise Exception(f"Video concatenation failed: {error_msg}")
+            
+            except subprocess.TimeoutExpired:
+                print(f"❌ FFmpeg timeout after 5 minutes")
+                raise Exception("Video concatenation timed out")
+            
+            except Exception as e:
+                print(f"❌ Concatenation error: {type(e).__name__}: {e}")
+                import traceback
+                traceback.print_exc()
+                raise
