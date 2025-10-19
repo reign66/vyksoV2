@@ -287,10 +287,10 @@ async def kie_callback(payload: dict):
         if task_id:
             try:
                 # Chercher dans single task
-                job = supabase.table("video_jobs").select("*").eq("kie_task_id", task_id).execute()
+                job_result = supabase.table("video_jobs").select("*").eq("kie_task_id", task_id).execute()
                 
                 # Si pas trouvé, chercher dans les multi-tasks
-                if not job.data:
+                if not job_result.data:
                     all_jobs = supabase.table("video_jobs").select("*").eq("status", "waiting_callback").execute()
                     for j in all_jobs.data:
                         kie_task_id = j.get("kie_task_id")
@@ -298,13 +298,13 @@ async def kie_callback(payload: dict):
                             try:
                                 task_ids = json.loads(kie_task_id)
                                 if task_id in task_ids:
-                                    job = {"data": [j]}
+                                    job_result = type('obj', (object,), {'data': [j]})()
                                     break
                             except:
                                 pass
                 
-                if job.data:
-                    job_id = job.data[0]["id"]
+                if job_result.data:
+                    job_id = job_result.data[0]["id"]
                     error_msg = f"{data.get('failCode')}: {data.get('failMsg')}"
                     
                     supabase.table("video_jobs").update({
@@ -335,10 +335,10 @@ async def kie_callback(payload: dict):
                     return {"status": "error", "message": "No video URL"}
                 
                 # Chercher le job (single ou multi)
-                job = supabase.table("video_jobs").select("*").eq("kie_task_id", task_id).execute()
+                job_result = supabase.table("video_jobs").select("*").eq("kie_task_id", task_id).execute()
                 
                 # Si pas trouvé, chercher dans les multi-tasks
-                if not job.data:
+                if not job_result.data:
                     all_jobs = supabase.table("video_jobs").select("*").eq("status", "waiting_callback").execute()
                     for j in all_jobs.data:
                         kie_task_id = j.get("kie_task_id")
@@ -346,16 +346,17 @@ async def kie_callback(payload: dict):
                             try:
                                 task_ids = json.loads(kie_task_id)
                                 if task_id in task_ids:
-                                    job = {"data": [j]}
+                                    # FIX: On crée un objet mock avec .data
+                                    job_result = type('obj', (object,), {'data': [j]})()
                                     break
                             except:
                                 pass
                 
-                if not job.data:
+                if not job_result.data:
                     print(f"⚠️ Job not found for task_id: {task_id}")
                     return {"status": "error", "message": "Job not found"}
                 
-                job_data = job.data[0]
+                job_data = job_result.data[0]
                 job_id = job_data["id"]
                 user_id = job_data["user_id"]
                 kie_task_id_field = job_data.get("kie_task_id")
@@ -409,13 +410,14 @@ async def kie_callback(payload: dict):
                     
                     # Vérifier si tous les clips sont prêts
                     if len(clips_urls) == num_clips:
-                        print(f"🎬 All {num_clips} clips ready, concatenating...")
+                        print(f"🎬 All {num_clips} clips ready, starting concatenation...")
                         
                         # Mettre en ordre les URLs
                         ordered_urls = [clips_urls[str(i)] for i in range(num_clips)]
+                        print(f"📹 Ordered URLs: {ordered_urls}")
                         
                         # Concaténer les vidéos
-                        print(f"🎞️ Concatenating {num_clips} videos...")
+                        print(f"🎞️ Concatenating {num_clips} videos with ffmpeg...")
                         concatenated_data = video_editor.concatenate_videos(ordered_urls, f"{job_id}.mp4")
                         
                         # Upload vers R2
@@ -449,7 +451,7 @@ async def kie_callback(payload: dict):
                             "p_amount": num_clips
                         }).execute()
                         
-                        print(f"✅ Job {job_id} completed (multi-clip)!")
+                        print(f"✅ Job {job_id} completed (multi-clip, {num_clips} clips concatenated)!")
                     else:
                         print(f"⏳ Waiting for {num_clips - len(clips_urls)} more clips...")
                 
@@ -461,23 +463,23 @@ async def kie_callback(payload: dict):
                 # Marquer le job en erreur
                 try:
                     if task_id:
-                        job = supabase.table("video_jobs").select("*").eq("kie_task_id", task_id).execute()
-                        if not job.data:
+                        job_result = supabase.table("video_jobs").select("*").eq("kie_task_id", task_id).execute()
+                        if not job_result.data:
                             all_jobs = supabase.table("video_jobs").select("*").eq("status", "waiting_callback").execute()
                             for j in all_jobs.data:
                                 try:
                                     task_ids = json.loads(j.get("kie_task_id", "[]"))
                                     if task_id in task_ids:
-                                        job = {"data": [j]}
+                                        job_result = type('obj', (object,), {'data': [j]})()
                                         break
                                 except:
                                     pass
                         
-                        if job.data:
+                        if job_result.data:
                             supabase.table("video_jobs").update({
                                 "status": "failed",
                                 "error": str(e)
-                            }).eq("id", job.data[0]["id"]).execute()
+                            }).eq("id", job_result.data[0]["id"]).execute()
                 except:
                     pass
     
