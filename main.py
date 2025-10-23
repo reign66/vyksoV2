@@ -1,6 +1,7 @@
 import os
 import json
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+import stripe
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from kie_client import KieAIClient
@@ -30,12 +31,16 @@ supabase = get_client()
 uploader = R2Uploader()
 video_editor = VideoEditor()
 
+# Stripe
+stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
+
 # Models
 class VideoRequest(BaseModel):
     user_id: str
-    niche: str
+    niche: str = None  # Optionnel maintenant
     duration: int  # 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60
     quality: str = "basic"
+    custom_prompt: str = None  # NOUVEAU
 
 class VideoResponse(BaseModel):
     job_id: str
@@ -44,21 +49,31 @@ class VideoResponse(BaseModel):
     num_clips: int
     total_credits: int
 
+class CheckoutRequest(BaseModel):
+    plan: str
+    user_id: str
+
 # ============= FUNCTIONS =============
 
-def generate_prompt(niche: str, clip_index: int = None, total_clips: int = None) -> str:
+def generate_prompt(niche: str = None, custom_prompt: str = None, clip_index: int = None, total_clips: int = None) -> str:
     """Génère un prompt optimisé pour Sora"""
-    templates = {
-        "recettes": "Cinematic cooking video showing delicious recipe preparation, beautiful food styling, warm kitchen lighting, professional chef techniques, mouth-watering close-ups",
-        
-        "voyage": "Breathtaking travel footage showcasing stunning landscapes, cinematic drone shots, golden hour lighting, epic adventure vibes, cultural exploration, scenic beauty",
-        
-        "motivation": "Inspiring motivational content with dynamic visual metaphors, uplifting atmosphere, professional cinematography, energetic pacing, success imagery, empowering message",
-        
-        "tech": "Modern technology showcase with sleek product presentation, futuristic aesthetics, clean minimalist style, innovative tech display, professional lighting, cutting-edge visuals"
-    }
     
-    base = templates.get(niche.lower(), f"High-quality viral video content about {niche}, engaging visuals, professional production")
+    # Si custom_prompt fourni, l'utiliser en priorité
+    if custom_prompt:
+        base = custom_prompt
+    else:
+        # Sinon utiliser les templates de niche
+        templates = {
+            "recettes": "Cinematic cooking video showing delicious recipe preparation, beautiful food styling, warm kitchen lighting, professional chef techniques, mouth-watering close-ups",
+            
+            "voyage": "Breathtaking travel footage showcasing stunning landscapes, cinematic drone shots, golden hour lighting, epic adventure vibes, cultural exploration, scenic beauty",
+            
+            "motivation": "Inspiring motivational content with dynamic visual metaphors, uplifting atmosphere, professional cinematography, energetic pacing, success imagery, empowering message",
+            
+            "tech": "Modern technology showcase with sleek product presentation, futuristic aesthetics, clean minimalist style, innovative tech display, professional lighting, cutting-edge visuals"
+        }
+        
+        base = templates.get(niche.lower() if niche else "", f"High-quality viral video content, engaging visuals, professional production")
     
     # Ajouter info de séquence si multi-clips
     if clip_index is not None and total_clips is not None and total_clips > 1:
@@ -68,7 +83,7 @@ def generate_prompt(niche: str, clip_index: int = None, total_clips: int = None)
     
     return f"{base}{sequence_info}, 9:16 vertical format, TikTok optimized, high quality, cinematic"
 
-async def process_video_generation(job_id: str, niche: str, duration: int, quality: str, user_id: str):
+async def process_video_generation(job_id: str, niche: str, duration: int, quality: str, user_id: str, custom_prompt: str = None):
     """Background task : génère la vidéo (single ou multi-clips)"""
     try:
         print(f"🎬 Starting generation for job {job_id}")
@@ -86,7 +101,7 @@ async def process_video_generation(job_id: str, niche: str, duration: int, quali
             # ===== CAS SIMPLE : 1 seul clip =====
             print("🎥 Single clip generation")
             
-            prompt = generate_prompt(niche)
+            prompt = generate_prompt(niche, custom_prompt)
             
             task = await kie.generate_video(
                 prompt=prompt,
@@ -113,7 +128,7 @@ async def process_video_generation(job_id: str, niche: str, duration: int, quali
             # Générer tous les clips en parallèle
             tasks = []
             for i in range(num_clips):
-                clip_prompt = generate_prompt(niche, i+1, num_clips)
+                clip_prompt = generate_prompt(niche, custom_prompt, i+1, num_clips)
                 print(f"📝 Clip {i+1}/{num_clips} prompt: {clip_prompt[:80]}...")
                 
                 task = await kie.generate_video(
@@ -168,9 +183,13 @@ def health():
 async def generate_video(req: VideoRequest, background_tasks: BackgroundTasks):
     """Endpoint principal : génère une vidéo de durée variable"""
     
-    # Valider la durée (multiples de 5 entre 10 et 60)
+    # Valider la durée
     if req.duration < 10 or req.duration > 60:
         raise HTTPException(status_code=400, detail="Duration must be between 10 and 60 seconds")
+    
+    # Valider qu'on a soit niche, soit custom_prompt
+    if not req.niche and not req.custom_prompt:
+        raise HTTPException(status_code=400, detail="Either niche or custom_prompt is required")
     
     # Calculer le nombre de clips
     num_clips = (req.duration + 9) // 10
@@ -208,13 +227,14 @@ async def generate_video(req: VideoRequest, background_tasks: BackgroundTasks):
         job = supabase.table("video_jobs").insert({
             "user_id": req.user_id,
             "status": "pending",
-            "niche": req.niche,
+            "niche": req.niche or "custom",
             "duration": req.duration,
             "quality": req.quality,
-            "prompt": generate_prompt(req.niche),
+            "prompt": req.custom_prompt or generate_prompt(req.niche),
             "metadata": json.dumps({
                 "num_clips": num_clips,
-                "target_duration": req.duration
+                "target_duration": req.duration,
+                "custom_prompt": req.custom_prompt
             })
         }).execute()
         
@@ -226,7 +246,15 @@ async def generate_video(req: VideoRequest, background_tasks: BackgroundTasks):
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
     
     # 4. Lancer génération en background
-    background_tasks.add_task(process_video_generation, job_id, req.niche, req.duration, req.quality, req.user_id)
+    background_tasks.add_task(
+        process_video_generation, 
+        job_id, 
+        req.niche, 
+        req.duration, 
+        req.quality, 
+        req.user_id,
+        req.custom_prompt
+    )
     
     # 5. Réponse immédiate
     estimated_time = num_clips * 40  # ~40s par clip en moyenne
@@ -263,6 +291,138 @@ async def get_video_status(job_id: str):
     except Exception as e:
         print(f"❌ Error getting job status: {e}")
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+@app.get("/api/users/{user_id}/videos")
+async def get_user_videos(user_id: str, limit: int = 20, offset: int = 0):
+    """Liste les vidéos d'un utilisateur"""
+    try:
+        videos = supabase.table("video_jobs").select("*").eq("user_id", user_id).order("created_at", desc=True).range(offset, offset + limit - 1).execute()
+        
+        return {
+            "total": len(videos.data),
+            "videos": videos.data
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ============= STRIPE ENDPOINTS =============
+
+@app.post("/api/stripe/create-checkout")
+async def create_checkout_session(req: CheckoutRequest):
+    """Créer une session Stripe Checkout"""
+    
+    # Map des Price IDs (à remplir après création dans Stripe)
+    price_ids = {
+        "starter": os.getenv("STRIPE_PRICE_STARTER"),
+        "pro": os.getenv("STRIPE_PRICE_PRO"),
+        "max": os.getenv("STRIPE_PRICE_MAX")
+    }
+    
+    if req.plan not in price_ids:
+        raise HTTPException(status_code=400, detail="Invalid plan")
+    
+    if not price_ids[req.plan]:
+        raise HTTPException(status_code=500, detail=f"Price ID for {req.plan} not configured")
+    
+    try:
+        session = stripe.checkout.Session.create(
+            payment_method_types=['card'],
+            line_items=[{
+                'price': price_ids[req.plan],
+                'quantity': 1,
+            }],
+            mode='subscription',
+            success_url=f"{os.getenv('FRONTEND_URL', 'https://vykso.lovable.app')}/dashboard?session_id={{CHECKOUT_SESSION_ID}}",
+            cancel_url=f"{os.getenv('FRONTEND_URL', 'https://vykso.lovable.app')}/pricing",
+            client_reference_id=req.user_id,
+            metadata={
+                'user_id': req.user_id,
+                'plan': req.plan
+            }
+        )
+        
+        return {"checkout_url": session.url}
+    
+    except Exception as e:
+        print(f"❌ Stripe error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/webhooks/stripe")
+async def stripe_webhook(request: Request):
+    """Webhook Stripe pour gérer les paiements"""
+    
+    payload = await request.body()
+    sig_header = request.headers.get('stripe-signature')
+    
+    try:
+        event = stripe.Webhook.construct_event(
+            payload, sig_header, os.getenv("STRIPE_WEBHOOK_SECRET")
+        )
+    except ValueError as e:
+        print(f"❌ Invalid payload: {e}")
+        raise HTTPException(status_code=400, detail="Invalid payload")
+    except stripe.error.SignatureVerificationError as e:
+        print(f"❌ Invalid signature: {e}")
+        raise HTTPException(status_code=400, detail="Invalid signature")
+    
+    print(f"📨 Received Stripe webhook: {event['type']}")
+    
+    # Gérer l'événement checkout.session.completed
+    if event['type'] == 'checkout.session.completed':
+        session = event['data']['object']
+        user_id = session['metadata']['user_id']
+        plan = session['metadata']['plan']
+        
+        # Crédits selon le plan
+        credits_map = {
+            "starter": 10,
+            "pro": 20,
+            "max": 30
+        }
+        
+        print(f"✅ Checkout completed for user {user_id}, plan: {plan}")
+        
+        # Mettre à jour l'utilisateur
+        try:
+            supabase.table("users").update({
+                "plan": plan,
+                "credits": credits_map[plan],
+                "stripe_customer_id": session.get('customer'),
+                "stripe_subscription_id": session.get('subscription')
+            }).eq("id", user_id).execute()
+            
+            print(f"✅ User {user_id} upgraded to {plan} with {credits_map[plan]} credits")
+        except Exception as e:
+            print(f"❌ Error updating user: {e}")
+    
+    # Gérer le renouvellement mensuel
+    elif event['type'] == 'invoice.payment_succeeded':
+        invoice = event['data']['object']
+        subscription_id = invoice.get('subscription')
+        
+        if subscription_id:
+            try:
+                # Récupérer l'utilisateur via subscription_id
+                user = supabase.table("users").select("*").eq("stripe_subscription_id", subscription_id).single().execute()
+                
+                if user.data:
+                    plan = user.data['plan']
+                    credits_map = {
+                        "starter": 10,
+                        "pro": 20,
+                        "max": 30
+                    }
+                    
+                    # Recharger les crédits mensuels
+                    supabase.table("users").update({
+                        "credits": credits_map[plan]
+                    }).eq("id", user.data['id']).execute()
+                    
+                    print(f"✅ Monthly credits recharged for user {user.data['id']}: {credits_map[plan]} credits")
+            except Exception as e:
+                print(f"❌ Error recharging credits: {e}")
+    
+    return {"status": "success"}
 
 @app.post("/api/callback")
 async def kie_callback(payload: dict):
