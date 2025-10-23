@@ -1,6 +1,7 @@
 import os
 import json
 import stripe
+from typing import Optional
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -37,10 +38,10 @@ stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
 # Models
 class VideoRequest(BaseModel):
     user_id: str
-    niche: str = None  # Optionnel maintenant
+    niche: Optional[str] = None  # Optionnel maintenant
     duration: int  # 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60
     quality: str = "basic"
-    custom_prompt: str = None  # NOUVEAU
+    custom_prompt: Optional[str] = None  # NOUVEAU
 
 class VideoResponse(BaseModel):
     job_id: str
