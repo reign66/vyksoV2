@@ -38,10 +38,10 @@ stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
 # Models
 class VideoRequest(BaseModel):
     user_id: str
-    niche: Optional[str] = None  # Optionnel maintenant
+    niche: Optional[str] = None
     duration: int  # 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60
     quality: str = "basic"
-    custom_prompt: Optional[str] = None  # NOUVEAU
+    custom_prompt: Optional[str] = None
 
 class VideoResponse(BaseModel):
     job_id: str
@@ -53,6 +53,11 @@ class VideoResponse(BaseModel):
 class CheckoutRequest(BaseModel):
     plan: str
     user_id: str
+
+class BuyCreditsRequest(BaseModel):
+    user_id: str
+    credits: int
+    amount: int
 
 # ============= FUNCTIONS =============
 
@@ -83,6 +88,19 @@ def generate_prompt(niche: str = None, custom_prompt: str = None, clip_index: in
         sequence_info = ""
     
     return f"{base}{sequence_info}, 9:16 vertical format, TikTok optimized, high quality, cinematic"
+
+def calculate_credits_cost(duration: int, quality: str) -> int:
+    """Calcule le coût en crédits selon la durée et la qualité"""
+    num_clips = (duration + 9) // 10
+    
+    if quality == "basic":
+        return num_clips * 1  # 1 crédit par clip
+    elif quality == "pro_720p":
+        return num_clips * 3  # 3 crédits par clip
+    elif quality == "pro_1080p":
+        return num_clips * 5  # 5 crédits par clip
+    else:
+        return num_clips
 
 async def process_video_generation(job_id: str, niche: str, duration: int, quality: str, user_id: str, custom_prompt: str = None):
     """Background task : génère la vidéo (single ou multi-clips)"""
@@ -195,6 +213,9 @@ async def generate_video(req: VideoRequest, background_tasks: BackgroundTasks):
     # Calculer le nombre de clips
     num_clips = (req.duration + 9) // 10
     
+    # Calculer le coût en crédits selon la qualité
+    required_credits = calculate_credits_cost(req.duration, req.quality)
+    
     # 1. Vérifier/créer user
     try:
         user = supabase.table("users").select("*").eq("id", req.user_id).execute()
@@ -204,23 +225,23 @@ async def generate_video(req: VideoRequest, background_tasks: BackgroundTasks):
             supabase.table("users").insert({
                 "id": req.user_id,
                 "email": f"{req.user_id}@vykso.com",
-                "credits": 50,
-                "plan": "starter"
+                "credits": 10,
+                "plan": "free"
             }).execute()
             user = supabase.table("users").select("*").eq("id", req.user_id).execute()
         
         user_data = user.data[0]
-        print(f"👤 User: {req.user_id}, Credits: {user_data['credits']}")
+        print(f"👤 User: {req.user_id}, Credits: {user_data['credits']}, Plan: {user_data['plan']}")
         
     except Exception as e:
         print(f"❌ Error checking user: {e}")
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
     
-    # 2. Vérifier crédits (1 crédit par clip de 10s)
-    if user_data["credits"] < num_clips:
+    # 2. Vérifier crédits
+    if user_data["credits"] < required_credits:
         raise HTTPException(
             status_code=402, 
-            detail=f"Crédits insuffisants. Besoin de {num_clips} crédits, vous avez {user_data['credits']}"
+            detail=f"Crédits insuffisants. Besoin de {required_credits} crédits, vous avez {user_data['credits']}"
         )
     
     # 3. Créer job dans Supabase
@@ -264,7 +285,7 @@ async def generate_video(req: VideoRequest, background_tasks: BackgroundTasks):
         status="pending",
         estimated_time=f"{estimated_time}-{estimated_time + 60}s",
         num_clips=num_clips,
-        total_credits=num_clips
+        total_credits=required_credits
     )
 
 @app.get("/api/videos/{job_id}/status")
@@ -306,13 +327,28 @@ async def get_user_videos(user_id: str, limit: int = 20, offset: int = 0):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/api/users/{user_id}/info")
+async def get_user_info(user_id: str):
+    """Récupère les infos complètes d'un utilisateur"""
+    try:
+        user = supabase.table("users").select("*").eq("id", user_id).single().execute()
+        
+        if not user.data:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        return user.data
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 # ============= STRIPE ENDPOINTS =============
 
 @app.post("/api/stripe/create-checkout")
 async def create_checkout_session(req: CheckoutRequest):
-    """Créer une session Stripe Checkout"""
+    """Créer une session Stripe Checkout pour abonnement"""
     
-    # Map des Price IDs (à remplir après création dans Stripe)
+    # Map des Price IDs
     price_ids = {
         "starter": os.getenv("STRIPE_PRICE_STARTER"),
         "pro": os.getenv("STRIPE_PRICE_PRO"),
@@ -333,12 +369,48 @@ async def create_checkout_session(req: CheckoutRequest):
                 'quantity': 1,
             }],
             mode='subscription',
-            success_url=f"{os.getenv('FRONTEND_URL', 'https://vykso.lovable.app')}/dashboard?session_id={{CHECKOUT_SESSION_ID}}",
+            success_url=f"{os.getenv('FRONTEND_URL', 'https://vykso.lovable.app')}/payment-success?session_id={{CHECKOUT_SESSION_ID}}",
             cancel_url=f"{os.getenv('FRONTEND_URL', 'https://vykso.lovable.app')}/pricing",
             client_reference_id=req.user_id,
             metadata={
                 'user_id': req.user_id,
-                'plan': req.plan
+                'plan': req.plan,
+                'type': 'subscription'
+            }
+        )
+        
+        return {"checkout_url": session.url}
+    
+    except Exception as e:
+        print(f"❌ Stripe error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/stripe/buy-credits")
+async def buy_credits(req: BuyCreditsRequest):
+    """Acheter des crédits ponctuels (pas d'abonnement)"""
+    
+    try:
+        session = stripe.checkout.Session.create(
+            payment_method_types=['card'],
+            line_items=[{
+                'price_data': {
+                    'currency': 'eur',
+                    'product_data': {
+                        'name': f'{req.credits} Vykso Credits',
+                        'description': f'{req.credits // 6} videos of 60s'
+                    },
+                    'unit_amount': req.amount * 100  # en centimes
+                },
+                'quantity': 1,
+            }],
+            mode='payment',  # Paiement unique, pas subscription
+            success_url=f"{os.getenv('FRONTEND_URL', 'https://vykso.lovable.app')}/payment-success?session_id={{CHECKOUT_SESSION_ID}}",
+            cancel_url=f"{os.getenv('FRONTEND_URL', 'https://vykso.lovable.app')}/credits",
+            client_reference_id=req.user_id,
+            metadata={
+                'user_id': req.user_id,
+                'credits': str(req.credits),
+                'type': 'credit_purchase'
             }
         )
         
@@ -371,30 +443,54 @@ async def stripe_webhook(request: Request):
     # Gérer l'événement checkout.session.completed
     if event['type'] == 'checkout.session.completed':
         session = event['data']['object']
-        user_id = session['metadata']['user_id']
-        plan = session['metadata']['plan']
+        metadata = session.get('metadata', {})
+        user_id = metadata.get('user_id')
         
-        # Crédits selon le plan
-        credits_map = {
-            "starter": 10,
-            "pro": 20,
-            "max": 30
-        }
-        
-        print(f"✅ Checkout completed for user {user_id}, plan: {plan}")
-        
-        # Mettre à jour l'utilisateur
-        try:
-            supabase.table("users").update({
-                "plan": plan,
-                "credits": credits_map[plan],
-                "stripe_customer_id": session.get('customer'),
-                "stripe_subscription_id": session.get('subscription')
-            }).eq("id", user_id).execute()
+        # Si c'est un achat de crédits (pas une subscription)
+        if metadata.get('type') == 'credit_purchase':
+            credits_to_add = int(metadata.get('credits', 0))
             
-            print(f"✅ User {user_id} upgraded to {plan} with {credits_map[plan]} credits")
-        except Exception as e:
-            print(f"❌ Error updating user: {e}")
+            print(f"💳 Credit purchase: {credits_to_add} credits for user {user_id}")
+            
+            try:
+                # Récupérer les crédits actuels
+                user = supabase.table("users").select("credits").eq("id", user_id).single().execute()
+                current_credits = user.data.get('credits', 0)
+                
+                # Ajouter les crédits
+                supabase.table("users").update({
+                    "credits": current_credits + credits_to_add
+                }).eq("id", user_id).execute()
+                
+                print(f"✅ Added {credits_to_add} credits to user {user_id} (total: {current_credits + credits_to_add})")
+            except Exception as e:
+                print(f"❌ Error adding credits: {e}")
+        
+        # Si c'est un abonnement
+        elif metadata.get('type') == 'subscription':
+            plan = metadata.get('plan')
+            
+            # Crédits selon le plan
+            credits_map = {
+                "starter": 60,   # 10 vidéos × 6 crédits
+                "pro": 120,      # 20 vidéos × 6 crédits
+                "max": 180       # 30 vidéos × 6 crédits
+            }
+            
+            print(f"✅ Subscription {plan} for user {user_id}")
+            
+            # Mettre à jour l'utilisateur
+            try:
+                supabase.table("users").update({
+                    "plan": plan,
+                    "credits": credits_map.get(plan, 60),
+                    "stripe_customer_id": session.get('customer'),
+                    "stripe_subscription_id": session.get('subscription')
+                }).eq("id", user_id).execute()
+                
+                print(f"✅ User {user_id} upgraded to {plan} with {credits_map.get(plan)} credits")
+            except Exception as e:
+                print(f"❌ Error updating user: {e}")
     
     # Gérer le renouvellement mensuel
     elif event['type'] == 'invoice.payment_succeeded':
@@ -409,17 +505,17 @@ async def stripe_webhook(request: Request):
                 if user.data:
                     plan = user.data['plan']
                     credits_map = {
-                        "starter": 10,
-                        "pro": 20,
-                        "max": 30
+                        "starter": 60,
+                        "pro": 120,
+                        "max": 180
                     }
                     
                     # Recharger les crédits mensuels
                     supabase.table("users").update({
-                        "credits": credits_map[plan]
+                        "credits": credits_map.get(plan, 60)
                     }).eq("id", user.data['id']).execute()
                     
-                    print(f"✅ Monthly credits recharged for user {user.data['id']}: {credits_map[plan]} credits")
+                    print(f"✅ Monthly credits recharged for user {user.data['id']}: {credits_map.get(plan)} credits")
             except Exception as e:
                 print(f"❌ Error recharging credits: {e}")
     
@@ -519,7 +615,12 @@ async def kie_callback(payload: dict):
                 job_data = job_result.data[0]
                 job_id = job_data["id"]
                 user_id = job_data["user_id"]
+                quality = job_data.get("quality", "basic")
+                duration = job_data.get("duration", 10)
                 kie_task_id_field = job_data.get("kie_task_id")
+                
+                # Calculer les crédits à débiter
+                credits_to_deduct = calculate_credits_cost(duration, quality)
                 
                 # Déterminer si single ou multi-clip
                 try:
@@ -539,13 +640,13 @@ async def kie_callback(payload: dict):
                         "completed_at": "now()"
                     }).eq("id", job_id).execute()
                     
-                    # Débiter crédit
+                    # Débiter crédits
                     supabase.rpc("decrement_credits", {
                         "p_user_id": user_id,
-                        "p_amount": 1
+                        "p_amount": credits_to_deduct
                     }).execute()
                     
-                    print(f"✅ Job {job_id} completed!")
+                    print(f"✅ Job {job_id} completed! ({credits_to_deduct} credits deducted)")
                 
                 else:
                     # ===== CAS MULTI-CLIPS : Stocker et attendre les autres =====
@@ -598,6 +699,7 @@ async def kie_callback(payload: dict):
                                 ExtraArgs={
                                     'ContentType': 'video/mp4',
                                     'CacheControl': 'public, max-age=31536000'
+                                    # ACL supprimé - R2 ne le supporte pas
                                 }
                             )
                             
@@ -614,10 +716,10 @@ async def kie_callback(payload: dict):
                             # Débiter crédits
                             supabase.rpc("decrement_credits", {
                                 "p_user_id": user_id,
-                                "p_amount": num_clips
+                                "p_amount": credits_to_deduct
                             }).execute()
                             
-                            print(f"✅ Job {job_id} completed (multi-clip, {num_clips} clips concatenated)!")
+                            print(f"✅ Job {job_id} completed (multi-clip, {num_clips} clips concatenated, {credits_to_deduct} credits deducted)!")
                         
                         except Exception as concat_error:
                             print(f"❌ Concatenation or upload failed: {concat_error}")
@@ -668,3 +770,5 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8080))
     uvicorn.run(app, host="0.0.0.0", port=port)
+                            
+                            # Marquer le job en erreur
