@@ -25,7 +25,7 @@ class KieAIClient:
         duration: int = 10,
         quality: Literal["basic", "pro_720p", "pro_1080p"] = "basic",
         image_urls: Optional[List[str]] = None,
-        shots: Optional[List[Dict]] = None,  # Pour storyboard
+        shots: Optional[List[Dict]] = None,
         model_type: Literal["text-to-video", "image-to-video", "storyboard"] = "text-to-video"
     ) -> dict:
         """
