@@ -45,8 +45,7 @@ class R2Uploader:
             filename,
             ExtraArgs={
                 'ContentType': 'video/mp4',
-                'CacheControl': 'public, max-age=31536000',
-                'ACL': 'public-read'
+                'CacheControl': 'public, max-age=31536000'
             }
         )
         
