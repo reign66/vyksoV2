@@ -2,6 +2,8 @@ import os
 import json
 import uuid
 import stripe
+import httpx
+from fastapi.responses import StreamingResponse
 from typing import Optional, List, Dict, Literal
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
@@ -635,6 +637,47 @@ async def stripe_webhook(request: Request):
                 print(f"❌ Error recharging credits: {e}")
     
     return {"status": "success"}
+
+@app.get("/api/videos/{job_id}/download")
+async def download_video(job_id: str):
+    """Télécharge une vidéo directement depuis la plateforme"""
+    try:
+        # Récupérer l'URL de la vidéo depuis la DB
+        job = supabase.table("video_jobs").select("video_url, niche, created_at").eq("id", job_id).single().execute()
+        
+        if not job.data:
+            raise HTTPException(status_code=404, detail="Video not found")
+        
+        video_url = job.data.get("video_url")
+        
+        if not video_url:
+            raise HTTPException(status_code=404, detail="Video URL not available")
+        
+        # Télécharger la vidéo depuis R2
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            response = await client.get(video_url)
+            response.raise_for_status()
+        
+        # Générer un nom de fichier propre
+        niche = job.data.get("niche", "video")
+        created_at = job.data.get("created_at", "")[:10]  # Format YYYY-MM-DD
+        filename = f"vykso_{niche}_{created_at}_{job_id[:8]}.mp4"
+        
+        # Retourner la vidéo en streaming
+        return StreamingResponse(
+            iter([response.content]),
+            media_type="video/mp4",
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "Content-Length": str(len(response.content))
+            }
+        )
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Download error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/callback")
 async def kie_callback(payload: dict):
