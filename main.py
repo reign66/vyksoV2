@@ -10,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from kie_client import KieAIClient
 from supabase_client import get_client
-from utils.uploader import R2Uploader
+from utils.supabase_uploader import SupabaseVideoUploader
 from utils.video_concat import VideoEditor
 from io import BytesIO
 
@@ -32,7 +32,7 @@ app.add_middleware(
 # Clients
 kie = KieAIClient()
 supabase = get_client()
-uploader = R2Uploader()
+uploader = SupabaseVideoUploader()
 video_editor = VideoEditor()
 
 # Stripe
