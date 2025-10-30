@@ -9,6 +9,7 @@ from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from kie_client import KieAIClient
+from veo_client import VeoAIClient
 from supabase_client import get_client
 from utils.supabase_uploader import SupabaseVideoUploader
 from utils.video_concat import VideoEditor
@@ -31,6 +32,7 @@ app.add_middleware(
 
 # Clients
 kie = KieAIClient()
+veo = VeoAIClient()
 supabase = get_client()
 uploader = SupabaseVideoUploader()
 video_editor = VideoEditor()
@@ -46,6 +48,7 @@ class VideoRequest(BaseModel):
     duration: int
     quality: str = "basic"
     custom_prompt: Optional[str] = None
+    ai_model: Literal["sora2", "veo3_fast", "veo3"] = "veo3_fast"
 
 class VideoResponse(BaseModel):
     job_id: str
@@ -76,6 +79,7 @@ class VideoRequestAdvanced(BaseModel):
     image_urls: Optional[List[str]] = None
     shots: Optional[List[StoryboardShot]] = None
     model_type: Literal["text-to-video", "image-to-video", "storyboard"] = "text-to-video"
+    ai_model: Literal["sora2", "veo3_fast", "veo3"] = "veo3_fast"
 
 # ============= FUNCTIONS =============
 
@@ -122,108 +126,185 @@ async def process_video_generation(
     custom_prompt: str = None,
     image_urls: List[str] = None,
     shots: List[dict] = None,
-    model_type: str = "text-to-video"
+    model_type: str = "text-to-video",
+    ai_model: str = "veo3_fast"
 ):
     """Background task : génère la vidéo (tous les modèles supportés)"""
     try:
         print(f"🎬 Starting generation for job {job_id}")
+        print(f"🤖 AI Model: {ai_model}")
         print(f"📊 Model type: {model_type}")
         
         supabase.table("video_jobs").update({
             "status": "generating"
         }).eq("id", job_id).execute()
         
-        # Pour storyboard, chaque shot est généré séparément
-        if model_type == "storyboard" and shots:
-            print(f"🎬 Storyboard mode: {len(shots)} shots")
+        # ===== DÉTECTION DU MODÈLE AI =====
+        if ai_model in ["veo3", "veo3_fast"]:
+            # ===== MODE VEO 3.1 =====
+            print(f"🎥 Using Veo 3.1 API ({ai_model})")
             
-            tasks = []
-            for i, shot in enumerate(shots):
-                print(f"📝 Shot {i+1}/{len(shots)}: {shot['Scene'][:80]}...")
+            # Veo génère des vidéos de ~8 secondes max par clip
+            if duration > 8:
+                # Multi-clip avec Veo
+                num_clips = (duration + 7) // 8  # Arrondi supérieur
+                print(f"🎥 Multi-clip Veo generation ({num_clips} clips of ~8s)")
                 
-                task = await kie.generate_video(
-                    prompt="",
-                    duration=int(shot['duration']),
-                    quality=quality,
-                    image_urls=image_urls,
-                    shots=[shot],
-                    model_type="storyboard"
-                )
-                tasks.append(task)
-                print(f"✅ Shot {i+1}/{len(shots)} task created: {task['taskId']}")
-            
-            task_ids = [t["taskId"] for t in tasks]
-            supabase.table("video_jobs").update({
-                "kie_task_id": json.dumps(task_ids),
-                "status": "waiting_callback",
-                "metadata": json.dumps({
-                    "num_clips": len(shots),
-                    "clips_completed": 0,
-                    "clips_urls": {},
-                    "model_type": "storyboard"
-                })
-            }).eq("id", job_id).execute()
-            
-            print(f"⏳ All {len(shots)} shots submitted, waiting for callbacks...")
-            return
-        
-        # Pour les autres modèles (text-to-video ou image-to-video)
-        if duration > 15:
-            num_clips = (duration + 9) // 10
-            print(f"🎥 Multi-clip generation ({num_clips} clips)")
-            
-            tasks = []
-            for i in range(num_clips):
-                clip_prompt = generate_prompt(niche, custom_prompt, i+1, num_clips)
-                print(f"📝 Clip {i+1}/{num_clips} prompt: {clip_prompt[:80]}...")
+                tasks = []
+                for i in range(num_clips):
+                    clip_prompt = generate_prompt(niche, custom_prompt, i+1, num_clips)
+                    print(f"📝 Clip {i+1}/{num_clips} prompt: {clip_prompt[:80]}...")
+                    
+                    task = await veo.generate_video(
+                        prompt=clip_prompt,
+                        model=ai_model,
+                        aspect_ratio="9:16",
+                        image_urls=image_urls if i == 0 else None
+                    )
+                    tasks.append(task)
+                    print(f"✅ Clip {i+1}/{num_clips} task created: {task['taskId']}")
                 
-                task = await kie.generate_video(
-                    prompt=clip_prompt,
-                    duration=10,
-                    quality=quality,
-                    image_urls=image_urls if i == 0 else None,
-                    model_type=model_type
+                task_ids = [t["taskId"] for t in tasks]
+                supabase.table("video_jobs").update({
+                    "kie_task_id": json.dumps(task_ids),
+                    "status": "waiting_callback",
+                    "metadata": json.dumps({
+                        "num_clips": num_clips,
+                        "clips_completed": 0,
+                        "clips_urls": {},
+                        "model_type": model_type,
+                        "ai_model": ai_model
+                    })
+                }).eq("id", job_id).execute()
+                
+                print(f"⏳ All {num_clips} Veo tasks submitted, waiting for callbacks...")
+            
+            else:
+                # Single clip Veo (≤ 8s)
+                print("🎥 Single Veo clip generation")
+                
+                prompt = generate_prompt(niche, custom_prompt)
+                
+                task = await veo.generate_video(
+                    prompt=prompt,
+                    model=ai_model,
+                    aspect_ratio="9:16",
+                    image_urls=image_urls
                 )
-                tasks.append(task)
-                print(f"✅ Clip {i+1}/{num_clips} task created: {task['taskId']}")
-            
-            task_ids = [t["taskId"] for t in tasks]
-            supabase.table("video_jobs").update({
-                "kie_task_id": json.dumps(task_ids),
-                "status": "waiting_callback",
-                "metadata": json.dumps({
-                    "num_clips": num_clips,
-                    "clips_completed": 0,
-                    "clips_urls": {},
-                    "model_type": model_type
-                })
-            }).eq("id", job_id).execute()
-            
-            print(f"⏳ All {num_clips} tasks submitted, waiting for callbacks...")
+                
+                task_id = task["taskId"]
+                print(f"✅ Task created: {task_id}")
+                
+                supabase.table("video_jobs").update({
+                    "kie_task_id": task_id,
+                    "status": "waiting_callback",
+                    "metadata": json.dumps({
+                        "ai_model": ai_model
+                    })
+                }).eq("id", job_id).execute()
+                
+                print(f"⏳ Task {task_id} submitted, waiting for callback...")
         
         else:
-            # Single clip (10 ou 15s)
-            print("🎥 Single clip generation")
+            # ===== MODE SORA 2 =====
+            print(f"🎥 Using Sora 2 API")
             
-            prompt = generate_prompt(niche, custom_prompt)
+            # Pour storyboard, chaque shot est généré séparément
+            if model_type == "storyboard" and shots:
+                print(f"🎬 Storyboard mode: {len(shots)} shots")
+                
+                tasks = []
+                for i, shot in enumerate(shots):
+                    print(f"📝 Shot {i+1}/{len(shots)}: {shot['Scene'][:80]}...")
+                    
+                    task = await kie.generate_video(
+                        prompt="",
+                        duration=int(shot['duration']),
+                        quality=quality,
+                        image_urls=image_urls,
+                        shots=[shot],
+                        model_type="storyboard"
+                    )
+                    tasks.append(task)
+                    print(f"✅ Shot {i+1}/{len(shots)} task created: {task['taskId']}")
+                
+                task_ids = [t["taskId"] for t in tasks]
+                supabase.table("video_jobs").update({
+                    "kie_task_id": json.dumps(task_ids),
+                    "status": "waiting_callback",
+                    "metadata": json.dumps({
+                        "num_clips": len(shots),
+                        "clips_completed": 0,
+                        "clips_urls": {},
+                        "model_type": "storyboard",
+                        "ai_model": ai_model
+                    })
+                }).eq("id", job_id).execute()
+                
+                print(f"⏳ All {len(shots)} shots submitted, waiting for callbacks...")
+                return
             
-            task = await kie.generate_video(
-                prompt=prompt,
-                duration=duration,
-                quality=quality,
-                image_urls=image_urls,
-                model_type=model_type
-            )
+            # Pour les autres modèles Sora (text-to-video ou image-to-video)
+            if duration > 15:
+                num_clips = (duration + 9) // 10
+                print(f"🎥 Multi-clip Sora generation ({num_clips} clips)")
+                
+                tasks = []
+                for i in range(num_clips):
+                    clip_prompt = generate_prompt(niche, custom_prompt, i+1, num_clips)
+                    print(f"📝 Clip {i+1}/{num_clips} prompt: {clip_prompt[:80]}...")
+                    
+                    task = await kie.generate_video(
+                        prompt=clip_prompt,
+                        duration=10,
+                        quality=quality,
+                        image_urls=image_urls if i == 0 else None,
+                        model_type=model_type
+                    )
+                    tasks.append(task)
+                    print(f"✅ Clip {i+1}/{num_clips} task created: {task['taskId']}")
+                
+                task_ids = [t["taskId"] for t in tasks]
+                supabase.table("video_jobs").update({
+                    "kie_task_id": json.dumps(task_ids),
+                    "status": "waiting_callback",
+                    "metadata": json.dumps({
+                        "num_clips": num_clips,
+                        "clips_completed": 0,
+                        "clips_urls": {},
+                        "model_type": model_type,
+                        "ai_model": ai_model
+                    })
+                }).eq("id", job_id).execute()
+                
+                print(f"⏳ All {num_clips} tasks submitted, waiting for callbacks...")
             
-            task_id = task["taskId"]
-            print(f"✅ Task created: {task_id}")
-            
-            supabase.table("video_jobs").update({
-                "kie_task_id": task_id,
-                "status": "waiting_callback"
-            }).eq("id", job_id).execute()
-            
-            print(f"⏳ Task {task_id} submitted, waiting for callback...")
+            else:
+                # Single clip (10 ou 15s)
+                print("🎥 Single Sora clip generation")
+                
+                prompt = generate_prompt(niche, custom_prompt)
+                
+                task = await kie.generate_video(
+                    prompt=prompt,
+                    duration=duration,
+                    quality=quality,
+                    image_urls=image_urls,
+                    model_type=model_type
+                )
+                
+                task_id = task["taskId"]
+                print(f"✅ Task created: {task_id}")
+                
+                supabase.table("video_jobs").update({
+                    "kie_task_id": task_id,
+                    "status": "waiting_callback",
+                    "metadata": json.dumps({
+                        "ai_model": ai_model
+                    })
+                }).eq("id", job_id).execute()
+                
+                print(f"⏳ Task {task_id} submitted, waiting for callback...")
         
     except Exception as e:
         print(f"❌ Error generating video {job_id}: {e}")
@@ -301,6 +382,7 @@ async def generate_video(req: VideoRequest, background_tasks: BackgroundTasks):
                 "num_clips": num_clips,
                 "target_duration": req.duration,
                 "custom_prompt": req.custom_prompt
+                "ai_model": req.ai_model
             })
         }).execute()
         
@@ -319,6 +401,10 @@ async def generate_video(req: VideoRequest, background_tasks: BackgroundTasks):
         req.quality, 
         req.user_id,
         req.custom_prompt
+        None,
+        None,
+        "text-to-video",
+        req.ai_model
     )
     
     estimated_time = num_clips * 40
@@ -346,8 +432,10 @@ async def generate_video_advanced(req: VideoRequestAdvanced, background_tasks: B
         if not req.niche and not req.custom_prompt:
             raise HTTPException(status_code=400, detail="Either niche or custom_prompt is required")
     
+    # Calculer le coût
     required_credits = calculate_credits_cost(req.duration, req.quality)
     
+    # Vérifier user et crédits
     try:
         user = supabase.table("users").select("*").eq("id", req.user_id).execute()
         
@@ -373,6 +461,7 @@ async def generate_video_advanced(req: VideoRequestAdvanced, background_tasks: B
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
     
+    # Créer job
     try:
         job = supabase.table("video_jobs").insert({
             "user_id": req.user_id,
@@ -384,7 +473,8 @@ async def generate_video_advanced(req: VideoRequestAdvanced, background_tasks: B
             "metadata": json.dumps({
                 "model_type": req.model_type,
                 "has_images": bool(req.image_urls),
-                "num_shots": len(req.shots) if req.shots else 0
+                "num_shots": len(req.shots) if req.shots else 0,
+                "ai_model": req.ai_model
             })
         }).execute()
         
@@ -393,6 +483,7 @@ async def generate_video_advanced(req: VideoRequestAdvanced, background_tasks: B
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
     
+    # Lancer génération
     shots_dict = [shot.dict() for shot in req.shots] if req.shots else None
     
     background_tasks.add_task(
@@ -405,7 +496,8 @@ async def generate_video_advanced(req: VideoRequestAdvanced, background_tasks: B
         req.custom_prompt,
         req.image_urls,
         shots_dict,
-        req.model_type
+        req.model_type,
+        req.ai_model
     )
     
     estimated_time = (len(req.shots) if req.shots else 1) * 40
