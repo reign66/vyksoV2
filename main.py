@@ -653,7 +653,7 @@ async def download_video(job_id: str):
         if not video_url:
             raise HTTPException(status_code=404, detail="Video URL not available")
         
-        # Télécharger la vidéo depuis R2
+        # Télécharger la vidéo depuis Supabase
         async with httpx.AsyncClient(timeout=120.0) as client:
             response = await client.get(video_url)
             response.raise_for_status()
@@ -780,7 +780,7 @@ async def kie_callback(payload: dict):
                     is_multi = False
                 
                 if not is_multi:
-                    print(f"📤 Uploading single video to R2...")
+                    print(f"📤 Uploading single video to Supabase...")
                     final_url = uploader.upload_from_url(video_url, f"{job_id}.mp4")
                     
                     supabase.table("video_jobs").update({
@@ -829,21 +829,12 @@ async def kie_callback(payload: dict):
                             
                             print(f"✅ Concatenation successful, video size: {len(concatenated_data)} bytes")
                             
-                            print(f"📤 Uploading concatenated video to R2...")
-                            video_buffer = BytesIO(concatenated_data)
-                            
-                            uploader.s3.upload_fileobj(
-                                video_buffer,
-                                uploader.bucket,
-                                f"{job_id}.mp4",
-                                ExtraArgs={
-                                    'ContentType': 'video/mp4',
-                                    'CacheControl': 'public, max-age=31536000'
-                                }
-                            )
-                            
-                            final_url = f"{uploader.public_base}/{job_id}.mp4"
+                            print(f"📤 Uploading concatenated video to Supabase Storage...")
+
+                            # Upload vers Supabase Storage avec la méthode upload_bytes
+                            final_url = uploader.upload_bytes(concatenated_data, f"{job_id}.mp4")
                             print(f"✅ Concatenated video uploaded: {final_url}")
+                            
                             
                             supabase.table("video_jobs").update({
                                 "status": "completed",
