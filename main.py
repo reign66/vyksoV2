@@ -381,7 +381,7 @@ async def generate_video(req: VideoRequest, background_tasks: BackgroundTasks):
             "metadata": json.dumps({
                 "num_clips": num_clips,
                 "target_duration": req.duration,
-                "custom_prompt": req.custom_prompt
+                "custom_prompt": req.custom_prompt,
                 "ai_model": req.ai_model
             })
         }).execute()
@@ -400,7 +400,7 @@ async def generate_video(req: VideoRequest, background_tasks: BackgroundTasks):
         req.duration, 
         req.quality, 
         req.user_id,
-        req.custom_prompt
+        req.custom_prompt,
         None,
         None,
         "text-to-video",
