@@ -7,6 +7,7 @@ from fastapi.responses import StreamingResponse
 from typing import Optional, List, Dict, Literal
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 from pydantic import BaseModel
 from sora_client import SoraClient
 from veo_client import VeoAIClient
@@ -14,6 +15,8 @@ from supabase_client import get_client
 from utils.supabase_uploader import SupabaseVideoUploader
 from utils.video_concat import VideoEditor
 from io import BytesIO
+from starlette.requests import Request as StarletteRequest
+from starlette.responses import StreamingResponse as StarletteStreamingResponse
 
 app = FastAPI(
     title="Vykso API",
@@ -39,6 +42,76 @@ video_editor = VideoEditor()
 
 # Stripe
 stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
+
+# ========= VIDEO STREAMING/PROXY HELPERS =========
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY") or os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+VIDEOS_BUCKET = os.getenv("VIDEOS_BUCKET", "vykso-videos")
+
+def _extract_object_path_from_public_url(public_url: str, bucket: str) -> Optional[str]:
+    """Extract the storage object path (filename) from a Supabase public URL.
+    Supports URLs like .../storage/v1/object/public/{bucket}/{path}.
+    """
+    try:
+        parts = public_url.split("/storage/v1/object/")
+        if len(parts) < 2:
+            return None
+        tail = parts[1]
+        # remove leading 'public/' if present
+        if tail.startswith("public/"):
+            tail = tail[len("public/"):]
+        # tail is now like '{bucket}/{path}'
+        if not tail.startswith(f"{bucket}/"):
+            return None
+        return tail[len(bucket) + 1 :]
+    except Exception:
+        return None
+
+async def _proxy_supabase_object_stream(object_path: str, range_header: Optional[str]):
+    """Stream a Supabase Storage object with Range support using the service key.
+    This avoids exposing external URLs and works with private buckets.
+    """
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+        raise HTTPException(status_code=500, detail="Supabase configuration missing")
+
+    # Build direct storage endpoint (non-public) so auth works for private buckets
+    object_url = f"{SUPABASE_URL}/storage/v1/object/{VIDEOS_BUCKET}/{object_path}"
+
+    headers = {
+        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+        "Accept": "application/octet-stream",
+    }
+    if range_header:
+        headers["Range"] = range_header
+
+    async with httpx.AsyncClient(timeout=None, follow_redirects=True) as client:
+        upstream = await client.get(object_url, headers=headers)
+        # 200 or 206 expected; propagate errors
+        if upstream.status_code >= 400:
+            raise HTTPException(status_code=upstream.status_code, detail="Unable to fetch video content")
+
+        # Prepare headers to forward
+        forward_headers = {}
+        for h in [
+            "Content-Type",
+            "Content-Length",
+            "Content-Range",
+            "Accept-Ranges",
+            "ETag",
+            "Last-Modified",
+            "Cache-Control",
+        ]:
+            v = upstream.headers.get(h)
+            if v:
+                forward_headers[h] = v
+
+        status = upstream.status_code  # 200 or 206 for ranges
+
+        async def body_iter():
+            async for chunk in upstream.aiter_bytes(chunk_size=1024 * 256):
+                yield chunk
+
+        return StarletteStreamingResponse(body_iter(), status_code=status, headers=forward_headers, media_type="video/mp4")
 
 # ============= MODELS =============
 
@@ -671,44 +744,64 @@ async def stripe_webhook(request: Request):
     return {"status": "success"}
 
 @app.get("/api/videos/{job_id}/download")
-async def download_video(job_id: str):
-    """Télécharge une vidéo directement depuis la plateforme"""
+async def download_video(job_id: str, request: Request):
+    """Télécharge une vidéo directement depuis la plateforme (proxy + streaming, supporte gros fichiers)."""
     try:
-        # Récupérer l'URL de la vidéo depuis la DB
         job = supabase.table("video_jobs").select("video_url, niche, created_at").eq("id", job_id).single().execute()
-        
         if not job.data:
             raise HTTPException(status_code=404, detail="Video not found")
-        
+
         video_url = job.data.get("video_url")
-        
         if not video_url:
             raise HTTPException(status_code=404, detail="Video URL not available")
-        
-        # Télécharger la vidéo depuis Supabase
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            response = await client.get(video_url)
-            response.raise_for_status()
-        
-        # Générer un nom de fichier propre
+
+        object_path = _extract_object_path_from_public_url(video_url, VIDEOS_BUCKET)
+        if not object_path:
+            # Fallback: try to use the filename from URL
+            object_path = video_url.rstrip("/").split("/")[-1]
+
+        # Build filename
         niche = job.data.get("niche", "video")
-        created_at = job.data.get("created_at", "")[:10]  # Format YYYY-MM-DD
+        created_at = job.data.get("created_at", "")[:10]
         filename = f"vykso_{niche}_{created_at}_{job_id[:8]}.mp4"
-        
-        # Retourner la vidéo en streaming
-        return StreamingResponse(
-            iter([response.content]),
-            media_type="video/mp4",
-            headers={
-                "Content-Disposition": f'attachment; filename="{filename}"',
-                "Content-Length": str(len(response.content))
-            }
-        )
-    
+
+        # Proxy with range support
+        range_header = request.headers.get("range") or request.headers.get("Range")
+        stream_resp = await _proxy_supabase_object_stream(object_path, range_header)
+        # Force attachment disposition for downloads
+        stream_resp.headers["Content-Disposition"] = f'attachment; filename="{filename}"'
+        return stream_resp
+
     except HTTPException:
         raise
     except Exception as e:
         print(f"❌ Download error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/videos/{job_id}/stream")
+async def stream_video(job_id: str, request: Request):
+    """Stream vidéo pour lecture dans le player (Range + proxy, pas d'URL externe)."""
+    try:
+        job = supabase.table("video_jobs").select("video_url").eq("id", job_id).single().execute()
+        if not job.data:
+            raise HTTPException(status_code=404, detail="Video not found")
+
+        video_url = job.data.get("video_url")
+        if not video_url:
+            raise HTTPException(status_code=404, detail="Video URL not available")
+
+        object_path = _extract_object_path_from_public_url(video_url, VIDEOS_BUCKET)
+        if not object_path:
+            object_path = video_url.rstrip("/").split("/")[-1]
+
+        range_header = request.headers.get("range") or request.headers.get("Range")
+        return await _proxy_supabase_object_stream(object_path, range_header)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Stream error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/callback")
