@@ -66,10 +66,12 @@ CREATE INDEX IF NOT EXISTS idx_video_jobs_created_at ON video_jobs(created_at DE
 
 1. Allez dans **Authentication > Providers** dans Supabase
 2. Activez **Google**
-3. Entrez :
-   - **Client ID** : `806484205365-aqqji9cc7dpbmq39ef1e84u9956aqdjj.apps.googleusercontent.com`
-   - **Client Secret** : `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`
+3. Entrez vos credentials Google OAuth :
+   - **Client ID** : (? r?cup?rer depuis Google Cloud Console)
+   - **Client Secret** : (? r?cup?rer depuis Google Cloud Console)
 4. Ajoutez l'URL de callback : `https://vykso.com/auth/callback`
+
+**Note** : Vos credentials Google OAuth doivent ?tre configur?s dans votre projet Google Cloud Console et ajout?s dans Supabase. Ne commitez jamais ces secrets dans Git.
 
 ### 1.3 Cr?er les buckets Storage
 
