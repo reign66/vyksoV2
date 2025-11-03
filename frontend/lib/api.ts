@@ -103,3 +103,21 @@ export const stripeApi = {
     return response.data;
   },
 };
+
+export const userSyncApi = {
+  sync: async (userData: {
+    id: string;
+    email?: string;
+    user_metadata?: {
+      first_name?: string;
+      last_name?: string;
+      full_name?: string;
+    };
+  }) => {
+    const response = await api.post<{ success: boolean; user: any }>(
+      '/api/users/sync',
+      userData
+    );
+    return response.data;
+  },
+};

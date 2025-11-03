@@ -10,6 +10,7 @@ import { LogOut, Video, CreditCard, Sparkles, Loader2 } from 'lucide-react';
 import Link from 'next/link';
 import { VideoGenerator } from '@/components/VideoGenerator';
 import { VideoGallery } from '@/components/VideoGallery';
+import { stripeApi } from '@/lib/api';
 import toast from 'react-hot-toast';
 
 export default function DashboardPage() {
@@ -129,17 +130,12 @@ function CreditsSection({ userId }: { userId: string }) {
 
   const handleBuyCredits = async (credits: number, amount: number) => {
     try {
-      const response = await fetch('/api/backend/stripe/buy-credits', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ user_id: userId, credits, amount }),
-      });
-      const data = await response.json();
+      const data = await stripeApi.buyCredits(userId, credits, amount);
       if (data.checkout_url) {
         window.location.href = data.checkout_url;
       }
-    } catch (error) {
-      toast.error('Erreur lors de l\'achat de cr?dits');
+    } catch (error: any) {
+      toast.error(error.response?.data?.detail || 'Erreur lors de l\'achat de cr?dits');
     }
   };
 

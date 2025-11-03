@@ -5,13 +5,28 @@ const nextConfig = {
     domains: [
       process.env.NEXT_PUBLIC_SUPABASE_URL?.replace('https://', '').split('/')[0],
       'vykso.com',
+      'localhost',
     ].filter(Boolean),
   },
-  async rewrites() {
+  // Remove rewrites - we'll use direct API calls
+  async headers() {
     return [
       {
-        source: '/api/backend/:path*',
-        destination: `${process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:8080'}/api/:path*`,
+        source: '/:path*',
+        headers: [
+          {
+            key: 'X-Content-Type-Options',
+            value: 'nosniff',
+          },
+          {
+            key: 'X-Frame-Options',
+            value: 'DENY',
+          },
+          {
+            key: 'X-XSS-Protection',
+            value: '1; mode=block',
+          },
+        ],
       },
     ];
   },

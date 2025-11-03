@@ -5,6 +5,7 @@ import { supabase } from '@/lib/supabase/client';
 import { useAuthStore } from '@/store/auth';
 import { useRouter, usePathname } from 'next/navigation';
 import { User } from '@supabase/supabase-js';
+import { userSyncApi } from '@/lib/api';
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const { setUser, setLoading, fetchUserData } = useAuthStore();
@@ -21,18 +22,14 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         const lastName = user.user_metadata?.last_name || fullName.split(' ').slice(1).join(' ') || null;
 
         // Sync with backend
-        await fetch('/api/backend/users/sync', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            id: user.id,
-            email: user.email,
-            user_metadata: {
-              first_name: firstName,
-              last_name: lastName,
-              full_name: fullName,
-            },
-          }),
+        await userSyncApi.sync({
+          id: user.id,
+          email: user.email,
+          user_metadata: {
+            first_name: firstName,
+            last_name: lastName,
+            full_name: fullName,
+          },
         }).catch((err) => console.error('Error syncing user:', err));
 
         // Fetch updated user data
