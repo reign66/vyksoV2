@@ -24,10 +24,15 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# CORS pour Lovable
+# CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "http://localhost:3000",
+        "https://vykso.com",
+        "https://www.vykso.com",
+        os.getenv("FRONTEND_URL", ""),
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -573,6 +578,50 @@ async def get_user_info(user_id: str):
     except HTTPException:
         raise
     except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/users/sync")
+async def sync_user_from_auth(user_data: dict):
+    """Synchronise les données utilisateur depuis Supabase Auth (appelé après login OAuth)"""
+    try:
+        user_id = user_data.get("id")
+        email = user_data.get("email")
+        first_name = user_data.get("user_metadata", {}).get("first_name") or user_data.get("user_metadata", {}).get("full_name", "").split()[0] if user_data.get("user_metadata", {}).get("full_name") else None
+        last_name = user_data.get("user_metadata", {}).get("last_name") or " ".join(user_data.get("user_metadata", {}).get("full_name", "").split()[1:]) if user_data.get("user_metadata", {}).get("full_name") and len(user_data.get("user_metadata", {}).get("full_name", "").split()) > 1 else None
+        
+        if not user_id:
+            raise HTTPException(status_code=400, detail="User ID is required")
+        
+        # Check if user exists
+        existing = supabase.table("users").select("*").eq("id", user_id).execute()
+        
+        update_data = {
+            "email": email or f"{user_id}@vykso.com",
+        }
+        
+        if first_name:
+            update_data["first_name"] = first_name
+        if last_name:
+            update_data["last_name"] = last_name
+        
+        if existing.data:
+            # Update existing user
+            result = supabase.table("users").update(update_data).eq("id", user_id).execute()
+        else:
+            # Create new user
+            update_data.update({
+                "id": user_id,
+                "credits": 10,
+                "plan": "free"
+            })
+            result = supabase.table("users").insert(update_data).execute()
+        
+        return {"success": True, "user": result.data[0] if result.data else None}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error syncing user: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 # ============= STRIPE ENDPOINTS =============
