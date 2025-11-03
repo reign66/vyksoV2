@@ -11,8 +11,4 @@ export const supabase = createClient(supabaseUrl, supabaseAnonKey, {
     storage: typeof window !== 'undefined' ? window.localStorage : undefined,
     flowType: 'pkce',
   },
-  cookieOptions: {
-    sameSite: 'lax',
-    secure: process.env.NODE_ENV === 'production',
-  },
 });

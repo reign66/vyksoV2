@@ -30,7 +30,6 @@ CREATE TABLE IF NOT EXISTS video_jobs (
     quality TEXT,
     prompt TEXT,
     metadata JSONB,
-    kie_task_id TEXT,
     error TEXT,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     completed_at TIMESTAMP WITH TIME ZONE
