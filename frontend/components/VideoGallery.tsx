@@ -10,30 +10,6 @@ export function VideoGallery({ userId }: { userId: string }) {
   const [loading, setLoading] = useState(true);
   const [polling, setPolling] = useState<Set<string>>(new Set());
 
-  useEffect(() => {
-    loadVideos();
-  }, [userId]);
-
-  useEffect(() => {
-    // Poll for pending/generating videos
-    const interval = setInterval(() => {
-      polling.forEach((jobId) => {
-        videoApi.getStatus(jobId).then((job) => {
-          if (job.status === 'completed' || job.status === 'failed') {
-            setPolling((prev) => {
-              const next = new Set(prev);
-              next.delete(jobId);
-              return next;
-            });
-            loadVideos(); // Refresh list
-          }
-        });
-      });
-    }, 3000);
-
-    return () => clearInterval(interval);
-  }, [polling]);
-
   const loadVideos = async () => {
     try {
       const data = await videoApi.getUserVideos(userId);
@@ -54,6 +30,32 @@ export function VideoGallery({ userId }: { userId: string }) {
       setLoading(false);
     }
   };
+
+  useEffect(() => {
+    loadVideos();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [userId]);
+
+  useEffect(() => {
+    // Poll for pending/generating videos
+    const interval = setInterval(() => {
+      polling.forEach((jobId) => {
+        videoApi.getStatus(jobId).then((job) => {
+          if (job.status === 'completed' || job.status === 'failed') {
+            setPolling((prev) => {
+              const next = new Set(prev);
+              next.delete(jobId);
+              return next;
+            });
+            loadVideos(); // Refresh list
+          }
+        });
+      });
+    }, 3000);
+
+    return () => clearInterval(interval);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [polling]);
 
   const getStatusIcon = (status: string) => {
     switch (status) {

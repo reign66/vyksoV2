@@ -7,7 +7,6 @@ API backend pour génération automatique de vidéos TikTok via Sora 2.
 - **FastAPI** - API REST
 - **Supabase** - Database + Auth
 - **Cloudflare R2** - Storage vidéos
-- **Kie.ai** - Sora 2 API
 - **Railway** - Hosting
 
 ## Setup Local
