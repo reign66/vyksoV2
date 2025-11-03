@@ -141,8 +141,8 @@ J'ai cr?? un guide complet dans `DEPLOYMENT.md`. Voici le r?sum? :
 1. ? Frontend : Bouton "Continuer avec Google" fonctionnel
 2. ? Backend : Endpoint `/api/users/sync` cr?? pour r?cup?rer nom/pr?nom
 3. ? Supabase : Vous devez juste activer Google dans le dashboard avec :
-   - Client ID : `806484205365-aqqji9cc7dpbmq39ef1e84u9956aqdjj.apps.googleusercontent.com`
-   - Client Secret : `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`
+   - Client ID : `YOUR_GOOGLE_CLIENT_ID`
+   - Client Secret : `YOUR_GOOGLE_CLIENT_SECRET`
 
 Le nom et pr?nom seront automatiquement r?cup?r?s depuis Google et stock?s dans votre BDD.
 
