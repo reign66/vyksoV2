@@ -49,3 +49,18 @@ class SupabaseVideoUploader:
         print(f"✅ Uploaded successfully: {public_url}")
         
         return public_url
+
+    def upload_bytes(self, video_bytes: bytes, filename: str) -> str:
+        """Upload raw MP4 bytes and return the public URL."""
+        print(f"📤 Uploading bytes to Supabase Storage: {filename}")
+        self.supabase.storage.from_(self.bucket).upload(
+            filename,
+            video_bytes,
+            {
+                "content-type": "video/mp4",
+                "cache-control": "public, max-age=31536000",
+            },
+        )
+        public_url = self.supabase.storage.from_(self.bucket).get_public_url(filename)
+        print(f"✅ Uploaded successfully: {public_url}")
+        return public_url
