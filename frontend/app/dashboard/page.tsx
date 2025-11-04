@@ -48,22 +48,22 @@ export default function DashboardPage() {
   }
 
   return (
-    <div className="min-h-screen bg-gray-50">
+    <div className="min-h-screen bg-gradient-to-br from-gray-50 to-blue-50">
       {/* Header */}
-      <header className="bg-white border-b">
+      <header className="bg-white/80 backdrop-blur-md border-b border-gray-200 shadow-sm sticky top-0 z-40">
         <div className="container mx-auto px-4 py-4">
           <div className="flex items-center justify-between">
             <Logo />
             <div className="flex items-center gap-4">
-              <div className="text-right">
-                <p className="text-sm text-gray-600">Cr?dits disponibles</p>
-                <p className="text-xl font-bold text-primary-600">
+              <div className="text-right px-4 py-2 bg-gradient-to-r from-primary-50 to-purple-50 rounded-lg border border-primary-200">
+                <p className="text-xs font-medium text-gray-600 uppercase tracking-wide">Crédits disponibles</p>
+                <p className="text-2xl font-bold bg-gradient-to-r from-primary-600 to-purple-600 bg-clip-text text-transparent">
                   {userData?.credits ?? 0}
                 </p>
               </div>
               <Button onClick={handleLogout} variant="ghost" size="sm">
                 <LogOut className="w-4 h-4 mr-2" />
-                D?connexion
+                Déconnexion
               </Button>
             </div>
           </div>
@@ -71,41 +71,41 @@ export default function DashboardPage() {
       </header>
 
       {/* Navigation Tabs */}
-      <div className="bg-white border-b">
+      <div className="bg-white/80 backdrop-blur-md border-b border-gray-200 shadow-sm">
         <div className="container mx-auto px-4">
-          <nav className="flex gap-4">
+          <nav className="flex gap-2">
             <button
               onClick={() => setActiveTab('generate')}
-              className={`px-6 py-4 font-medium border-b-2 transition-colors ${
+              className={`px-6 py-4 font-medium border-b-2 transition-all rounded-t-lg ${
                 activeTab === 'generate'
-                  ? 'border-primary-600 text-primary-600'
-                  : 'border-transparent text-gray-600 hover:text-gray-900'
+                  ? 'border-primary-600 text-primary-600 bg-primary-50'
+                  : 'border-transparent text-gray-600 hover:text-gray-900 hover:bg-gray-50'
               }`}
             >
               <Sparkles className="w-4 h-4 inline mr-2" />
-              G?n?rer une vid?o
+              Générer une vidéo
             </button>
             <button
               onClick={() => setActiveTab('gallery')}
-              className={`px-6 py-4 font-medium border-b-2 transition-colors ${
+              className={`px-6 py-4 font-medium border-b-2 transition-all rounded-t-lg ${
                 activeTab === 'gallery'
-                  ? 'border-primary-600 text-primary-600'
-                  : 'border-transparent text-gray-600 hover:text-gray-900'
+                  ? 'border-primary-600 text-primary-600 bg-primary-50'
+                  : 'border-transparent text-gray-600 hover:text-gray-900 hover:bg-gray-50'
               }`}
             >
               <Video className="w-4 h-4 inline mr-2" />
-              Mes vid?os
+              Mes vidéos
             </button>
             <button
               onClick={() => setActiveTab('credits')}
-              className={`px-6 py-4 font-medium border-b-2 transition-colors ${
+              className={`px-6 py-4 font-medium border-b-2 transition-all rounded-t-lg ${
                 activeTab === 'credits'
-                  ? 'border-primary-600 text-primary-600'
-                  : 'border-transparent text-gray-600 hover:text-gray-900'
+                  ? 'border-primary-600 text-primary-600 bg-primary-50'
+                  : 'border-transparent text-gray-600 hover:text-gray-900 hover:bg-gray-50'
               }`}
             >
               <CreditCard className="w-4 h-4 inline mr-2" />
-              Cr?dits & Plans
+              Crédits & Plans
             </button>
           </nav>
         </div>
@@ -135,50 +135,50 @@ function CreditsSection({ userId }: { userId: string }) {
         window.location.href = data.checkout_url;
       }
     } catch (error: any) {
-      toast.error(error.response?.data?.detail || 'Erreur lors de l\'achat de cr?dits');
+      toast.error(error.response?.data?.detail || 'Erreur lors de l\'achat de crédits');
     }
   };
 
   return (
     <div>
-      <h2 className="text-3xl font-bold mb-8">Acheter des cr?dits</h2>
+      <h2 className="text-3xl font-bold mb-8">Acheter des crédits</h2>
       <div className="grid md:grid-cols-3 gap-6">
-        <div className="bg-white p-6 rounded-lg border-2 border-gray-200">
-          <h3 className="text-xl font-bold mb-2">Petit Pack</h3>
-          <p className="text-3xl font-bold text-primary-600 mb-4">30 cr?dits</p>
-          <p className="text-gray-600 mb-4">? 5 vid?os de 60s</p>
+        <div className="bg-white p-8 rounded-2xl shadow-lg border-2 border-gray-200 hover:shadow-xl transition-all transform hover:-translate-y-1">
+          <h3 className="text-2xl font-bold mb-3 text-gray-900">Petit Pack</h3>
+          <p className="text-4xl font-bold bg-gradient-to-r from-primary-600 to-purple-600 bg-clip-text text-transparent mb-2">30 crédits</p>
+          <p className="text-gray-600 mb-6">≈ 5 vidéos de 60s</p>
           <Button
             onClick={() => handleBuyCredits(30, 10)}
-            className="w-full"
+            className="w-full bg-gradient-to-r from-primary-600 to-primary-700 hover:from-primary-700 hover:to-primary-800 shadow-lg"
           >
-            10?
+            10€
           </Button>
         </div>
 
-        <div className="bg-white p-6 rounded-lg border-2 border-primary-500 relative">
-          <span className="absolute -top-3 left-1/2 -translate-x-1/2 bg-primary-600 text-white px-4 py-1 rounded-full text-sm">
+        <div className="bg-gradient-to-br from-primary-50 to-purple-50 p-8 rounded-2xl shadow-xl border-2 border-primary-500 relative transform hover:-translate-y-1 transition-all">
+          <span className="absolute -top-4 left-1/2 -translate-x-1/2 bg-gradient-to-r from-primary-600 to-purple-600 text-white px-5 py-1.5 rounded-full text-sm font-semibold shadow-lg">
             Populaire
           </span>
-          <h3 className="text-xl font-bold mb-2">Pack Moyen</h3>
-          <p className="text-3xl font-bold text-primary-600 mb-4">100 cr?dits</p>
-          <p className="text-gray-600 mb-4">? 16 vid?os de 60s</p>
+          <h3 className="text-2xl font-bold mb-3 text-gray-900 mt-2">Pack Moyen</h3>
+          <p className="text-4xl font-bold bg-gradient-to-r from-primary-600 to-purple-600 bg-clip-text text-transparent mb-2">100 crédits</p>
+          <p className="text-gray-600 mb-6">≈ 16 vidéos de 60s</p>
           <Button
             onClick={() => handleBuyCredits(100, 25)}
-            className="w-full"
+            className="w-full bg-gradient-to-r from-primary-600 to-primary-700 hover:from-primary-700 hover:to-primary-800 shadow-lg"
           >
-            25?
+            25€
           </Button>
         </div>
 
-        <div className="bg-white p-6 rounded-lg border-2 border-gray-200">
-          <h3 className="text-xl font-bold mb-2">Gros Pack</h3>
-          <p className="text-3xl font-bold text-primary-600 mb-4">250 cr?dits</p>
-          <p className="text-gray-600 mb-4">? 41 vid?os de 60s</p>
+        <div className="bg-white p-8 rounded-2xl shadow-lg border-2 border-gray-200 hover:shadow-xl transition-all transform hover:-translate-y-1">
+          <h3 className="text-2xl font-bold mb-3 text-gray-900">Gros Pack</h3>
+          <p className="text-4xl font-bold bg-gradient-to-r from-primary-600 to-purple-600 bg-clip-text text-transparent mb-2">250 crédits</p>
+          <p className="text-gray-600 mb-6">≈ 41 vidéos de 60s</p>
           <Button
             onClick={() => handleBuyCredits(250, 50)}
-            className="w-full"
+            className="w-full bg-gradient-to-r from-primary-600 to-primary-700 hover:from-primary-700 hover:to-primary-800 shadow-lg"
           >
-            50?
+            50€
           </Button>
         </div>
       </div>

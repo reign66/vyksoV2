@@ -32,9 +32,9 @@ function PaymentSuccessContent() {
     <div className="min-h-screen bg-gray-50 flex items-center justify-center p-4">
       <div className="max-w-md w-full bg-white rounded-2xl shadow-xl p-8 text-center">
         <CheckCircle2 className="w-16 h-16 text-green-600 mx-auto mb-4" />
-        <h1 className="text-3xl font-bold mb-4">Paiement r?ussi !</h1>
+        <h1 className="text-3xl font-bold mb-4">Paiement réussi !</h1>
         <p className="text-gray-600 mb-6">
-          Votre transaction a ?t? trait?e avec succ?s. Vos cr?dits ont ?t? ajout?s ? votre compte.
+          Votre transaction a été traitée avec succès. Vos crédits ont été ajoutés à votre compte.
         </p>
         <Button onClick={() => router.push('/dashboard')} className="w-full">
           Retour au tableau de bord

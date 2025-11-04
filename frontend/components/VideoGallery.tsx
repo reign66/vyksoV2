@@ -25,7 +25,7 @@ export function VideoGallery({ userId }: { userId: string }) {
         return next;
       });
     } catch (error) {
-      toast.error('Erreur lors du chargement des vid?os');
+      toast.error('Erreur lors du chargement des vidéos');
     } finally {
       setLoading(false);
     }
@@ -74,11 +74,11 @@ export function VideoGallery({ userId }: { userId: string }) {
   const getStatusText = (status: string) => {
     switch (status) {
       case 'completed':
-        return 'Termin?e';
+        return 'Terminée';
       case 'failed':
-        return '?chou?e';
+        return 'Échouée';
       case 'generating':
-        return 'G?n?ration en cours...';
+        return 'Génération en cours...';
       case 'pending':
         return 'En attente...';
       default:
@@ -99,10 +99,10 @@ export function VideoGallery({ userId }: { userId: string }) {
       <div className="text-center py-12">
         <Video className="w-16 h-16 text-gray-400 mx-auto mb-4" />
         <h3 className="text-xl font-medium text-gray-900 mb-2">
-          Aucune vid?o g?n?r?e
+          Aucune vidéo générée
         </h3>
         <p className="text-gray-600">
-          G?n?rez votre premi?re vid?o pour commencer !
+          Générez votre première vidéo pour commencer !
         </p>
       </div>
     );
@@ -110,7 +110,7 @@ export function VideoGallery({ userId }: { userId: string }) {
 
   return (
     <div>
-      <h2 className="text-3xl font-bold mb-6">Mes vid?os</h2>
+      <h2 className="text-3xl font-bold mb-6">Mes vidéos</h2>
       <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-6">
         {videos.map((video) => (
           <div
@@ -132,7 +132,7 @@ export function VideoGallery({ userId }: { userId: string }) {
             <div className="p-4">
               <div className="flex items-center justify-between mb-2">
                 <span className="text-sm font-medium text-gray-900">
-                  {video.niche || 'Personnalis?'}
+                  {video.niche || 'Personnalisé'}
                 </span>
                 <span className="text-sm text-gray-600 flex items-center gap-1">
                   {getStatusIcon(video.status)}
@@ -141,7 +141,7 @@ export function VideoGallery({ userId }: { userId: string }) {
               </div>
 
               <p className="text-xs text-gray-500 mb-3">
-                {video.duration}s ? {video.quality} ? {new Date(video.created_at).toLocaleDateString('fr-FR')}
+                {video.duration}s • {video.quality} • {new Date(video.created_at).toLocaleDateString('fr-FR')}
               </p>
 
               {video.status === 'completed' && video.video_url && (
@@ -151,7 +151,7 @@ export function VideoGallery({ userId }: { userId: string }) {
                   className="inline-flex items-center gap-2 text-sm text-primary-600 hover:text-primary-700"
                 >
                   <Download className="w-4 h-4" />
-                  T?l?charger
+                  Télécharger
                 </a>
               )}
 
