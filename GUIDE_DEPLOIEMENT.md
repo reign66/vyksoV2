@@ -115,16 +115,17 @@ Railway devrait détecter automatiquement le `railway.json` dans `frontend/`. Si
    - **Browser Cache TTL** : Respect Existing Headers
    - **Always Use HTTPS** : On
 
-### 3.4 Configurer les en-têtes (Important pour UTF-8)
+### 3.4 Configurer les en-têtes (Optionnel - Déjà géré par Next.js)
 
+⚠️ **IMPORTANT** : Next.js configure déjà automatiquement les en-têtes UTF-8 dans `next.config.js`. 
+**NE créez PAS de règle Cloudflare pour `Content-Type`** car cela créera un doublon et peut causer des problèmes.
+
+Si vous avez déjà créé une règle Cloudflare pour `Content-Type`, **SUPPRIMEZ-LA** :
 1. Allez dans **Rules** → **Transform Rules** → **Modify Response Header**
-2. Créez une nouvelle règle :
-   - **Name** : `UTF-8 Content-Type`
-   - **URL** : `votre-domaine.com/*`
-   - **Set static** :
-     - **Header name** : `Content-Type`
-     - **Value** : `text/html; charset=utf-8`
-3. Sauvegardez
+2. Trouvez la règle `UTF-8 Content-Type` ou similaire
+3. Cliquez sur **Delete** ou **Remove**
+
+Les en-têtes de sécurité (X-Frame-Options, X-XSS-Protection, etc.) sont déjà gérés par Next.js.
 
 ### 3.5 Désactiver le cache pour le développement (Optionnel)
 
@@ -194,8 +195,8 @@ Assurez-vous que toutes les variables d'environnement sont correctement configur
 ### Problème : Caractères spéciaux affichés comme "?"
 
 **Solutions :**
-1. Vérifiez que la règle Cloudflare pour `Content-Type: text/html; charset=utf-8` est active
-2. Vérifiez que `next.config.js` contient bien la configuration UTF-8
+1. ⚠️ **SUPPRIMEZ** toute règle Cloudflare pour `Content-Type` si vous en avez créé une (cela crée un conflit)
+2. Vérifiez que `next.config.js` contient bien la configuration UTF-8 (c'est déjà le cas)
 3. Videz le cache Cloudflare : **Caching** → **Configuration** → **Purge Everything**
 4. Vérifiez que les fichiers sont bien encodés en UTF-8
 
