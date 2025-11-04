@@ -1,6 +1,9 @@
 'use client';
 
 import { useEffect } from 'react';
+
+// Force dynamic rendering to avoid build-time Supabase initialization
+export const dynamic = 'force-dynamic';
 import { useRouter } from 'next/navigation';
 import { supabase } from '@/lib/supabase/client';
 import { Logo } from '@/components/Logo';

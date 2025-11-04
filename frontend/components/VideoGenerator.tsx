@@ -8,10 +8,10 @@ import toast from 'react-hot-toast';
 import { Sparkles, Loader2 } from 'lucide-react';
 
 const NICHES = [
-  { id: 'recettes', label: 'Recettes de cuisine', emoji: '?????' },
-  { id: 'voyage', label: 'Voyage & Aventure', emoji: '??' },
-  { id: 'motivation', label: 'Motivation & Lifestyle', emoji: '??' },
-  { id: 'tech', label: 'Tech & Innovation', emoji: '??' },
+  { id: 'recettes', label: 'Recettes de cuisine', emoji: '🍳' },
+  { id: 'voyage', label: 'Voyage & Aventure', emoji: '✈️' },
+  { id: 'motivation', label: 'Motivation & Lifestyle', emoji: '💪' },
+  { id: 'tech', label: 'Tech & Innovation', emoji: '💻' },
 ];
 
 export function VideoGenerator() {
