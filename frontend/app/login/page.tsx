@@ -1,19 +1,21 @@
 'use client';
 
-import { useEffect } from 'react';
+import { useEffect, useState, Suspense } from 'react';
 
 // Force dynamic rendering to avoid build-time Supabase initialization
 export const dynamic = 'force-dynamic';
-import { useRouter } from 'next/navigation';
+import { useRouter, useSearchParams } from 'next/navigation';
 import { supabase } from '@/lib/supabase/client';
 import { Logo } from '@/components/Logo';
 import { Button } from '@/components/ui/Button';
 import { useAuthStore } from '@/store/auth';
 import toast from 'react-hot-toast';
 
-export default function LoginPage() {
+function LoginContent() {
   const router = useRouter();
+  const searchParams = useSearchParams();
   const { user, loading } = useAuthStore();
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     if (user && !loading) {
@@ -21,12 +23,29 @@ export default function LoginPage() {
     }
   }, [user, loading, router]);
 
+  useEffect(() => {
+    // Check for error in URL params (from callback redirect)
+    const errorParam = searchParams.get('error');
+    if (errorParam) {
+      const decodedError = decodeURIComponent(errorParam);
+      setError(decodedError);
+      toast.error(decodedError);
+      // Clean up URL
+      router.replace('/login');
+    }
+  }, [searchParams, router]);
+
   const handleGoogleLogin = async () => {
     try {
-      const { error } = await supabase.auth.signInWithOAuth({
+      setError(null);
+      
+      // Get the current origin (works for both localhost and Vercel)
+      const redirectTo = `${window.location.origin}/auth/callback`;
+      
+      const { error, data } = await supabase.auth.signInWithOAuth({
         provider: 'google',
         options: {
-          redirectTo: `${window.location.origin}/auth/callback`,
+          redirectTo,
           queryParams: {
             access_type: 'offline',
             prompt: 'consent',
@@ -34,9 +53,18 @@ export default function LoginPage() {
         },
       });
 
-      if (error) throw error;
+      if (error) {
+        console.error('OAuth error:', error);
+        throw error;
+      }
+
+      // The redirect will happen automatically
+      // No need to do anything else here
     } catch (error: any) {
-      toast.error(error.message || 'Erreur lors de la connexion');
+      const errorMessage = error.message || 'Erreur lors de la connexion';
+      setError(errorMessage);
+      toast.error(errorMessage);
+      console.error('Login error:', error);
     }
   };
 
@@ -56,6 +84,12 @@ export default function LoginPage() {
           <h1 className="text-4xl font-bold text-gray-900 mb-3 bg-gradient-to-r from-primary-600 to-purple-600 bg-clip-text text-transparent">Bienvenue</h1>
           <p className="text-gray-600 text-lg">Connectez-vous pour commencer à créer des vidéos</p>
         </div>
+
+        {error && (
+          <div className="mb-4 p-4 bg-red-50 border border-red-200 rounded-lg">
+            <p className="text-sm text-red-800">{error}</p>
+          </div>
+        )}
 
         <Button
           onClick={handleGoogleLogin}
@@ -91,5 +125,17 @@ export default function LoginPage() {
         </p>
       </div>
     </div>
+  );
+}
+
+export default function LoginPage() {
+  return (
+    <Suspense fallback={
+      <div className="min-h-screen flex items-center justify-center">
+        <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-primary-600"></div>
+      </div>
+    }>
+      <LoginContent />
+    </Suspense>
   );
 }
