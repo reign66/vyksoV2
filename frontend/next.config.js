@@ -30,16 +30,6 @@ const nextConfig = {
           },
         ],
       },
-      {
-        // Apply Content-Type only to HTML files
-        source: '/:path((?!.*\\.(js|css|png|jpg|jpeg|gif|svg|ico|woff|woff2|ttf|eot)).*)',
-        headers: [
-          {
-            key: 'Content-Type',
-            value: 'text/html; charset=utf-8',
-          },
-        ],
-      },
     ];
   },
 };
