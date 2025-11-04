@@ -25,12 +25,12 @@ export function VideoGenerator() {
 
   const handleGenerate = async () => {
     if (!user) {
-      toast.error('Vous devez ?tre connect?');
+      toast.error('Vous devez être connecté');
       return;
     }
 
     if (!selectedNiche && !customPrompt.trim()) {
-      toast.error('Veuillez s?lectionner une niche ou entrer un prompt personnalis?');
+      toast.error('Veuillez sélectionner une niche ou entrer un prompt personnalisé');
       return;
     }
 
@@ -41,7 +41,7 @@ export function VideoGenerator() {
     if (quality === 'pro_1080p') requiredCredits = numClips * 5;
 
     if (userData && userData.credits < requiredCredits) {
-      toast.error(`Cr?dits insuffisants. Vous avez besoin de ${requiredCredits} cr?dits.`);
+      toast.error(`Crédits insuffisants. Vous avez besoin de ${requiredCredits} crédits.`);
       return;
     }
 
@@ -57,14 +57,14 @@ export function VideoGenerator() {
         ai_model: aiModel,
       });
 
-      toast.success(`Vid?o en cours de g?n?ration ! (${response.estimated_time})`);
+      toast.success(`Vidéo en cours de génération ! (${response.estimated_time})`);
       
       // Redirect to gallery after a short delay
       setTimeout(() => {
         window.location.hash = 'gallery';
       }, 2000);
     } catch (error: any) {
-      toast.error(error.response?.data?.detail || 'Erreur lors de la g?n?ration');
+      toast.error(error.response?.data?.detail || 'Erreur lors de la génération');
     } finally {
       setGenerating(false);
     }
@@ -75,13 +75,13 @@ export function VideoGenerator() {
       <div className="bg-white rounded-2xl shadow-lg p-8">
         <h2 className="text-3xl font-bold mb-6 flex items-center gap-2">
           <Sparkles className="w-8 h-8 text-primary-600" />
-          G?n?rer une nouvelle vid?o
+          Générer une nouvelle vidéo
         </h2>
 
         {/* Niche Selection */}
         <div className="mb-6">
           <label className="block text-sm font-medium text-gray-700 mb-3">
-            Choisissez une niche (ou laissez vide pour un prompt personnalis?)
+            Choisissez une niche (ou laissez vide pour un prompt personnalisé)
           </label>
           <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
             {NICHES.map((niche) => (
@@ -115,7 +115,7 @@ export function VideoGenerator() {
               setCustomPrompt(e.target.value);
               if (e.target.value.trim()) setSelectedNiche('');
             }}
-            placeholder="Ex: Un chat qui joue du piano dans un caf? parisien..."
+            placeholder="Ex: Un chat qui joue du piano dans un café parisien..."
             className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-transparent"
             rows={3}
           />
@@ -124,7 +124,7 @@ export function VideoGenerator() {
         {/* Duration */}
         <div className="mb-6">
           <label className="block text-sm font-medium text-gray-700 mb-2">
-            Dur?e: {duration} secondes
+            Durée: {duration} secondes
           </label>
           <input
             type="range"
@@ -144,7 +144,7 @@ export function VideoGenerator() {
         {/* Quality */}
         <div className="mb-6">
           <label className="block text-sm font-medium text-gray-700 mb-2">
-            Qualit?
+            Qualité
           </label>
           <div className="flex gap-4">
             <label className="flex items-center">
@@ -155,7 +155,7 @@ export function VideoGenerator() {
                 onChange={(e) => setQuality(e.target.value as any)}
                 className="mr-2"
               />
-              Basic (1 cr?dit/clip)
+              Basic (1 crédit/clip)
             </label>
             <label className="flex items-center">
               <input
@@ -165,7 +165,7 @@ export function VideoGenerator() {
                 onChange={(e) => setQuality(e.target.value as any)}
                 className="mr-2"
               />
-              Pro 720p (3 cr?dits/clip)
+              Pro 720p (3 crédits/clip)
             </label>
             <label className="flex items-center">
               <input
@@ -175,7 +175,7 @@ export function VideoGenerator() {
                 onChange={(e) => setQuality(e.target.value as any)}
                 className="mr-2"
               />
-              Pro 1080p (5 cr?dits/clip)
+              Pro 1080p (5 crédits/clip)
             </label>
           </div>
         </div>
@@ -183,15 +183,15 @@ export function VideoGenerator() {
         {/* AI Model */}
         <div className="mb-6">
           <label className="block text-sm font-medium text-gray-700 mb-2">
-            Mod?le IA
+            Modèle IA
           </label>
           <select
             value={aiModel}
             onChange={(e) => setAiModel(e.target.value as any)}
             className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500"
           >
-            <option value="veo3_fast">Veo 3 Fast (Recommand?)</option>
-            <option value="veo3">Veo 3 (Haute qualit?)</option>
+            <option value="veo3_fast">Veo 3 Fast (Recommandé)</option>
+            <option value="veo3">Veo 3 (Haute qualité)</option>
             <option value="sora2">Sora 2</option>
           </select>
         </div>
@@ -199,9 +199,9 @@ export function VideoGenerator() {
         {/* Cost Summary */}
         <div className="mb-6 p-4 bg-gray-50 rounded-lg">
           <p className="text-sm text-gray-600">
-            Co?t estim?:{' '}
+            Coût estimé:{' '}
             <span className="font-bold text-primary-600">
-              {Math.ceil(duration / 10) * (quality === 'basic' ? 1 : quality === 'pro_720p' ? 3 : 5)} cr?dits
+              {Math.ceil(duration / 10) * (quality === 'basic' ? 1 : quality === 'pro_720p' ? 3 : 5)} crédits
             </span>
           </p>
         </div>
@@ -216,12 +216,12 @@ export function VideoGenerator() {
           {generating ? (
             <>
               <Loader2 className="w-5 h-5 mr-2 animate-spin" />
-              G?n?ration en cours...
+              Génération en cours...
             </>
           ) : (
             <>
               <Sparkles className="w-5 h-5 mr-2" />
-              G?n?rer la vid?o
+              Générer la vidéo
             </>
           )}
         </Button>

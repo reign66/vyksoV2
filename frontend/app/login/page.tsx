@@ -46,17 +46,17 @@ export default function LoginPage() {
   }
 
   return (
-    <div className="min-h-screen bg-gradient-to-b from-primary-50 to-white flex items-center justify-center p-4">
-      <div className="max-w-md w-full bg-white rounded-2xl shadow-xl p-8">
+    <div className="min-h-screen bg-gradient-to-br from-primary-50 via-blue-50 to-purple-50 flex items-center justify-center p-4">
+      <div className="max-w-md w-full bg-white rounded-2xl shadow-2xl p-8 border border-gray-100">
         <div className="text-center mb-8">
-          <Logo className="justify-center mb-4" />
-          <h1 className="text-3xl font-bold text-gray-900 mb-2">Bienvenue</h1>
-          <p className="text-gray-600">Connectez-vous pour commencer ? cr?er des vid?os</p>
+          <Logo className="justify-center mb-6" />
+          <h1 className="text-4xl font-bold text-gray-900 mb-3 bg-gradient-to-r from-primary-600 to-purple-600 bg-clip-text text-transparent">Bienvenue</h1>
+          <p className="text-gray-600 text-lg">Connectez-vous pour commencer à créer des vidéos</p>
         </div>
 
         <Button
           onClick={handleGoogleLogin}
-          className="w-full mb-4 flex items-center justify-center gap-3"
+          className="w-full mb-4 flex items-center justify-center gap-3 bg-gradient-to-r from-primary-600 to-primary-700 hover:from-primary-700 hover:to-primary-800 shadow-lg hover:shadow-xl transition-all"
           size="lg"
         >
           <svg className="w-5 h-5" viewBox="0 0 24 24">
