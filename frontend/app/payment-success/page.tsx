@@ -1,6 +1,9 @@
 'use client';
 
 import { useEffect, useState, Suspense } from 'react';
+
+// Force dynamic rendering to avoid build-time Supabase initialization
+export const dynamic = 'force-dynamic';
 import { useSearchParams, useRouter } from 'next/navigation';
 import { useAuthStore } from '@/store/auth';
 import { Logo } from '@/components/Logo';
