@@ -107,7 +107,7 @@ export function VideoGenerator() {
         <div className="mb-6 p-4 bg-gradient-to-r from-primary-50 to-purple-50 rounded-lg border border-primary-100">
           <p className="text-sm text-gray-700 flex items-start gap-2">
             <MonitorPlay className="w-4 h-4 mt-0.5 text-primary-600" />
-            Avec votre plan, vous disposez d'un quota en secondes. Une vidéo de {duration}s déduira {duration} secondes. Des vidéos plus courtes permettent d'en faire davantage chaque jour.
+            Avec votre plan, vous disposez d&apos;un quota en secondes. Une vidéo de {duration}s déduira {duration} secondes. Des vidéos plus courtes permettent d&apos;en faire davantage chaque jour.
           </p>
         </div>
 

@@ -15,7 +15,7 @@ export default function PricingPage() {
           </div>
           <h1 className="text-4xl md:text-5xl font-extrabold tracking-tight mt-4">Des plans clairs, pensés pour la création</h1>
           <p className="text-gray-600 mt-3 max-w-2xl mx-auto">
-            Choisissez un plan, utilisez vos secondes comme vous voulez. SORA 2, SORA 2 PRO, VEO 3.1 Fast ou VEO 3.1 Quality — pas de différence de "crédits" entre les modèles, seules les secondes comptent.
+            Choisissez un plan, utilisez vos secondes comme vous voulez. SORA 2, SORA 2 PRO, VEO 3.1 Fast ou VEO 3.1 Quality — pas de différence de &quot;crédits&quot; entre les modèles, seules les secondes comptent.
           </p>
         </div>
 
@@ -28,7 +28,7 @@ export default function PricingPage() {
               <p className="text-gray-600">Idéal pour débuter</p>
               <div className="mt-6 space-y-2 text-sm text-gray-700">
                 <Feature>Quota mensuel: 600 secondes</Feature>
-                <Feature>Jusqu'à 10 vidéos de 60s</Feature>
+                <Feature>Jusqu&apos;à 10 vidéos de 60s</Feature>
                 <Feature>Ou 2 vidéos par jour de 10s</Feature>
                 <Feature>Accès aux 4 modèles IA</Feature>
               </div>
@@ -47,7 +47,7 @@ export default function PricingPage() {
               <p className="text-gray-600">Pour créateurs réguliers</p>
               <div className="mt-6 space-y-2 text-sm text-gray-700">
                 <Feature>Quota mensuel: 1 200 secondes</Feature>
-                <Feature>Jusqu'à 20 vidéos de 60s</Feature>
+                <Feature>Jusqu&apos;à 20 vidéos de 60s</Feature>
                 <Feature>Ou 4 vidéos par jour de 10s</Feature>
                 <Feature>Accès aux 4 modèles IA</Feature>
                 <Feature>Priorité de génération</Feature>
@@ -64,7 +64,7 @@ export default function PricingPage() {
               <p className="text-gray-600">Pour équipes et pros</p>
               <div className="mt-6 space-y-2 text-sm text-gray-700">
                 <Feature>Quota mensuel: 3 000 secondes</Feature>
-                <Feature>Jusqu'à 50 vidéos de 60s</Feature>
+                <Feature>Jusqu&apos;à 50 vidéos de 60s</Feature>
                 <Feature>Ou ~5 vidéos par jour de 20s</Feature>
                 <Feature>Accès aux 4 modèles IA</Feature>
                 <Feature>Support prioritaire</Feature>

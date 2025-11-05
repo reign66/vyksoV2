@@ -156,7 +156,7 @@ function CreditsSection({ userId }: { userId: string }) {
         window.location.href = data.checkout_url;
       }
     } catch (error: any) {
-      toast.error(error.response?.data?.detail || 'Erreur lors de l\'achat de crédits');
+      toast.error(error.response?.data?.detail || 'Erreur lors de l\u2019achat de crédits');
     }
   };
 
@@ -165,7 +165,7 @@ function CreditsSection({ userId }: { userId: string }) {
       <div className="mb-8 p-5 rounded-xl border bg-gradient-to-r from-primary-50 to-purple-50 border-primary-100">
         <h2 className="text-2xl font-bold mb-2">Comprendre votre quota</h2>
         <p className="text-gray-700">
-          Votre plan vous donne un volume de secondes vidéo à utiliser comme vous le souhaitez. Par exemple, des vidéos de 10s permettent jusqu'à 2 vidéos par jour. Les modèles (SORA 2, SORA 2 PRO, VEO 3.1 Fast/Quality) consomment votre quota en secondes, sans différence visible en crédits.
+          Votre plan vous donne un volume de secondes vidéo à utiliser comme vous le souhaitez. Par exemple, des vidéos de 10s permettent jusqu&apos;à 2 vidéos par jour. Les modèles (SORA 2, SORA 2 PRO, VEO 3.1 Fast/Quality) consomment votre quota en secondes, sans différence visible en crédits.
         </p>
         <div className="mt-3">
           <Link href="/pricing" className="underline text-primary-700 font-medium">Voir les plans et détails</Link>

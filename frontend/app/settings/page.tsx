@@ -1,6 +1,6 @@
-export const dynamic = 'force-dynamic';
+"use client";
 
-'use client';
+export const dynamic = 'force-dynamic';
 
 import { useAuthStore } from '@/store/auth';
 import { Logo } from '@/components/Logo';
