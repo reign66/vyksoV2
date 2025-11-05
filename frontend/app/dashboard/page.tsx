@@ -9,7 +9,7 @@ import { useAuthStore } from '@/store/auth';
 import { Logo } from '@/components/Logo';
 import { Button } from '@/components/ui/Button';
 import { supabase } from '@/lib/supabase/client';
-import { LogOut, Video, CreditCard, Sparkles, Loader2 } from 'lucide-react';
+import { LogOut, Video, CreditCard, Sparkles, Loader2, Settings, BadgeDollarSign } from 'lucide-react';
 import Link from 'next/link';
 import { VideoGenerator } from '@/components/VideoGenerator';
 import { VideoGallery } from '@/components/VideoGallery';
@@ -56,8 +56,26 @@ export default function DashboardPage() {
       <header className="bg-white/80 backdrop-blur-md border-b border-gray-200 shadow-sm sticky top-0 z-40">
         <div className="container mx-auto px-4 py-4">
           <div className="flex items-center justify-between">
-            <Logo />
-            <div className="flex items-center gap-4">
+            <div className="flex items-center gap-6">
+              <Logo />
+              <div className="hidden md:block">
+                <p className="text-sm text-gray-500">Bienvenue{userData?.first_name ? `, ${userData.first_name}` : ''} 👋</p>
+                <p className="text-xs text-gray-400">Heureux de vous revoir</p>
+              </div>
+            </div>
+            <div className="flex items-center gap-3">
+              <Link href="/pricing" className="hidden md:inline-flex">
+                <Button variant="ghost" size="sm">
+                  <BadgeDollarSign className="w-4 h-4 mr-2" />
+                  Plans
+                </Button>
+              </Link>
+              <Link href="/settings" className="hidden md:inline-flex">
+                <Button variant="ghost" size="sm">
+                  <Settings className="w-4 h-4 mr-2" />
+                  Settings
+                </Button>
+              </Link>
               <div className="text-right px-4 py-2 bg-gradient-to-r from-primary-50 to-purple-50 rounded-lg border border-primary-200">
                 <p className="text-xs font-medium text-gray-600 uppercase tracking-wide">Crédits disponibles</p>
                 <p className="text-2xl font-bold bg-gradient-to-r from-primary-600 to-purple-600 bg-clip-text text-transparent">
@@ -138,13 +156,22 @@ function CreditsSection({ userId }: { userId: string }) {
         window.location.href = data.checkout_url;
       }
     } catch (error: any) {
-      toast.error(error.response?.data?.detail || 'Erreur lors de l\'achat de crédits');
+      toast.error(error.response?.data?.detail || 'Erreur lors de l\u2019achat de crédits');
     }
   };
 
   return (
     <div>
-      <h2 className="text-3xl font-bold mb-8">Acheter des crédits</h2>
+      <div className="mb-8 p-5 rounded-xl border bg-gradient-to-r from-primary-50 to-purple-50 border-primary-100">
+        <h2 className="text-2xl font-bold mb-2">Comprendre votre quota</h2>
+        <p className="text-gray-700">
+          Votre plan vous donne un volume de secondes vidéo à utiliser comme vous le souhaitez. Par exemple, des vidéos de 10s permettent jusqu&apos;à 2 vidéos par jour. Les modèles (SORA 2, SORA 2 PRO, VEO 3.1 Fast/Quality) consomment votre quota en secondes, sans différence visible en crédits.
+        </p>
+        <div className="mt-3">
+          <Link href="/pricing" className="underline text-primary-700 font-medium">Voir les plans et détails</Link>
+        </div>
+      </div>
+      <h3 className="text-xl font-semibold mb-4">Packs additionnels (optionnel)</h3>
       <div className="grid md:grid-cols-3 gap-6">
         <div className="bg-white p-8 rounded-2xl shadow-lg border-2 border-gray-200 hover:shadow-xl transition-all transform hover:-translate-y-1">
           <h3 className="text-2xl font-bold mb-3 text-gray-900">Petit Pack</h3>
