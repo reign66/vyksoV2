@@ -7,6 +7,7 @@ export const dynamic = 'force-dynamic';
 import { useRouter } from 'next/navigation';
 import { useAuthStore } from '@/store/auth';
 import { Logo } from '@/components/Logo';
+import { Sidebar } from '@/components/Sidebar';
 import { Button } from '@/components/ui/Button';
 import { supabase } from '@/lib/supabase/client';
 import { LogOut, Video, CreditCard, Sparkles, Loader2, Settings, BadgeDollarSign } from 'lucide-react';
@@ -51,31 +52,16 @@ export default function DashboardPage() {
   }
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-gray-50 to-blue-50">
-      {/* Header */}
-      <header className="bg-white/80 backdrop-blur-md border-b border-gray-200 shadow-sm sticky top-0 z-40">
-        <div className="container mx-auto px-4 py-4">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-6">
-              <Logo />
-              <div className="hidden md:block">
-                <p className="text-sm text-gray-500">Bienvenue{userData?.first_name ? `, ${userData.first_name}` : ''} 👋</p>
-                <p className="text-xs text-gray-400">Heureux de vous revoir</p>
-              </div>
+    <div className="min-h-screen bg-gradient-to-br from-gray-50 to-blue-50 flex">
+      <Sidebar />
+      <div className="flex-1 flex flex-col">
+        <header className="bg-white/80 backdrop-blur-md border-b border-gray-200">
+          <div className="px-6 py-4 flex items-center justify-between">
+            <div>
+              <p className="text-sm text-gray-500">Bienvenue{userData?.first_name ? `, ${userData.first_name}` : ''} 👋</p>
+              <p className="text-xs text-gray-400">Heureux de vous revoir</p>
             </div>
             <div className="flex items-center gap-3">
-              <Link href="/pricing" className="hidden md:inline-flex">
-                <Button variant="ghost" size="sm">
-                  <BadgeDollarSign className="w-4 h-4 mr-2" />
-                  Plans
-                </Button>
-              </Link>
-              <Link href="/settings" className="hidden md:inline-flex">
-                <Button variant="ghost" size="sm">
-                  <Settings className="w-4 h-4 mr-2" />
-                  Settings
-                </Button>
-              </Link>
               <div className="text-right px-4 py-2 bg-gradient-to-r from-primary-50 to-purple-50 rounded-lg border border-primary-200">
                 <p className="text-xs font-medium text-gray-600 uppercase tracking-wide">Crédits disponibles</p>
                 <p className="text-2xl font-bold bg-gradient-to-r from-primary-600 to-purple-600 bg-clip-text text-transparent">
@@ -88,19 +74,15 @@ export default function DashboardPage() {
               </Button>
             </div>
           </div>
-        </div>
-      </header>
-
-      {/* Navigation Tabs */}
-      <div className="bg-white/80 backdrop-blur-md border-b border-gray-200 shadow-sm">
-        <div className="container mx-auto px-4">
+        </header>
+        <div className="px-6 pt-4">
           <nav className="flex gap-2">
             <button
               onClick={() => setActiveTab('generate')}
-              className={`px-6 py-4 font-medium border-b-2 transition-all rounded-t-lg ${
+              className={`px-4 py-2 font-medium rounded-md ${
                 activeTab === 'generate'
-                  ? 'border-primary-600 text-primary-600 bg-primary-50'
-                  : 'border-transparent text-gray-600 hover:text-gray-900 hover:bg-gray-50'
+                  ? 'bg-primary-600 text-white'
+                  : 'text-gray-700 hover:bg-gray-100'
               }`}
             >
               <Sparkles className="w-4 h-4 inline mr-2" />
@@ -108,10 +90,10 @@ export default function DashboardPage() {
             </button>
             <button
               onClick={() => setActiveTab('gallery')}
-              className={`px-6 py-4 font-medium border-b-2 transition-all rounded-t-lg ${
+              className={`px-4 py-2 font-medium rounded-md ${
                 activeTab === 'gallery'
-                  ? 'border-primary-600 text-primary-600 bg-primary-50'
-                  : 'border-transparent text-gray-600 hover:text-gray-900 hover:bg-gray-50'
+                  ? 'bg-primary-600 text-white'
+                  : 'text-gray-700 hover:bg-gray-100'
               }`}
             >
               <Video className="w-4 h-4 inline mr-2" />
@@ -119,10 +101,10 @@ export default function DashboardPage() {
             </button>
             <button
               onClick={() => setActiveTab('credits')}
-              className={`px-6 py-4 font-medium border-b-2 transition-all rounded-t-lg ${
+              className={`px-4 py-2 font-medium rounded-md ${
                 activeTab === 'credits'
-                  ? 'border-primary-600 text-primary-600 bg-primary-50'
-                  : 'border-transparent text-gray-600 hover:text-gray-900 hover:bg-gray-50'
+                  ? 'bg-primary-600 text-white'
+                  : 'text-gray-700 hover:bg-gray-100'
               }`}
             >
               <CreditCard className="w-4 h-4 inline mr-2" />
@@ -130,18 +112,16 @@ export default function DashboardPage() {
             </button>
           </nav>
         </div>
+        <main className="px-6 py-6">
+          {activeTab === 'generate' && <VideoGenerator />}
+          {activeTab === 'gallery' && <VideoGallery userId={user.id} />}
+          {activeTab === 'credits' && (
+            <div className="max-w-4xl">
+              <CreditsSection userId={user.id} />
+            </div>
+          )}
+        </main>
       </div>
-
-      {/* Content */}
-      <main className="container mx-auto px-4 py-8">
-        {activeTab === 'generate' && <VideoGenerator />}
-        {activeTab === 'gallery' && <VideoGallery userId={user.id} />}
-        {activeTab === 'credits' && (
-          <div className="max-w-4xl mx-auto">
-            <CreditsSection userId={user.id} />
-          </div>
-        )}
-      </main>
     </div>
   );
 }

@@ -102,6 +102,13 @@ export const stripeApi = {
     );
     return response.data;
   },
+  portal: async (userId: string) => {
+    const response = await api.post<{ url: string }>(
+      '/api/stripe/portal',
+      { user_id: userId }
+    );
+    return response.data;
+  },
 };
 
 export const userSyncApi = {
