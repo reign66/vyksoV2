@@ -9,19 +9,16 @@ import { useAuthStore } from '@/store/auth';
 import { Logo } from '@/components/Logo';
 import { Button } from '@/components/ui/Button';
 import { supabase } from '@/lib/supabase/client';
-import { LogOut, Video, CreditCard, Sparkles, Loader2, Settings, BadgeDollarSign, Home } from 'lucide-react';
+import { LogOut, Video, CreditCard, Sparkles, Loader2, Settings, BadgeDollarSign } from 'lucide-react';
 import Link from 'next/link';
 import { VideoGenerator } from '@/components/VideoGenerator';
 import { VideoGallery } from '@/components/VideoGallery';
 import { stripeApi } from '@/lib/api';
 import toast from 'react-hot-toast';
-import { useSearchParams, usePathname } from 'next/navigation';
 
 export default function DashboardPage() {
   const router = useRouter();
   const { user, userData, loading, fetchUserData } = useAuthStore();
-  const searchParams = useSearchParams();
-  const pathname = usePathname();
   const [activeTab, setActiveTab] = useState<'generate' | 'gallery' | 'credits'>('generate');
 
   useEffect(() => {
@@ -36,15 +33,18 @@ export default function DashboardPage() {
     }
   }, [user, userData, fetchUserData]);
 
-  // Sync tab from query param
+  // Sync tab from query param using window.location (client-side only)
   useEffect(() => {
-    const tab = (searchParams.get('tab') as 'generate' | 'gallery' | 'credits') || 'generate';
-    setActiveTab(tab);
-  }, [searchParams]);
+    if (typeof window !== 'undefined') {
+      const params = new URLSearchParams(window.location.search);
+      const tab = (params.get('tab') as 'generate' | 'gallery' | 'credits') || 'generate';
+      setActiveTab(tab);
+    }
+  }, []);
 
   const navigateTab = (tab: 'generate' | 'gallery' | 'credits') => {
-    const url = `${pathname}?tab=${tab}`;
-    router.push(url);
+    setActiveTab(tab);
+    router.push(`/dashboard?tab=${tab}`);
   };
 
   const handleLogout = async () => {

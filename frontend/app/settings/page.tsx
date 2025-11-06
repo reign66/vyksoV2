@@ -66,7 +66,7 @@ export default function SettingsPage() {
               <div className="space-y-3 text-gray-700">
                 <p className="flex items-center gap-2"><UserIcon className="w-4 h-4 text-gray-500"/> {userData?.full_name || `${userData?.first_name || '—'} ${userData?.last_name || ''}`}</p>
                 <p className="flex items-center gap-2"><Mail className="w-4 h-4 text-gray-500"/> {user.email}</p>
-                <p className="text-sm text-gray-600">Créé le {user?.created_at ? new Date(user.created_at as any).toLocaleDateString('fr-FR') : ''}</p>
+                <p className="text-sm text-gray-600">Créé le {userData?.created_at ? new Date(userData.created_at).toLocaleDateString('fr-FR') : ''}</p>
               </div>
             </div>
             <div className="bg-white rounded-2xl border border-gray-200 p-6">
