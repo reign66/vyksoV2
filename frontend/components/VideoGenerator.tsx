@@ -46,7 +46,7 @@ export function VideoGenerator() {
       
       // Redirect to gallery after a short delay
       setTimeout(() => {
-        window.location.hash = 'gallery';
+        window.location.href = '/dashboard?tab=gallery';
       }, 2000);
     } catch (error: any) {
       toast.error(error.response?.data?.detail || 'Erreur lors de la génération');

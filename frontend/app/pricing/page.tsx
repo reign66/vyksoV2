@@ -1,10 +1,71 @@
 export const dynamic = 'force-dynamic';
 
+"use client";
 import Link from 'next/link';
+import { useMemo, useState } from 'react';
+import { useAuthStore } from '@/store/auth';
 import { Button } from '@/components/ui/Button';
-import { BadgeDollarSign, CheckCircle2, MonitorPlay } from 'lucide-react';
+import { BadgeDollarSign, CheckCircle2, MonitorPlay, Sparkles } from 'lucide-react';
+import { stripeApi } from '@/lib/api';
 
 export default function PricingPage() {
+  const { user } = useAuthStore();
+  const [billingCycle, setBillingCycle] = useState<'monthly' | 'annual'>('monthly');
+
+  const plans = useMemo(
+    () => [
+      {
+        key: 'premium',
+        title: 'Premium',
+        priceMonthly: 199,
+        priceAnnual: 169,
+        highlights: [
+          '10 vidéos — SORA 2 OU VEO 3.1 Fast',
+          'Jusqu’à 60s par vidéo',
+          '1 crédit = 1 seconde',
+        ],
+      },
+      {
+        key: 'pro',
+        title: 'Pro',
+        priceMonthly: 589,
+        priceAnnual: 559,
+        highlights: [
+          '18 vidéos — SORA 2 OU VEO 3.1 Fast (60s)',
+          '2 vidéos — SORA 2 PRO OU VEO 3.1 Quality (60s)',
+          '1 crédit = 1 seconde',
+        ],
+      },
+      {
+        key: 'max',
+        title: 'MAX',
+        priceMonthly: 1199,
+        priceAnnual: 989,
+        highlights: [
+          '20 vidéos — SORA 2 OU VEO 3.1 Fast (60s)',
+          '10 vidéos — SORA 2 PRO OU VEO 3.1 Quality (60s)',
+          '1 crédit = 1 seconde',
+        ],
+      },
+    ],
+    []
+  );
+
+  const onSelect = async (planKey: string) => {
+    const planId = `${planKey}_${billingCycle}`; // e.g., premium_monthly
+    try {
+      if (!user) {
+        // redirect to login if not authenticated
+        window.location.href = '/login';
+        return;
+      }
+      const res = await stripeApi.createCheckout(planId, user.id);
+      if (res.checkout_url) window.location.href = res.checkout_url;
+    } catch (e) {
+      // noop — toast handled globally elsewhere if needed
+    }
+  };
+
   return (
     <div className="min-h-screen bg-gradient-to-br from-gray-50 to-blue-50">
       <div className="container mx-auto px-4 py-12 max-w-6xl">
@@ -17,61 +78,56 @@ export default function PricingPage() {
           <p className="text-gray-600 mt-3 max-w-2xl mx-auto">
             Choisissez un plan, utilisez vos secondes comme vous voulez. SORA 2, SORA 2 PRO, VEO 3.1 Fast ou VEO 3.1 Quality — pas de différence de &quot;crédits&quot; entre les modèles, seules les secondes comptent.
           </p>
+          <div className="mt-6 inline-flex items-center bg-white shadow-sm border rounded-full overflow-hidden">
+            <button
+              className={`px-4 py-2 text-sm font-medium ${
+                billingCycle === 'monthly' ? 'bg-primary-600 text-white' : 'text-gray-700'
+              }`}
+              onClick={() => setBillingCycle('monthly')}
+            >
+              Mensuel
+            </button>
+            <button
+              className={`px-4 py-2 text-sm font-medium ${
+                billingCycle === 'annual' ? 'bg-primary-600 text-white' : 'text-gray-700'
+              }`}
+              onClick={() => setBillingCycle('annual')}
+            >
+              Annuel <span className="ml-1 text-xs opacity-80">(économisez)</span>
+            </button>
+          </div>
         </div>
 
         <div className="grid md:grid-cols-3 gap-6">
-          {/* Starter */}
-          <div className="bg-white rounded-2xl shadow-lg border border-gray-200 overflow-hidden">
-            <div className="p-8">
-              <h2 className="text-xl font-bold">Starter</h2>
-              <p className="text-4xl font-extrabold my-2">19€</p>
-              <p className="text-gray-600">Idéal pour débuter</p>
-              <div className="mt-6 space-y-2 text-sm text-gray-700">
-                <Feature>Quota mensuel: 600 secondes</Feature>
-                <Feature>Jusqu&apos;à 10 vidéos de 60s</Feature>
-                <Feature>Ou 2 vidéos par jour de 10s</Feature>
-                <Feature>Accès aux 4 modèles IA</Feature>
+          {plans.map((plan) => (
+            <div key={plan.key} className="bg-white rounded-2xl shadow-lg border border-gray-200 overflow-hidden">
+              <div className="p-8">
+                <h2 className="text-xl font-bold flex items-center gap-2">
+                  {plan.title}
+                  {plan.key === 'premium' && (
+                    <span className="text-[10px] uppercase tracking-wide px-2 py-0.5 rounded-full bg-primary-100 text-primary-700">SORA 2 recommandé</span>
+                  )}
+                </h2>
+                <p className="text-4xl font-extrabold my-2">
+                  {billingCycle === 'monthly' ? plan.priceMonthly : plan.priceAnnual}€
+                  <span className="text-base text-gray-500 font-semibold">/mois</span>
+                </p>
+                <p className="text-gray-600">
+                  {plan.key === 'premium' && '10 vidéos SORA 2 OU VEO 3.1 Fast'}
+                  {plan.key === 'pro' && '18 Fast + 2 Pro/Quality'}
+                  {plan.key === 'max' && '20 Fast + 10 Pro/Quality'}
+                </p>
+                <div className="mt-6 space-y-2 text-sm text-gray-700">
+                  {plan.highlights.map((h) => (
+                    <Feature key={h}>{h}</Feature>
+                  ))}
+                </div>
+                <Button onClick={() => onSelect(plan.key)} className="w-full mt-6 flex items-center justify-center gap-2">
+                  <Sparkles className="w-4 h-4" /> Choisir {plan.title}
+                </Button>
               </div>
-              <Button className="w-full mt-6">Choisir Starter</Button>
             </div>
-          </div>
-
-          {/* Pro */}
-          <div className="bg-white rounded-2xl shadow-xl border-2 border-primary-500 overflow-hidden relative">
-            <span className="absolute -top-3 left-1/2 -translate-x-1/2 bg-gradient-to-r from-primary-600 to-purple-600 text-white text-xs font-bold tracking-wide px-3 py-1 rounded-full shadow">
-              Recommandé
-            </span>
-            <div className="p-8">
-              <h2 className="text-xl font-bold">Pro</h2>
-              <p className="text-4xl font-extrabold my-2">39€</p>
-              <p className="text-gray-600">Pour créateurs réguliers</p>
-              <div className="mt-6 space-y-2 text-sm text-gray-700">
-                <Feature>Quota mensuel: 1 200 secondes</Feature>
-                <Feature>Jusqu&apos;à 20 vidéos de 60s</Feature>
-                <Feature>Ou 4 vidéos par jour de 10s</Feature>
-                <Feature>Accès aux 4 modèles IA</Feature>
-                <Feature>Priorité de génération</Feature>
-              </div>
-              <Button className="w-full mt-6">Choisir Pro</Button>
-            </div>
-          </div>
-
-          {/* Premium */}
-          <div className="bg-white rounded-2xl shadow-lg border border-gray-200 overflow-hidden">
-            <div className="p-8">
-              <h2 className="text-xl font-bold">Premium</h2>
-              <p className="text-4xl font-extrabold my-2">79€</p>
-              <p className="text-gray-600">Pour équipes et pros</p>
-              <div className="mt-6 space-y-2 text-sm text-gray-700">
-                <Feature>Quota mensuel: 3 000 secondes</Feature>
-                <Feature>Jusqu&apos;à 50 vidéos de 60s</Feature>
-                <Feature>Ou ~5 vidéos par jour de 20s</Feature>
-                <Feature>Accès aux 4 modèles IA</Feature>
-                <Feature>Support prioritaire</Feature>
-              </div>
-              <Button className="w-full mt-6">Choisir Premium</Button>
-            </div>
-          </div>
+          ))}
         </div>
 
         <div className="mt-12 grid md:grid-cols-2 gap-6 items-start">

@@ -17,6 +17,7 @@ export const MODEL_CARDS: Array<{
     title: 'SORA 2',
     subtitle: 'Creative, general purpose',
     image: '/models/sora2.svg',
+    recommended: true,
   },
   {
     key: 'sora2_pro',
@@ -29,7 +30,6 @@ export const MODEL_CARDS: Array<{
     title: 'VEO 3.1 Fast',
     subtitle: 'Speed-first iteration',
     image: '/models/veo31_fast.svg',
-    recommended: true,
   },
   {
     key: 'veo31_quality',
@@ -82,7 +82,7 @@ export function ModelSelector({
                 </div>
                 {m.recommended && (
                   <span className="text-xs font-semibold px-2 py-1 rounded-full bg-primary-100 text-primary-700">
-                    Recommended
+                    Recommandé
                   </span>
                 )}
               </div>
