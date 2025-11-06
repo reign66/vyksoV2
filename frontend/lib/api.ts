@@ -48,6 +48,7 @@ export interface User {
   plan: string;
   first_name?: string;
   last_name?: string;
+  full_name?: string;
   created_at: string;
 }
 
@@ -91,6 +92,14 @@ export const stripeApi = {
     const response = await api.post<{ checkout_url: string }>(
       '/api/stripe/create-checkout',
       { plan, user_id: userId }
+    );
+    return response.data;
+  },
+
+  createPortal: async (userId: string) => {
+    const response = await api.post<{ url: string }>(
+      '/api/stripe/customer-portal',
+      { user_id: userId }
     );
     return response.data;
   },

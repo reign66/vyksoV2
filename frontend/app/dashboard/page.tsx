@@ -33,6 +33,20 @@ export default function DashboardPage() {
     }
   }, [user, userData, fetchUserData]);
 
+  // Sync tab from query param using window.location (client-side only)
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      const params = new URLSearchParams(window.location.search);
+      const tab = (params.get('tab') as 'generate' | 'gallery' | 'credits') || 'generate';
+      setActiveTab(tab);
+    }
+  }, []);
+
+  const navigateTab = (tab: 'generate' | 'gallery' | 'credits') => {
+    setActiveTab(tab);
+    router.push(`/dashboard?tab=${tab}`);
+  };
+
   const handleLogout = async () => {
     await supabase.auth.signOut();
     router.push('/');
@@ -59,25 +73,13 @@ export default function DashboardPage() {
             <div className="flex items-center gap-6">
               <Logo />
               <div className="hidden md:block">
-                <p className="text-sm text-gray-500">Bienvenue{userData?.first_name ? `, ${userData.first_name}` : ''} 👋</p>
+                <p className="text-sm text-gray-500">Bienvenue{userData?.first_name || userData?.full_name ? `, ${userData?.first_name || userData?.full_name}` : ''} 👋</p>
                 <p className="text-xs text-gray-400">Heureux de vous revoir</p>
               </div>
             </div>
             <div className="flex items-center gap-3">
-              <Link href="/pricing" className="hidden md:inline-flex">
-                <Button variant="ghost" size="sm">
-                  <BadgeDollarSign className="w-4 h-4 mr-2" />
-                  Plans
-                </Button>
-              </Link>
-              <Link href="/settings" className="hidden md:inline-flex">
-                <Button variant="ghost" size="sm">
-                  <Settings className="w-4 h-4 mr-2" />
-                  Settings
-                </Button>
-              </Link>
               <div className="text-right px-4 py-2 bg-gradient-to-r from-primary-50 to-purple-50 rounded-lg border border-primary-200">
-                <p className="text-xs font-medium text-gray-600 uppercase tracking-wide">Crédits disponibles</p>
+                <p className="text-xs font-medium text-gray-600 uppercase tracking-wide">Secondes disponibles</p>
                 <p className="text-2xl font-bold bg-gradient-to-r from-primary-600 to-purple-600 bg-clip-text text-transparent">
                   {userData?.credits ?? 0}
                 </p>
@@ -91,57 +93,54 @@ export default function DashboardPage() {
         </div>
       </header>
 
-      {/* Navigation Tabs */}
-      <div className="bg-white/80 backdrop-blur-md border-b border-gray-200 shadow-sm">
-        <div className="container mx-auto px-4">
-          <nav className="flex gap-2">
+      {/* Sidebar + Content */}
+      <div className="container mx-auto px-4 py-6 grid grid-cols-1 md:grid-cols-[260px_1fr] gap-6">
+        <aside className="bg-white rounded-2xl border border-gray-200 p-4 h-fit sticky top-20">
+          <nav className="flex flex-col gap-2">
             <button
-              onClick={() => setActiveTab('generate')}
-              className={`px-6 py-4 font-medium border-b-2 transition-all rounded-t-lg ${
-                activeTab === 'generate'
-                  ? 'border-primary-600 text-primary-600 bg-primary-50'
-                  : 'border-transparent text-gray-600 hover:text-gray-900 hover:bg-gray-50'
+              onClick={() => navigateTab('generate')}
+              className={`w-full text-left px-4 py-3 rounded-lg flex items-center gap-2 ${
+                activeTab === 'generate' ? 'bg-primary-50 text-primary-700' : 'hover:bg-gray-50 text-gray-700'
               }`}
             >
-              <Sparkles className="w-4 h-4 inline mr-2" />
-              Générer une vidéo
+              <Sparkles className="w-4 h-4" /> Générer
             </button>
             <button
-              onClick={() => setActiveTab('gallery')}
-              className={`px-6 py-4 font-medium border-b-2 transition-all rounded-t-lg ${
-                activeTab === 'gallery'
-                  ? 'border-primary-600 text-primary-600 bg-primary-50'
-                  : 'border-transparent text-gray-600 hover:text-gray-900 hover:bg-gray-50'
+              onClick={() => navigateTab('gallery')}
+              className={`w-full text-left px-4 py-3 rounded-lg flex items-center gap-2 ${
+                activeTab === 'gallery' ? 'bg-primary-50 text-primary-700' : 'hover:bg-gray-50 text-gray-700'
               }`}
             >
-              <Video className="w-4 h-4 inline mr-2" />
-              Mes vidéos
+              <Video className="w-4 h-4" /> Mes vidéos
             </button>
             <button
-              onClick={() => setActiveTab('credits')}
-              className={`px-6 py-4 font-medium border-b-2 transition-all rounded-t-lg ${
-                activeTab === 'credits'
-                  ? 'border-primary-600 text-primary-600 bg-primary-50'
-                  : 'border-transparent text-gray-600 hover:text-gray-900 hover:bg-gray-50'
+              onClick={() => navigateTab('credits')}
+              className={`w-full text-left px-4 py-3 rounded-lg flex items-center gap-2 ${
+                activeTab === 'credits' ? 'bg-primary-50 text-primary-700' : 'hover:bg-gray-50 text-gray-700'
               }`}
             >
-              <CreditCard className="w-4 h-4 inline mr-2" />
-              Crédits & Plans
+              <CreditCard className="w-4 h-4" /> Secondes & Plans
             </button>
+            <Link href="/pricing" className="px-4 py-3 rounded-lg flex items-center gap-2 hover:bg-gray-50 text-gray-700">
+              <BadgeDollarSign className="w-4 h-4" /> Pricing
+            </Link>
+            <Link href="/settings" className="px-4 py-3 rounded-lg flex items-center gap-2 hover:bg-gray-50 text-gray-700">
+              <Settings className="w-4 h-4" /> Paramètres
+            </Link>
           </nav>
-        </div>
-      </div>
+        </aside>
 
-      {/* Content */}
-      <main className="container mx-auto px-4 py-8">
-        {activeTab === 'generate' && <VideoGenerator />}
-        {activeTab === 'gallery' && <VideoGallery userId={user.id} />}
-        {activeTab === 'credits' && (
-          <div className="max-w-4xl mx-auto">
-            <CreditsSection userId={user.id} />
-          </div>
-        )}
-      </main>
+        {/* Content */}
+        <main className="py-2">
+          {activeTab === 'generate' && <VideoGenerator />}
+          {activeTab === 'gallery' && <VideoGallery userId={user.id} />}
+          {activeTab === 'credits' && (
+            <div className="max-w-4xl">
+              <CreditsSection userId={user.id} />
+            </div>
+          )}
+        </main>
+      </div>
     </div>
   );
 }
