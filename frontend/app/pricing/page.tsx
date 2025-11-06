@@ -253,7 +253,7 @@ export default function PricingPage() {
               <h3 className="text-2xl font-bold mb-4">⚙️ Accroche finale</h3>
               <div className="space-y-3 text-gray-700 max-w-3xl mx-auto">
                 <p className="text-lg">
-                  Peu importe ton plan, tu profites de la même puissance d'IA — seules les secondes comptent.
+                  Peu importe ton plan, tu profites de la même puissance d&apos;IA — seules les secondes comptent.
                 </p>
                 <p>
                   Chaque plan inclut la compatibilité avec SORA 2, SORA 2 PRO, VEO 3.1 Fast et VEO 3.1 Quality.
