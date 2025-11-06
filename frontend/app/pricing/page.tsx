@@ -1,12 +1,11 @@
 "use client";
 
-export const dynamic = 'force-dynamic';
-
 import Link from 'next/link';
 import { useMemo, useState } from 'react';
 import { useAuthStore } from '@/store/auth';
 import { Button } from '@/components/ui/Button';
-import { BadgeDollarSign, CheckCircle2, MonitorPlay, Sparkles } from 'lucide-react';
+import { Logo } from '@/components/Logo';
+import { BadgeDollarSign, CheckCircle2, Sparkles, Video, CreditCard, Settings, Flame } from 'lucide-react';
 import { stripeApi } from '@/lib/api';
 
 export default function PricingPage() {
@@ -20,10 +19,17 @@ export default function PricingPage() {
         title: 'Premium',
         priceMonthly: 199,
         priceAnnual: 169,
-        highlights: [
-          '10 vidéos — SORA 2 OU VEO 3.1 Fast',
-          'Jusqu’à 60s par vidéo',
-          '1 crédit = 1 seconde',
+        emoji: '💎',
+        subtitle: 'Le choix parfait pour lancer tes créations IA.',
+        description: 'Tu veux des vidéos dignes de SORA sans dépenser une fortune ? Le plan Premium te donne tout ce qu\'il faut pour produire du contenu impactant, rapide et cinématique.',
+        idealFor: 'Idéal pour les créateurs solo, les freelances ou les marques qui veulent tester la puissance de la génération IA haute qualité.',
+        features: [
+          '10 vidéos / mois — SORA 2 ou VEO 3.1 Fast',
+          'Jusqu\'à 60 s par vidéo',
+          '1 crédit = 1 seconde générée',
+          'Accès complet aux modèles SORA et VEO Fast',
+          'Génération fluide, sans watermark',
+          'Support prioritaire',
         ],
       },
       {
@@ -31,9 +37,17 @@ export default function PricingPage() {
         title: 'Pro',
         priceMonthly: 589,
         priceAnnual: 559,
-        highlights: [
-          '18 vidéos — SORA 2 OU VEO 3.1 Fast (60s)',
-          '2 vidéos — SORA 2 PRO OU VEO 3.1 Quality (60s)',
+        emoji: '🚀',
+        subtitle: 'Le plan des créateurs exigeants.',
+        description: 'Passe à la vitesse supérieure : plus de vidéos, une qualité supérieure, et l\'accès à la version SORA 2 PRO pour un rendu photoréaliste.',
+        idealFor: 'Parfait pour les studios, les agences et les créateurs qui publient plusieurs projets par semaine.',
+        features: [
+          '20 vidéos / mois (18 Fast + 2 Pro Quality)',
+          'Accès complet à SORA 2 PRO & VEO 3.1 Quality',
+          'Jusqu\'à 60 s par vidéo',
+          'Génération 4K rapide',
+          'Accès anticipé aux nouvelles versions',
+          'Priorité sur la file de rendu',
           '1 crédit = 1 seconde',
         ],
       },
@@ -41,11 +55,18 @@ export default function PricingPage() {
         key: 'max',
         title: 'MAX',
         priceMonthly: 1199,
-        priceAnnual: 989,
-        highlights: [
-          '20 vidéos — SORA 2 OU VEO 3.1 Fast (60s)',
-          '10 vidéos — SORA 2 PRO OU VEO 3.1 Quality (60s)',
-          '1 crédit = 1 seconde',
+        priceAnnual: 999,
+        emoji: '🧠',
+        subtitle: 'Aucune limite, juste ton imagination.',
+        description: 'Le plan ultime pour dominer les réseaux et produire du contenu IA à grande échelle.',
+        idealFor: 'Conçu pour les producteurs de contenu, les studios IA et les marques internationales qui veulent transformer leurs idées en images spectaculaires.',
+        features: [
+          '30 vidéos / mois — 20 Fast + 10 Pro Quality',
+          'Accès intégral à SORA 2 PRO, VEO 3.1 Fast/Quality',
+          'Rendus prioritaires en ultra-qualité (jusqu\'à 60 s)',
+          'Accès aux modèles expérimentaux et nouvelles features',
+          'Assistance technique dédiée (1 to 1)',
+          'Génération illimitée dans le cloud haute performance',
         ],
       },
     ],
@@ -69,92 +90,181 @@ export default function PricingPage() {
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-gray-50 to-blue-50">
-      <div className="container mx-auto px-4 py-12 max-w-6xl">
-        <div className="text-center mb-12">
-          <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-primary-100 text-primary-700 text-sm font-semibold">
-            <BadgeDollarSign className="w-4 h-4" />
-            Plans & quotas en secondes
-          </div>
-          <h1 className="text-4xl md:text-5xl font-extrabold tracking-tight mt-4">Des plans clairs, pensés pour la création</h1>
-          <p className="text-gray-600 mt-3 max-w-2xl mx-auto">
-            Choisissez un plan, utilisez vos secondes comme vous voulez. SORA 2, SORA 2 PRO, VEO 3.1 Fast ou VEO 3.1 Quality — pas de différence de &quot;crédits&quot; entre les modèles, seules les secondes comptent.
-          </p>
-          <div className="mt-6 inline-flex items-center bg-white shadow-sm border rounded-full overflow-hidden">
-            <button
-              className={`px-4 py-2 text-sm font-medium ${
-                billingCycle === 'monthly' ? 'bg-primary-600 text-white' : 'text-gray-700'
-              }`}
-              onClick={() => setBillingCycle('monthly')}
-            >
-              Mensuel
-            </button>
-            <button
-              className={`px-4 py-2 text-sm font-medium ${
-                billingCycle === 'annual' ? 'bg-primary-600 text-white' : 'text-gray-700'
-              }`}
-              onClick={() => setBillingCycle('annual')}
-            >
-              Annuel <span className="ml-1 text-xs opacity-80">(économisez)</span>
-            </button>
-          </div>
+      {/* Header */}
+      <header className="bg-white/80 backdrop-blur-md border-b border-gray-200 shadow-sm sticky top-0 z-40">
+        <div className="container mx-auto px-4 py-4 flex items-center justify-between">
+          <Logo />
+          <div className="text-sm text-gray-500">Pricing</div>
         </div>
+      </header>
 
-        <div className="grid md:grid-cols-3 gap-6">
-          {plans.map((plan) => (
-            <div key={plan.key} className="bg-white rounded-2xl shadow-lg border border-gray-200 overflow-hidden">
-              <div className="p-8">
-                <h2 className="text-xl font-bold flex items-center gap-2">
-                  {plan.title}
-                  {plan.key === 'premium' && (
-                    <span className="text-[10px] uppercase tracking-wide px-2 py-0.5 rounded-full bg-primary-100 text-primary-700">SORA 2 recommandé</span>
-                  )}
-                </h2>
-                <p className="text-4xl font-extrabold my-2">
-                  {billingCycle === 'monthly' ? plan.priceMonthly : plan.priceAnnual}€
-                  <span className="text-base text-gray-500 font-semibold">/mois</span>
-                </p>
-                <p className="text-gray-600">
-                  {plan.key === 'premium' && '10 vidéos SORA 2 OU VEO 3.1 Fast'}
-                  {plan.key === 'pro' && '18 Fast + 2 Pro/Quality'}
-                  {plan.key === 'max' && '20 Fast + 10 Pro/Quality'}
-                </p>
-                <div className="mt-6 space-y-2 text-sm text-gray-700">
-                  {plan.highlights.map((h) => (
-                    <Feature key={h}>{h}</Feature>
-                  ))}
-                </div>
-                <Button onClick={() => onSelect(plan.key)} className="w-full mt-6 flex items-center justify-center gap-2">
-                  <Sparkles className="w-4 h-4" /> Choisir {plan.title}
-                </Button>
+      <div className="container mx-auto px-4 py-6 grid grid-cols-1 md:grid-cols-[260px_1fr] gap-6">
+        {/* Sidebar */}
+        <aside className="bg-white rounded-2xl border border-gray-200 p-4 h-fit sticky top-20">
+          <nav className="flex flex-col gap-2">
+            <Link href="/dashboard?tab=generate" className="px-4 py-3 rounded-lg flex items-center gap-2 hover:bg-gray-50 text-gray-700">
+              <Sparkles className="w-4 h-4" /> Générer
+            </Link>
+            <Link href="/dashboard?tab=gallery" className="px-4 py-3 rounded-lg flex items-center gap-2 hover:bg-gray-50 text-gray-700">
+              <Video className="w-4 h-4" /> Mes vidéos
+            </Link>
+            <Link href="/dashboard?tab=credits" className="px-4 py-3 rounded-lg flex items-center gap-2 hover:bg-gray-50 text-gray-700">
+              <CreditCard className="w-4 h-4" /> Secondes & Plans
+            </Link>
+            <div className="px-4 py-3 rounded-lg flex items-center gap-2 bg-primary-50 text-primary-700">
+              <BadgeDollarSign className="w-4 h-4" /> Pricing
+            </div>
+            <Link href="/settings" className="px-4 py-3 rounded-lg flex items-center gap-2 hover:bg-gray-50 text-gray-700">
+              <Settings className="w-4 h-4" /> Paramètres
+            </Link>
+          </nav>
+        </aside>
+
+        {/* Main Content */}
+        <main className="py-2">
+          <div className="max-w-6xl mx-auto">
+            {/* Header Section */}
+            <div className="text-center mb-12">
+              <h1 className="text-4xl md:text-5xl font-extrabold tracking-tight mb-4">
+                Des plans taillés pour les créateurs visionnaires.
+              </h1>
+              <p className="text-lg text-gray-700 max-w-3xl mx-auto leading-relaxed">
+                Crée, teste et publie des vidéos IA ultra-réalistes avec SORA 2, VEO 3.1 ou Fast Generation — sans limite de créativité, seules les secondes comptent.
+              </p>
+              
+              {/* Billing Toggle */}
+              <div className="mt-8 inline-flex items-center bg-white shadow-lg border-2 border-gray-200 rounded-full overflow-hidden">
+                <button
+                  className={`px-6 py-3 text-sm font-semibold transition-all ${
+                    billingCycle === 'monthly' 
+                      ? 'bg-primary-600 text-white shadow-md' 
+                      : 'text-gray-700 hover:bg-gray-50'
+                  }`}
+                  onClick={() => setBillingCycle('monthly')}
+                >
+                  Mensuel
+                </button>
+                <button
+                  className={`px-6 py-3 text-sm font-semibold transition-all relative ${
+                    billingCycle === 'annual' 
+                      ? 'bg-primary-600 text-white shadow-md' 
+                      : 'text-gray-700 hover:bg-gray-50'
+                  }`}
+                  onClick={() => setBillingCycle('annual')}
+                >
+                  Annuel
+                  <span className="ml-2 px-2 py-0.5 bg-emerald-500 text-white text-xs font-bold rounded-full">-17%</span>
+                </button>
               </div>
             </div>
-          ))}
-        </div>
 
-        <div className="mt-12 grid md:grid-cols-2 gap-6 items-start">
-          <div className="bg-white rounded-2xl border border-gray-200 p-6">
-            <h3 className="text-xl font-bold mb-2">Comment on compte ?</h3>
-            <p className="text-gray-700">
-              Seules les secondes générées sont déduites. Ex: une vidéo de 18s = 18 secondes. Si vous préférez des vidéos plus courtes, vous en ferez simplement plus. Les modèles ont le même impact sur votre quota.
-            </p>
-            <p className="text-gray-700 mt-2 flex items-center gap-2">
-              <MonitorPlay className="w-4 h-4 text-primary-600" />
-              10 vidéos de SORA 2 ou 10 vidéos de VEO 3.1 Fast maximum de 60s pour le plan Premium — à vous de répartir selon vos besoins.
-            </p>
+            {/* Plans Grid */}
+            <div className="grid md:grid-cols-3 gap-6 mb-12">
+              {plans.map((plan, index) => {
+                const isPro = plan.key === 'pro';
+                const currentPrice = billingCycle === 'monthly' ? plan.priceMonthly : plan.priceAnnual;
+                const originalPrice = billingCycle === 'annual' ? plan.priceMonthly : null;
+                const discount = 17; // Fixed -17% discount
+
+                return (
+                  <div
+                    key={plan.key}
+                    className={`bg-white rounded-2xl shadow-lg border-2 overflow-hidden relative transition-all hover:shadow-xl ${
+                      isPro 
+                        ? 'border-primary-500 shadow-xl scale-105 md:scale-110 z-10' 
+                        : 'border-gray-200'
+                    }`}
+                  >
+                    {/* Flame badge for Pro */}
+                    {isPro && (
+                      <div className="absolute -top-3 left-1/2 -translate-x-1/2 z-20">
+                        <div className="bg-gradient-to-r from-orange-500 to-red-500 text-white px-4 py-1.5 rounded-full shadow-lg flex items-center gap-1.5">
+                          <Flame className="w-4 h-4 fill-current" />
+                          <span className="text-xs font-bold">POPULAIRE</span>
+                        </div>
+                      </div>
+                    )}
+
+                    <div className="p-8">
+                      <div className="mb-4">
+                        <span className="text-3xl mb-2 block">{plan.emoji}</span>
+                        <h2 className="text-2xl font-bold mb-1">{plan.title}</h2>
+                        <p className="text-sm text-gray-600 font-medium">{plan.subtitle}</p>
+                      </div>
+
+                      {/* Price */}
+                      <div className="mb-4">
+                        {billingCycle === 'annual' && originalPrice && (
+                          <div className="flex items-center gap-2 mb-1">
+                            <span className="text-xl text-gray-400 line-through font-semibold">
+                              {originalPrice}€
+                            </span>
+                            <span className="px-2 py-0.5 bg-emerald-100 text-emerald-700 text-xs font-bold rounded">
+                              -17%
+                            </span>
+                          </div>
+                        )}
+                        <div className="flex items-baseline gap-2">
+                          <span className="text-5xl font-extrabold text-gray-900">
+                            {currentPrice}€
+                          </span>
+                          <span className="text-base text-gray-500 font-semibold">/mois</span>
+                        </div>
+                        {billingCycle === 'annual' && (
+                          <p className="text-xs text-gray-500 mt-1">
+                            Facturé annuellement
+                          </p>
+                        )}
+                      </div>
+
+                      <p className="text-sm text-gray-700 mb-6 leading-relaxed">
+                        {plan.description}
+                      </p>
+
+                      {/* Features */}
+                      <div className="space-y-3 mb-6">
+                        {plan.features.map((feature, idx) => (
+                          <Feature key={idx}>{feature}</Feature>
+                        ))}
+                      </div>
+
+                      <p className="text-xs text-gray-600 italic mb-6 leading-relaxed">
+                        💡 {plan.idealFor}
+                      </p>
+
+                      <Button 
+                        onClick={() => onSelect(plan.key)} 
+                        className={`w-full flex items-center justify-center gap-2 ${
+                          isPro 
+                            ? 'bg-gradient-to-r from-primary-600 to-primary-700 hover:from-primary-700 hover:to-primary-800 shadow-lg' 
+                            : ''
+                        }`}
+                      >
+                        <Sparkles className="w-4 h-4" /> Choisir {plan.title}
+                      </Button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+
+            {/* Footer Section */}
+            <div className="bg-white rounded-2xl border border-gray-200 p-8 text-center">
+              <h3 className="text-2xl font-bold mb-4">⚙️ Accroche finale</h3>
+              <div className="space-y-3 text-gray-700 max-w-3xl mx-auto">
+                <p className="text-lg">
+                  Peu importe ton plan, tu profites de la même puissance d&apos;IA — seules les secondes comptent.
+                </p>
+                <p>
+                  Chaque plan inclut la compatibilité avec SORA 2, SORA 2 PRO, VEO 3.1 Fast et VEO 3.1 Quality.
+                </p>
+                <p className="font-semibold text-primary-700">
+                  Choisis la vitesse, la qualité et la liberté qui te ressemblent.
+                </p>
+              </div>
+            </div>
           </div>
-          <div className="bg-white rounded-2xl border border-gray-200 p-6">
-            <h3 className="text-xl font-bold mb-2">Modèles disponibles</h3>
-            <ul className="text-gray-700 list-disc pl-5">
-              <li>SORA 2</li>
-              <li>SORA 2 PRO</li>
-              <li>VEO 3.1 Fast</li>
-              <li>VEO 3.1 Quality</li>
-            </ul>
-            <Link href="/dashboard" className="inline-block mt-4">
-              <Button variant="secondary">Générer une vidéo</Button>
-            </Link>
-          </div>
-        </div>
+        </main>
       </div>
     </div>
   );
@@ -162,8 +272,9 @@ export default function PricingPage() {
 
 function Feature({ children }: { children: React.ReactNode }) {
   return (
-    <p className="flex items-center gap-2">
-      <CheckCircle2 className="w-4 h-4 text-emerald-600" /> {children}
+    <p className="flex items-start gap-2 text-sm text-gray-700">
+      <CheckCircle2 className="w-4 h-4 text-emerald-600 mt-0.5 flex-shrink-0" /> 
+      <span>{children}</span>
     </p>
   );
 }
