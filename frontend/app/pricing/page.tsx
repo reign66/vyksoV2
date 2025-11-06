@@ -19,8 +19,8 @@ export default function PricingPage() {
       {
         key: 'premium',
         title: 'Premium',
-        priceMonthly: 169,
-        priceAnnual: 135, // -20%
+        priceMonthly: 199,
+        priceAnnual: 169,
         emoji: '💎',
         subtitle: 'Le choix parfait pour lancer tes créations IA.',
         description: 'Tu veux des vidéos dignes de SORA sans dépenser une fortune ? Le plan Premium te donne tout ce qu\'il faut pour produire du contenu impactant, rapide et cinématique.',
@@ -37,8 +37,8 @@ export default function PricingPage() {
       {
         key: 'pro',
         title: 'Pro',
-        priceMonthly: 559,
-        priceAnnual: 447, // -20%
+        priceMonthly: 589,
+        priceAnnual: 559,
         emoji: '🚀',
         subtitle: 'Le plan des créateurs exigeants.',
         description: 'Passe à la vitesse supérieure : plus de vidéos, une qualité supérieure, et l\'accès à la version SORA 2 PRO pour un rendu photoréaliste.',
@@ -56,8 +56,8 @@ export default function PricingPage() {
       {
         key: 'max',
         title: 'MAX',
-        priceMonthly: 989,
-        priceAnnual: 791, // -20%
+        priceMonthly: 1199,
+        priceAnnual: 999,
         emoji: '🧠',
         subtitle: 'Aucune limite, juste ton imagination.',
         description: 'Le plan ultime pour dominer les réseaux et produire du contenu IA à grande échelle.',
@@ -155,7 +155,7 @@ export default function PricingPage() {
                   onClick={() => setBillingCycle('annual')}
                 >
                   Annuel
-                  <span className="ml-2 px-2 py-0.5 bg-emerald-500 text-white text-xs font-bold rounded-full">-20%</span>
+                  <span className="ml-2 px-2 py-0.5 bg-emerald-500 text-white text-xs font-bold rounded-full">-17%</span>
                 </button>
               </div>
             </div>
@@ -166,7 +166,7 @@ export default function PricingPage() {
                 const isPro = plan.key === 'pro';
                 const currentPrice = billingCycle === 'monthly' ? plan.priceMonthly : plan.priceAnnual;
                 const originalPrice = billingCycle === 'annual' ? plan.priceMonthly : null;
-                const discount = billingCycle === 'annual' ? Math.round(((plan.priceMonthly - plan.priceAnnual) / plan.priceMonthly) * 100) : 0;
+                const discount = 17; // Fixed -17% discount
 
                 return (
                   <div
@@ -202,7 +202,7 @@ export default function PricingPage() {
                               {originalPrice}€
                             </span>
                             <span className="px-2 py-0.5 bg-emerald-100 text-emerald-700 text-xs font-bold rounded">
-                              -{discount}%
+                              -17%
                             </span>
                           </div>
                         )}
