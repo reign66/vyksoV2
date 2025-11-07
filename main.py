@@ -17,6 +17,7 @@ from utils.video_concat import VideoEditor
 from io import BytesIO
 from starlette.requests import Request as StarletteRequest
 from starlette.responses import StreamingResponse as StarletteStreamingResponse
+from urllib.parse import urlparse
 
 app = FastAPI(
     title="Vykso API",
@@ -53,6 +54,41 @@ stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY") or os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 VIDEOS_BUCKET = os.getenv("VIDEOS_BUCKET", "vykso-videos")
+SUPABASE_ANON_OR_SERVICE_KEY = os.getenv("SUPABASE_ANON_KEY") or os.getenv("SUPABASE_SERVICE_KEY") or os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+
+async def _get_authenticated_user_id(request: Request) -> str:
+    """Validate Supabase JWT from Authorization header and return user id (sub).
+
+    This calls Supabase Auth `/auth/v1/user` which verifies the Bearer JWT.
+    Requires SUPABASE_URL and an API key (anon or service) in env.
+    """
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
+    jwt_token = auth_header[len("Bearer "):].strip()
+
+    if not SUPABASE_URL or not SUPABASE_ANON_OR_SERVICE_KEY:
+        raise HTTPException(status_code=500, detail="Supabase auth not configured")
+
+    auth_user_url = f"{SUPABASE_URL}/auth/v1/user"
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.get(
+            auth_user_url,
+            headers={
+                "Authorization": f"Bearer {jwt_token}",
+                "apikey": SUPABASE_ANON_OR_SERVICE_KEY,
+            },
+        )
+    if resp.status_code != 200:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    try:
+        data = resp.json()
+        user_id = data.get("id") or data.get("sub")
+    except Exception:
+        user_id = None
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unable to resolve user from token")
+    return user_id
 
 def _extract_object_path_from_public_url(public_url: str, bucket: str) -> Optional[str]:
     """Extract the storage object path (filename) from a Supabase public URL.
@@ -122,7 +158,7 @@ async def _proxy_supabase_object_stream(object_path: str, range_header: Optional
 # ============= MODELS =============
 
 class VideoRequest(BaseModel):
-    user_id: str
+    user_id: str  # Ignored server-side; derived from JWT
     niche: Optional[str] = None
     duration: int
     quality: str = "basic"
@@ -150,7 +186,7 @@ class StoryboardShot(BaseModel):
     duration: float
 
 class VideoRequestAdvanced(BaseModel):
-    user_id: str
+    user_id: str  # Ignored server-side; derived from JWT
     niche: Optional[str] = None
     duration: int = 10
     quality: str = "basic"
@@ -195,6 +231,32 @@ def calculate_credits_cost(duration: int, quality: str) -> int:
         return num_clips * 5
     else:
         return num_clips
+
+def _validate_duration_and_model(duration: int, ai_model: str):
+    if duration < 8 or duration > 60:
+        raise HTTPException(status_code=400, detail="Duration must be between 8 and 60 seconds")
+    if ai_model in ["veo3", "veo3_fast"]:
+        if duration % 8 not in (0,):
+            raise HTTPException(status_code=400, detail="Duration must be a multiple of 8 for Veo models")
+    else:
+        if duration % 10 not in (0,):
+            raise HTTPException(status_code=400, detail="Duration must be a multiple of 10 for Sora model")
+
+def _validate_image_urls(image_urls: Optional[List[str]]):
+    if not image_urls:
+        return
+    try:
+        supabase_host = urlparse(SUPABASE_URL).netloc
+    except Exception:
+        supabase_host = None
+    for url in image_urls:
+        parsed = urlparse(url)
+        if not parsed.scheme.startswith("http"):
+            raise HTTPException(status_code=400, detail="Invalid image URL scheme")
+        if supabase_host and parsed.netloc != supabase_host:
+            raise HTTPException(status_code=400, detail="Image URLs must be hosted on Supabase Storage")
+        if "/storage/v1/object/public/video-images/" not in url:
+            raise HTTPException(status_code=400, detail="Image URL not in allowed bucket 'video-images'")
 
 async def process_video_generation(
     job_id: str, 
@@ -257,12 +319,7 @@ async def process_video_generation(
                 "completed_at": "now()",
             }).eq("id", job_id).execute()
 
-            credits_to_deduct = calculate_credits_cost(duration, quality)
-            supabase.rpc("decrement_credits", {
-                "p_user_id": user_id,
-                "p_amount": credits_to_deduct,
-            }).execute()
-            print(f"✅ Job {job_id} completed! ({credits_to_deduct} credits deducted)")
+            print(f"✅ Job {job_id} completed! (credits already deducted)")
         
         else:
             # ===== MODE SORA 2 (OpenAI Videos API) - génération synchronisée avec polling =====
@@ -318,12 +375,7 @@ async def process_video_generation(
                 "completed_at": "now()",
             }).eq("id", job_id).execute()
 
-            credits_to_deduct = calculate_credits_cost(duration, quality)
-            supabase.rpc("decrement_credits", {
-                "p_user_id": user_id,
-                "p_amount": credits_to_deduct,
-            }).execute()
-            print(f"✅ Job {job_id} completed! ({credits_to_deduct} credits deducted)")
+            print(f"✅ Job {job_id} completed! (credits already deducted)")
         
     except Exception as e:
         print(f"❌ Error generating video {job_id}: {e}")
@@ -351,11 +403,15 @@ def health():
     return {"status": "ok"}
 
 @app.post("/api/videos/generate", response_model=VideoResponse)
-async def generate_video(req: VideoRequest, background_tasks: BackgroundTasks):
+async def generate_video(req: VideoRequest, background_tasks: BackgroundTasks, request: Request):
     """Endpoint principal : génère une vidéo de durée variable"""
-    
-    if req.duration < 10 or req.duration > 60:
-        raise HTTPException(status_code=400, detail="Duration must be between 10 and 60 seconds")
+    # Auth: derive user_id from JWT
+    token_user_id = await _get_authenticated_user_id(request)
+    # Security: ignore body user_id and use token subject
+    req.user_id = token_user_id
+
+    # Validate model/duration
+    _validate_duration_and_model(req.duration, req.ai_model)
     
     if not req.niche and not req.custom_prompt:
         raise HTTPException(status_code=400, detail="Either niche or custom_prompt is required")
@@ -383,11 +439,22 @@ async def generate_video(req: VideoRequest, background_tasks: BackgroundTasks):
         print(f"❌ Error checking user: {e}")
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
     
-    if user_data["credits"] < required_credits:
-        raise HTTPException(
-            status_code=402, 
-            detail=f"Crédits insuffisants. Besoin de {required_credits} crédits, vous avez {user_data['credits']}"
-        )
+    # Deduct credits atomically BEFORE scheduling work (backend source of truth)
+    try:
+        decrement = supabase.rpc("decrement_credits", {
+            "p_user_id": req.user_id,
+            "p_amount": required_credits,
+        }).execute()
+        if not decrement.data:
+            raise HTTPException(
+                status_code=402,
+                detail=f"Insufficient credits. Need {required_credits} credits."
+            )
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error decrementing credits: {e}")
+        raise HTTPException(status_code=500, detail="Unable to deduct credits")
     
     try:
         job = supabase.table("video_jobs").insert({
@@ -436,21 +503,26 @@ async def generate_video(req: VideoRequest, background_tasks: BackgroundTasks):
     )
 
 @app.post("/api/videos/generate-advanced")
-async def generate_video_advanced(req: VideoRequestAdvanced, background_tasks: BackgroundTasks):
+async def generate_video_advanced(req: VideoRequestAdvanced, background_tasks: BackgroundTasks, request: Request):
     """Endpoint avancé : supporte storyboard, image-to-video, etc."""
-    
+    # Auth: derive user_id from JWT
+    token_user_id = await _get_authenticated_user_id(request)
+    req.user_id = token_user_id
+
     # Calculer la durée totale pour storyboard
     if req.model_type == "storyboard" and req.shots:
         total_duration = sum(shot.duration for shot in req.shots)
         req.duration = int(total_duration)
-    
-    if req.duration < 10 or req.duration > 60:
-        raise HTTPException(status_code=400, detail="Duration must be between 10 and 60 seconds")
+    # Validate model/duration
+    _validate_duration_and_model(req.duration, req.ai_model)
     
     if req.model_type != "storyboard":
         if not req.niche and not req.custom_prompt:
             raise HTTPException(status_code=400, detail="Either niche or custom_prompt is required")
     
+    # Additional server-side validations
+    _validate_image_urls(req.image_urls)
+
     # Calculer le coût
     required_credits = calculate_credits_cost(req.duration, req.quality)
     
@@ -469,11 +541,13 @@ async def generate_video_advanced(req: VideoRequestAdvanced, background_tasks: B
         
         user_data = user.data[0]
         
-        if user_data["credits"] < required_credits:
-            raise HTTPException(
-                status_code=402, 
-                detail=f"Crédits insuffisants. Besoin de {required_credits} crédits"
-            )
+        # Deduct credits BEFORE scheduling generation
+        decrement = supabase.rpc("decrement_credits", {
+            "p_user_id": req.user_id,
+            "p_amount": required_credits,
+        }).execute()
+        if not decrement.data:
+            raise HTTPException(status_code=402, detail="Insufficient credits")
         
     except HTTPException:
         raise
@@ -668,9 +742,26 @@ async def create_checkout_session(req: CheckoutRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/stripe/buy-credits")
-async def buy_credits(req: BuyCreditsRequest):
+async def buy_credits(req: BuyCreditsRequest, request: Request):
     """Acheter des crédits ponctuels (pas d'abonnement)"""
-    
+    # Auth required
+    token_user_id = await _get_authenticated_user_id(request)
+    # Security: ignore body user_id, use token subject
+    req.user_id = token_user_id
+
+    # Basic server-side validation for credits/amount
+    if req.credits <= 0 or req.amount <= 0:
+        raise HTTPException(status_code=400, detail="Invalid credits or amount")
+    # Optional: map fixed packs for safety
+    packs = {
+        60: 9,    # example: 60 credits -> 9 EUR
+        120: 15,
+        300: 29,
+    }
+    # If pack exists, enforce price; otherwise allow custom amount (comment to restrict strictly)
+    if req.credits in packs and packs[req.credits] != req.amount:
+        raise HTTPException(status_code=400, detail="Invalid amount for selected credits pack")
+
     try:
         session = stripe.checkout.Session.create(
             payment_method_types=['card'],
