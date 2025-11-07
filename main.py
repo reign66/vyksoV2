@@ -633,7 +633,7 @@ async def get_video_status(job_id: str, request: Request):
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
 @app.get("/api/users/{user_id}/videos")
-async def get_user_videos(user_id: str, limit: int = 20, offset: int = 0, request: Request):
+async def get_user_videos(user_id: str, request: Request, limit: int = 20, offset: int = 0):
     """Liste les vidéos d'un utilisateur"""
     try:
         # Require auth and ensure user matches token
