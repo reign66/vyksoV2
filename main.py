@@ -603,15 +603,20 @@ async def generate_video_advanced(req: VideoRequestAdvanced, background_tasks: B
     )
 
 @app.get("/api/videos/{job_id}/status")
-async def get_video_status(job_id: str):
+async def get_video_status(job_id: str, request: Request):
     """Check le statut d'une vidéo"""
     try:
-        job = supabase.table("video_jobs").select("*").eq("id", job_id).execute()
+        # Require auth and ensure ownership
+        token_user_id = await _get_authenticated_user_id(request)
+        job = supabase.table("video_jobs").select("*").eq("id", job_id).single().execute()
         
         if not job.data:
             raise HTTPException(status_code=404, detail="Job not found")
         
-        job_data = job.data[0]
+        job_data = job.data
+
+        if job_data.get("user_id") != token_user_id:
+            raise HTTPException(status_code=403, detail="Forbidden")
         
         if job_data.get("metadata"):
             try:
@@ -628,9 +633,13 @@ async def get_video_status(job_id: str):
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
 @app.get("/api/users/{user_id}/videos")
-async def get_user_videos(user_id: str, limit: int = 20, offset: int = 0):
+async def get_user_videos(user_id: str, limit: int = 20, offset: int = 0, request: Request):
     """Liste les vidéos d'un utilisateur"""
     try:
+        # Require auth and ensure user matches token
+        token_user_id = await _get_authenticated_user_id(request)
+        if token_user_id != user_id:
+            raise HTTPException(status_code=403, detail="Forbidden")
         videos = supabase.table("video_jobs").select("*").eq("user_id", user_id).order("created_at", desc=True).range(offset, offset + limit - 1).execute()
         
         return {
@@ -641,9 +650,13 @@ async def get_user_videos(user_id: str, limit: int = 20, offset: int = 0):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/users/{user_id}/info")
-async def get_user_info(user_id: str):
+async def get_user_info(user_id: str, request: Request):
     """Récupère les infos complètes d'un utilisateur"""
     try:
+        # Require auth and ensure user matches token
+        token_user_id = await _get_authenticated_user_id(request)
+        if token_user_id != user_id:
+            raise HTTPException(status_code=403, detail="Forbidden")
         user = supabase.table("users").select("*").eq("id", user_id).single().execute()
         
         if not user.data:
@@ -656,9 +669,11 @@ async def get_user_info(user_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/users/sync")
-async def sync_user_from_auth(user_data: dict):
+async def sync_user_from_auth(user_data: dict, request: Request):
     """Synchronise les données utilisateur depuis Supabase Auth (appelé après login OAuth)"""
     try:
+        # Require auth and ensure identity consistency when possible
+        token_user_id = await _get_authenticated_user_id(request)
         user_id = user_data.get("id")
         email = user_data.get("email")
         first_name = user_data.get("user_metadata", {}).get("first_name") or user_data.get("user_metadata", {}).get("full_name", "").split()[0] if user_data.get("user_metadata", {}).get("full_name") else None
@@ -666,6 +681,9 @@ async def sync_user_from_auth(user_data: dict):
         
         if not user_id:
             raise HTTPException(status_code=400, detail="User ID is required")
+
+        if token_user_id and user_id and token_user_id != user_id:
+            raise HTTPException(status_code=403, detail="Forbidden")
         
         # Check if user exists
         existing = supabase.table("users").select("*").eq("id", user_id).execute()
@@ -702,9 +720,12 @@ async def sync_user_from_auth(user_data: dict):
 # ============= STRIPE ENDPOINTS =============
 
 @app.post("/api/stripe/create-checkout")
-async def create_checkout_session(req: CheckoutRequest):
+async def create_checkout_session(req: CheckoutRequest, request: Request):
     """Créer une session Stripe Checkout pour abonnement"""
-    
+    # Auth: derive user_id from JWT and ignore body value
+    token_user_id = await _get_authenticated_user_id(request)
+    req.user_id = token_user_id
+
     price_ids = {
         "starter": os.getenv("STRIPE_PRICE_STARTER"),
         "pro": os.getenv("STRIPE_PRICE_PRO"),
@@ -888,9 +909,14 @@ async def stripe_webhook(request: Request):
 async def download_video(job_id: str, request: Request):
     """Télécharge une vidéo directement depuis la plateforme (proxy + streaming, supporte gros fichiers)."""
     try:
-        job = supabase.table("video_jobs").select("video_url, niche, created_at").eq("id", job_id).single().execute()
+        # Require auth and ensure ownership
+        token_user_id = await _get_authenticated_user_id(request)
+        job = supabase.table("video_jobs").select("video_url, niche, created_at, user_id").eq("id", job_id).single().execute()
         if not job.data:
             raise HTTPException(status_code=404, detail="Video not found")
+
+        if job.data.get("user_id") != token_user_id:
+            raise HTTPException(status_code=403, detail="Forbidden")
 
         video_url = job.data.get("video_url")
         if not video_url:
@@ -924,9 +950,14 @@ async def download_video(job_id: str, request: Request):
 async def stream_video(job_id: str, request: Request):
     """Stream vidéo pour lecture dans le player (Range + proxy, pas d'URL externe)."""
     try:
-        job = supabase.table("video_jobs").select("video_url").eq("id", job_id).single().execute()
+        # Require auth and ensure ownership
+        token_user_id = await _get_authenticated_user_id(request)
+        job = supabase.table("video_jobs").select("video_url, user_id").eq("id", job_id).single().execute()
         if not job.data:
             raise HTTPException(status_code=404, detail="Video not found")
+
+        if job.data.get("user_id") != token_user_id:
+            raise HTTPException(status_code=403, detail="Forbidden")
 
         video_url = job.data.get("video_url")
         if not video_url:
@@ -946,9 +977,11 @@ async def stream_video(job_id: str, request: Request):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/upload-image")
-async def upload_image_to_supabase(file: UploadFile = File(...)):
+async def upload_image_to_supabase(request: Request, file: UploadFile = File(...)):
     """Upload une image vers Supabase Storage"""
     try:
+        # Require auth
+        await _get_authenticated_user_id(request)
         # Vérifier le type de fichier
         allowed_types = ["image/jpeg", "image/png", "image/webp"]
         if file.content_type not in allowed_types:
