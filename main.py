@@ -30,7 +30,7 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:3000",
         "https://vykso.com",
-        "https://vykso-v2-tww7.vercel.app",
+        "https://vykso.lovable.app",
         "https://www.vykso.com",
         os.getenv("FRONTEND_URL", ""),
     ],
