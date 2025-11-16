@@ -79,7 +79,15 @@ class SoraClient:
         if size:
             create_params["size"] = size
         if seconds:
-            create_params["seconds"] = seconds  # Keep as integer, not string
+            # API expects string: '4', '8', or '12'
+            # Round to nearest allowed value
+            if seconds <= 4:
+                seconds_str = "4"
+            elif seconds <= 8:
+                seconds_str = "8"
+            else:
+                seconds_str = "12"
+            create_params["seconds"] = seconds_str
 
         # Start video generation job
         video = self.client.videos.create(**create_params)
@@ -136,7 +144,15 @@ class SoraClient:
         if size:
             payload["size"] = size
         if seconds:
-            payload["seconds"] = seconds  # Keep as integer, not string
+            # API expects string: '4', '8', or '12'
+            # Round to nearest allowed value
+            if seconds <= 4:
+                seconds_str = "4"
+            elif seconds <= 8:
+                seconds_str = "8"
+            else:
+                seconds_str = "12"
+            payload["seconds"] = seconds_str
 
         headers = {
             "Authorization": f"Bearer {self.api_key}",
