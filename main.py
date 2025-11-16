@@ -342,6 +342,14 @@ async def process_video_generation(
             clip_seconds = 10
             clip_urls = []
 
+            # Handle image-to-video: download images if provided
+            input_reference = None
+            if model_type == "image-to-video" and image_urls and len(image_urls) > 0:
+                # Use first image for all clips (or can be extended to use different images per clip)
+                image_url = image_urls[0]
+                print(f"🖼️ Using image reference: {image_url}")
+                input_reference = image_url  # sora_client will download it from URL
+
             if model_type == "storyboard" and shots:
                 iterable = enumerate(shots)
             else:
@@ -351,11 +359,15 @@ async def process_video_generation(
                 clip_prompt = shot["Scene"] if shot else generate_prompt(niche, custom_prompt, i + 1, num_clips)
                 print(f"📝 Sora clip {i+1} prompt: {clip_prompt[:100]}...")
 
+                # For image-to-video, use image only for first clip
+                clip_input_reference = input_reference if (i == 0 and input_reference) else None
+
                 local_path = sora.generate_video_and_wait(
                     prompt=clip_prompt,
                     use_pro=use_pro,
                     size=size,
                     seconds=(int(shot["duration"]) if shot else clip_seconds),
+                    input_reference=clip_input_reference,
                     download_path=f"/tmp/{job_id}_sora_{i}.mp4",
                 )
 
