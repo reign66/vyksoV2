@@ -186,6 +186,8 @@ class StoryboardShot(BaseModel):
     duration: float
 
 class VideoRequestAdvanced(BaseModel):
+    model_config = {"protected_namespaces": ()}
+    
     user_id: str  # Ignored server-side; derived from JWT
     niche: Optional[str] = None
     duration: int = 10

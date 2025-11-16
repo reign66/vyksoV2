@@ -79,7 +79,7 @@ class SoraClient:
         if size:
             create_params["size"] = size
         if seconds:
-            create_params["seconds"] = str(seconds)
+            create_params["seconds"] = seconds  # Keep as integer, not string
 
         # Start video generation job
         video = self.client.videos.create(**create_params)
@@ -136,7 +136,7 @@ class SoraClient:
         if size:
             payload["size"] = size
         if seconds:
-            payload["seconds"] = str(seconds)
+            payload["seconds"] = seconds  # Keep as integer, not string
 
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -150,7 +150,17 @@ class SoraClient:
                 headers=headers,
                 json=payload,
             )
-            response.raise_for_status()
+            # Better error handling: show API error message
+            if response.status_code >= 400:
+                error_detail = "Unknown error"
+                try:
+                    error_data = response.json()
+                    error_detail = error_data.get("error", {}).get("message", str(error_data))
+                except:
+                    error_detail = response.text or f"HTTP {response.status_code}"
+                print(f"❌ API Error: {error_detail}")
+                print(f"📋 Request payload: {payload}")
+                response.raise_for_status()
             video = response.json()
 
         video_id = video["id"]
