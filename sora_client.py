@@ -1,7 +1,8 @@
 import os
 import time
-from typing import Optional
+from typing import Optional, Union
 import httpx
+from pathlib import Path
 
 try:
     from openai import OpenAI
@@ -46,6 +47,7 @@ class SoraClient:
         use_pro: bool = False,
         size: Optional[str] = None,  # e.g., "1280x720"
         seconds: Optional[int] = None,  # e.g., 8, 10, 15
+        input_reference: Optional[Union[str, Path, bytes]] = None,  # Image file path, URL, or bytes
         download_path: str = "output.mp4",
     ) -> str:
         """Start a Sora job, poll until complete, then download MP4 to download_path.
@@ -53,12 +55,13 @@ class SoraClient:
         - use_pro: True => model "sora-2-pro", else "sora-2"
         - size: optional (e.g., 1280x720); if None, Sora default is used
         - seconds: optional duration; if None, Sora default is used
+        - input_reference: optional image file path, URL, or bytes for image-to-video
         Returns the local file path to the downloaded MP4.
         """
         if self.use_sdk:
-            return self._generate_with_sdk(prompt, use_pro, size, seconds, download_path)
+            return self._generate_with_sdk(prompt, use_pro, size, seconds, input_reference, download_path)
         else:
-            return self._generate_with_httpx(prompt, use_pro, size, seconds, download_path)
+            return self._generate_with_httpx(prompt, use_pro, size, seconds, input_reference, download_path)
     
     def _generate_with_sdk(
         self,
@@ -66,6 +69,7 @@ class SoraClient:
         use_pro: bool,
         size: Optional[str],
         seconds: Optional[int],
+        input_reference: Optional[Union[str, Path, bytes]],
         download_path: str,
     ) -> str:
         """Generate video using OpenAI SDK."""
@@ -88,6 +92,27 @@ class SoraClient:
             else:
                 seconds_str = "12"
             create_params["seconds"] = seconds_str
+        
+        # Handle input_reference (image for image-to-video)
+        if input_reference:
+            if isinstance(input_reference, (str, Path)):
+                # File path or URL
+                if str(input_reference).startswith(('http://', 'https://')):
+                    # Download from URL first
+                    import tempfile
+                    with httpx.Client(timeout=30.0) as client:
+                        resp = client.get(str(input_reference))
+                        resp.raise_for_status()
+                        with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as tmp:
+                            tmp.write(resp.content)
+                            input_reference = tmp.name
+                create_params["input_reference"] = open(input_reference, "rb")
+            elif isinstance(input_reference, bytes):
+                # Bytes data - write to temp file
+                import tempfile
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as tmp:
+                    tmp.write(input_reference)
+                    create_params["input_reference"] = open(tmp.name, "rb")
 
         # Start video generation job
         video = self.client.videos.create(**create_params)
@@ -131,53 +156,116 @@ class SoraClient:
         use_pro: bool,
         size: Optional[str],
         seconds: Optional[int],
+        input_reference: Optional[Union[str, Path, bytes]],
         download_path: str,
     ) -> str:
         """Generate video using direct HTTP calls (fallback method)."""
         model = "sora-2-pro" if use_pro else "sora-2"
 
-        # Prepare request payload
-        payload = {
-            "model": model,
-            "prompt": prompt,
-        }
-        if size:
-            payload["size"] = size
-        if seconds:
-            # API expects string: '4', '8', or '12'
-            # Round to nearest allowed value
-            if seconds <= 4:
-                seconds_str = "4"
-            elif seconds <= 8:
-                seconds_str = "8"
-            else:
-                seconds_str = "12"
-            payload["seconds"] = seconds_str
-
         headers = {
             "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
         }
 
-        # Start video generation job
-        with httpx.Client(timeout=30.0) as client:
-            response = client.post(
-                f"{self.base_url}/videos",
-                headers=headers,
-                json=payload,
-            )
-            # Better error handling: show API error message
-            if response.status_code >= 400:
-                error_detail = "Unknown error"
-                try:
-                    error_data = response.json()
-                    error_detail = error_data.get("error", {}).get("message", str(error_data))
-                except:
-                    error_detail = response.text or f"HTTP {response.status_code}"
-                print(f"❌ API Error: {error_detail}")
-                print(f"📋 Request payload: {payload}")
-                response.raise_for_status()
-            video = response.json()
+        # Handle input_reference - if present, use multipart/form-data
+        if input_reference:
+            # Download image if URL
+            image_data = None
+            image_filename = "input_reference.jpg"
+            
+            if isinstance(input_reference, (str, Path)):
+                if str(input_reference).startswith(('http://', 'https://')):
+                    # Download from URL
+                    with httpx.Client(timeout=30.0) as client:
+                        resp = client.get(str(input_reference))
+                        resp.raise_for_status()
+                        image_data = resp.content
+                        # Try to determine content type from response
+                        content_type = resp.headers.get("content-type", "image/jpeg")
+                        if "png" in content_type:
+                            image_filename = "input_reference.png"
+                        elif "webp" in content_type:
+                            image_filename = "input_reference.webp"
+                else:
+                    # Local file path
+                    with open(input_reference, "rb") as f:
+                        image_data = f.read()
+                    # Determine file extension
+                    path_str = str(input_reference)
+                    if path_str.endswith('.png'):
+                        image_filename = "input_reference.png"
+                    elif path_str.endswith('.webp'):
+                        image_filename = "input_reference.webp"
+            elif isinstance(input_reference, bytes):
+                image_data = input_reference
+
+            # Use multipart/form-data for file upload
+            files = {
+                "input_reference": (image_filename, image_data, "image/jpeg")
+            }
+            data = {
+                "model": model,
+                "prompt": prompt,
+            }
+            if size:
+                data["size"] = size
+            if seconds:
+                # API expects string: '4', '8', or '12'
+                if seconds <= 4:
+                    seconds_str = "4"
+                elif seconds <= 8:
+                    seconds_str = "8"
+                else:
+                    seconds_str = "12"
+                data["seconds"] = seconds_str
+
+            # Start video generation job with multipart/form-data
+            with httpx.Client(timeout=30.0) as client:
+                response = client.post(
+                    f"{self.base_url}/videos",
+                    headers=headers,
+                    files=files,
+                    data=data,
+                )
+        else:
+            # No image - use JSON
+            payload = {
+                "model": model,
+                "prompt": prompt,
+            }
+            if size:
+                payload["size"] = size
+            if seconds:
+                # API expects string: '4', '8', or '12'
+                if seconds <= 4:
+                    seconds_str = "4"
+                elif seconds <= 8:
+                    seconds_str = "8"
+                else:
+                    seconds_str = "12"
+                payload["seconds"] = seconds_str
+
+            headers["Content-Type"] = "application/json"
+
+            # Start video generation job
+            with httpx.Client(timeout=30.0) as client:
+                response = client.post(
+                    f"{self.base_url}/videos",
+                    headers=headers,
+                    json=payload,
+                )
+        
+        # Better error handling: show API error message (applies to both cases)
+        if response.status_code >= 400:
+            error_detail = "Unknown error"
+            try:
+                error_data = response.json()
+                error_detail = error_data.get("error", {}).get("message", str(error_data))
+            except:
+                error_detail = response.text or f"HTTP {response.status_code}"
+            print(f"❌ API Error: {error_detail}")
+            print(f"📋 Model: {model}, Prompt: {prompt[:100]}...")
+            response.raise_for_status()
+        video = response.json()
 
         video_id = video["id"]
         print(f"🎬 Video generation started: {video_id}")
