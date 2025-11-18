@@ -3,6 +3,8 @@ import json
 import uuid
 import stripe
 import httpx
+import asyncio
+import sys
 from fastapi.responses import StreamingResponse
 from typing import Optional, List, Dict, Literal
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, UploadFile, File
@@ -273,19 +275,27 @@ async def process_video_generation(
     ai_model: str = "veo3_fast"
 ):
     """Background task : génère la vidéo (tous les modèles supportés)"""
+    # Force flush pour s'assurer que les logs apparaissent immédiatement
+    print(f"🎬 [BACKGROUND TASK STARTED] Starting generation for job {job_id}", flush=True)
+    sys.stdout.flush()
+    
     try:
-        print(f"🎬 Starting generation for job {job_id}")
-        print(f"🤖 AI Model: {ai_model}")
-        print(f"📊 Model type: {model_type}")
+        print(f"🎬 Starting generation for job {job_id}", flush=True)
+        print(f"🤖 AI Model: {ai_model}", flush=True)
+        print(f"📊 Model type: {model_type}", flush=True)
+        sys.stdout.flush()
         
         supabase.table("video_jobs").update({
             "status": "generating"
         }).eq("id", job_id).execute()
+        print(f"✅ Job {job_id} status updated to 'generating'", flush=True)
+        sys.stdout.flush()
         
         # ===== DÉTECTION DU MODÈLE AI =====
         if ai_model in ["veo3", "veo3_fast"]:
             # ===== MODE VEO 3.1 (Google GenAI) - génération synchronisée avec polling =====
-            print(f"🎥 Using Veo 3.1 API ({ai_model})")
+            print(f"🎥 Using Veo 3.1 API ({ai_model})", flush=True)
+            sys.stdout.flush()
             use_fast = ai_model == "veo3_fast"
 
             # Veo ≈ 8s par clip => découpage puis concat
@@ -294,14 +304,21 @@ async def process_video_generation(
 
             for i in range(num_clips):
                 clip_prompt = generate_prompt(niche, custom_prompt, i + 1, num_clips)
-                print(f"📝 Veo clip {i+1}/{num_clips} prompt: {clip_prompt[:100]}...")
+                print(f"📝 Veo clip {i+1}/{num_clips} prompt: {clip_prompt[:100]}...", flush=True)
+                sys.stdout.flush()
 
-                local_path = veo.generate_video_and_wait(
-                    prompt=clip_prompt,
-                    use_fast_model=use_fast,
-                    aspect_ratio="9:16",
-                    download_path=f"/tmp/{job_id}_veo_{i}.mp4",
-                )
+                # Exécuter dans un thread séparé pour ne pas bloquer l'event loop
+                # Capturer les valeurs explicitement pour éviter les problèmes de closure
+                def _generate_veo_clip(p=clip_prompt, idx=i):
+                    return veo.generate_video_and_wait(
+                        prompt=p,
+                        use_fast_model=use_fast,
+                        aspect_ratio="9:16",
+                        download_path=f"/tmp/{job_id}_veo_{idx}.mp4",
+                    )
+                
+                loop = asyncio.get_event_loop()
+                local_path = await loop.run_in_executor(None, _generate_veo_clip)
 
                 with open(local_path, "rb") as f:
                     data = f.read()
@@ -311,8 +328,14 @@ async def process_video_generation(
             if len(clip_urls) == 1:
                 final_url = clip_urls[0]
             else:
-                print(f"🎞️ Concatenating {len(clip_urls)} Veo clips...")
-                concatenated_data = video_editor.concatenate_videos(clip_urls, f"{job_id}.mp4")
+                print(f"🎞️ Concatenating {len(clip_urls)} Veo clips...", flush=True)
+                sys.stdout.flush()
+                
+                def _concat_veo_clips():
+                    return video_editor.concatenate_videos(clip_urls, f"{job_id}.mp4")
+                
+                loop = asyncio.get_event_loop()
+                concatenated_data = await loop.run_in_executor(None, _concat_veo_clips)
                 final_url = uploader.upload_bytes(concatenated_data, f"{job_id}.mp4")
 
             supabase.table("video_jobs").update({
@@ -321,11 +344,13 @@ async def process_video_generation(
                 "completed_at": "now()",
             }).eq("id", job_id).execute()
 
-            print(f"✅ Job {job_id} completed! (credits already deducted)")
+            print(f"✅ Job {job_id} completed! (credits already deducted)", flush=True)
+            sys.stdout.flush()
         
         else:
             # ===== MODE SORA 2 (OpenAI Videos API) - génération synchronisée avec polling =====
-            print(f"🎥 Using Sora 2 API")
+            print(f"🎥 Using Sora 2 API", flush=True)
+            sys.stdout.flush()
 
             def quality_to_sora_params(q: str):
                 # Map simple: basic => default, pro_720p => size 1280x720 + pro, pro_1080p => size 1920x1080 + pro
@@ -347,7 +372,8 @@ async def process_video_generation(
             if model_type == "image-to-video" and image_urls and len(image_urls) > 0:
                 # Use first image for all clips (or can be extended to use different images per clip)
                 image_url = image_urls[0]
-                print(f"🖼️ Using image reference: {image_url}")
+                print(f"🖼️ Using image reference: {image_url}", flush=True)
+                sys.stdout.flush()
                 input_reference = image_url  # sora_client will download it from URL
 
             if model_type == "storyboard" and shots:
@@ -357,19 +383,28 @@ async def process_video_generation(
 
             for i, shot in iterable:
                 clip_prompt = shot["Scene"] if shot else generate_prompt(niche, custom_prompt, i + 1, num_clips)
-                print(f"📝 Sora clip {i+1} prompt: {clip_prompt[:100]}...")
+                print(f"📝 Sora clip {i+1} prompt: {clip_prompt[:100]}...", flush=True)
+                sys.stdout.flush()
 
                 # For image-to-video, use image only for first clip
                 clip_input_reference = input_reference if (i == 0 and input_reference) else None
+                clip_duration = int(shot["duration"]) if shot else clip_seconds
+                download_path_clip = f"/tmp/{job_id}_sora_{i}.mp4"
 
-                local_path = sora.generate_video_and_wait(
-                    prompt=clip_prompt,
-                    use_pro=use_pro,
-                    size=size,
-                    seconds=(int(shot["duration"]) if shot else clip_seconds),
-                    input_reference=clip_input_reference,
-                    download_path=f"/tmp/{job_id}_sora_{i}.mp4",
-                )
+                # Exécuter dans un thread séparé pour ne pas bloquer l'event loop
+                # Capturer les valeurs explicitement pour éviter les problèmes de closure
+                def _generate_sora_clip(p=clip_prompt, dur=clip_duration, ir=clip_input_reference, dp=download_path_clip):
+                    return sora.generate_video_and_wait(
+                        prompt=p,
+                        use_pro=use_pro,
+                        size=size,
+                        seconds=dur,
+                        input_reference=ir,
+                        download_path=dp,
+                    )
+                
+                loop = asyncio.get_event_loop()
+                local_path = await loop.run_in_executor(None, _generate_sora_clip)
 
                 with open(local_path, "rb") as f:
                     data = f.read()
@@ -379,8 +414,14 @@ async def process_video_generation(
             if len(clip_urls) == 1:
                 final_url = clip_urls[0]
             else:
-                print(f"🎞️ Concatenating {len(clip_urls)} Sora clips...")
-                concatenated_data = video_editor.concatenate_videos(clip_urls, f"{job_id}.mp4")
+                print(f"🎞️ Concatenating {len(clip_urls)} Sora clips...", flush=True)
+                sys.stdout.flush()
+                
+                def _concat_sora_clips():
+                    return video_editor.concatenate_videos(clip_urls, f"{job_id}.mp4")
+                
+                loop = asyncio.get_event_loop()
+                concatenated_data = await loop.run_in_executor(None, _concat_sora_clips)
                 final_url = uploader.upload_bytes(concatenated_data, f"{job_id}.mp4")
 
             supabase.table("video_jobs").update({
@@ -389,17 +430,23 @@ async def process_video_generation(
                 "completed_at": "now()",
             }).eq("id", job_id).execute()
 
-            print(f"✅ Job {job_id} completed! (credits already deducted)")
+            print(f"✅ Job {job_id} completed! (credits already deducted)", flush=True)
+            sys.stdout.flush()
         
     except Exception as e:
-        print(f"❌ Error generating video {job_id}: {e}")
+        print(f"❌ Error generating video {job_id}: {e}", flush=True)
         import traceback
         traceback.print_exc()
+        sys.stdout.flush()
         
-        supabase.table("video_jobs").update({
-            "status": "failed",
-            "error": str(e)
-        }).eq("id", job_id).execute()
+        try:
+            supabase.table("video_jobs").update({
+                "status": "failed",
+                "error": str(e)
+            }).eq("id", job_id).execute()
+        except Exception as db_error:
+            print(f"❌ Failed to update job status in DB: {db_error}", flush=True)
+            sys.stdout.flush()
 
 # ============= ENDPOINTS =============
 
@@ -487,12 +534,16 @@ async def generate_video(req: VideoRequest, background_tasks: BackgroundTasks, r
         }).execute()
         
         job_id = job.data[0]["id"]
-        print(f"📋 Job created: {job_id}")
+        print(f"📋 Job created: {job_id}", flush=True)
+        sys.stdout.flush()
         
     except Exception as e:
-        print(f"❌ Error creating job: {e}")
+        print(f"❌ Error creating job: {e}", flush=True)
+        sys.stdout.flush()
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
     
+    print(f"🚀 Adding background task for job {job_id}", flush=True)
+    sys.stdout.flush()
     background_tasks.add_task(
         process_video_generation, 
         job_id, 
@@ -506,6 +557,8 @@ async def generate_video(req: VideoRequest, background_tasks: BackgroundTasks, r
         "text-to-video",
         req.ai_model
     )
+    print(f"✅ Background task added for job {job_id}", flush=True)
+    sys.stdout.flush()
     
     estimated_time = num_clips * 40
     return VideoResponse(
@@ -586,13 +639,19 @@ async def generate_video_advanced(req: VideoRequestAdvanced, background_tasks: B
         }).execute()
         
         job_id = job.data[0]["id"]
+        print(f"📋 Job created (advanced): {job_id}", flush=True)
+        sys.stdout.flush()
         
     except Exception as e:
+        print(f"❌ Error creating job (advanced): {e}", flush=True)
+        sys.stdout.flush()
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
     
     # Lancer génération
     shots_dict = [shot.dict() for shot in req.shots] if req.shots else None
     
+    print(f"🚀 Adding background task for job {job_id} (advanced)", flush=True)
+    sys.stdout.flush()
     background_tasks.add_task(
         process_video_generation, 
         job_id, 
@@ -606,6 +665,8 @@ async def generate_video_advanced(req: VideoRequestAdvanced, background_tasks: B
         req.model_type,
         req.ai_model
     )
+    print(f"✅ Background task added for job {job_id} (advanced)", flush=True)
+    sys.stdout.flush()
     
     estimated_time = (len(req.shots) if req.shots else 1) * 40
     return VideoResponse(
