@@ -43,16 +43,73 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Clients
-sora = SoraClient()
-veo = VeoAIClient()
-supabase = get_client()
-uploader = SupabaseVideoUploader()
-video_editor = VideoEditor()
-gemini_client = GeminiClient()
-youtube_client = YouTubeClient()
-content_generator = ContentGenerator(gemini_client=gemini_client)
-schedule_calculator = ScheduleCalculator()
+# Clients - Lazy initialization to prevent startup crashes
+# These will be initialized on first use, allowing the server to start
+# even if some API keys are not configured
+
+_sora = None
+_veo = None
+_supabase = None
+_uploader = None
+_video_editor = None
+_gemini_client = None
+_youtube_client = None
+_content_generator = None
+_schedule_calculator = None
+
+def get_sora():
+    global _sora
+    if _sora is None:
+        _sora = SoraClient()
+    return _sora
+
+def get_veo():
+    global _veo
+    if _veo is None:
+        _veo = VeoAIClient()
+    return _veo
+
+def get_supabase():
+    global _supabase
+    if _supabase is None:
+        _supabase = get_client()
+    return _supabase
+
+def get_uploader():
+    global _uploader
+    if _uploader is None:
+        _uploader = SupabaseVideoUploader()
+    return _uploader
+
+def get_video_editor():
+    global _video_editor
+    if _video_editor is None:
+        _video_editor = VideoEditor()
+    return _video_editor
+
+def get_gemini():
+    global _gemini_client
+    if _gemini_client is None:
+        _gemini_client = GeminiClient()
+    return _gemini_client
+
+def get_youtube():
+    global _youtube_client
+    if _youtube_client is None:
+        _youtube_client = YouTubeClient()
+    return _youtube_client
+
+def get_content_generator():
+    global _content_generator
+    if _content_generator is None:
+        _content_generator = ContentGenerator(gemini_client=get_gemini())
+    return _content_generator
+
+def get_schedule_calculator():
+    global _schedule_calculator
+    if _schedule_calculator is None:
+        _schedule_calculator = ScheduleCalculator()
+    return _schedule_calculator
 
 # Stripe
 stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
@@ -313,7 +370,7 @@ async def process_video_generation(
         print(f"🤖 AI Model: {ai_model}")
         print(f"📊 Model type: {model_type}")
         
-        supabase.table("video_jobs").update({
+        get_supabase().table("video_jobs").update({
             "status": "generating"
         }).eq("id", job_id).execute()
         
@@ -329,7 +386,7 @@ async def process_video_generation(
             
             # 2. Generate Script using Gemini with prompt enrichment
             print(f"📜 Generating enriched script for {duration}s video ({num_segments} segments)...")
-            script = gemini_client.generate_video_script(
+            script = get_gemini().generate_video_script(
                 prompt=custom_prompt or generate_prompt(niche),
                 duration=duration,
                 num_segments=num_segments,
@@ -374,7 +431,7 @@ async def process_video_generation(
                 else:
                     # A. Generate Image with enriched prompt (Parallel)
                     print(f"  📸 Seg {segment_index} Shot {shot_idx}: Generating Image with gemini-3-pro-image-preview...")
-                    image_bytes = await loop.run_in_executor(None, gemini_client.generate_image, img_prompt)
+                    image_bytes = await loop.run_in_executor(None, get_gemini().generate_image, img_prompt)
                     
                     if image_bytes:
                         from PIL import Image
@@ -384,7 +441,7 @@ async def process_video_generation(
                             img_path = f"/tmp/{job_id}_seg{segment_index}_shot{shot_idx}.png"
                             with open(img_path, "wb") as f:
                                 f.write(image_bytes)
-                            await loop.run_in_executor(None, uploader.upload_file, img_path, f"{job_id}_seg{segment_index}_shot{shot_idx}.png", "video-images")
+                            await loop.run_in_executor(None, get_uploader().upload_file, img_path, f"{job_id}_seg{segment_index}_shot{shot_idx}.png", "video-images")
                         except Exception as e:
                             print(f"⚠️ Failed to upload generated image: {e}")
 
@@ -398,7 +455,7 @@ async def process_video_generation(
                 
                 local_path = await loop.run_in_executor(
                     None, 
-                    lambda: veo.generate_video_and_wait(
+                    lambda: get_veo().generate_video_and_wait(
                         prompt=vid_prompt,
                         aspect_ratio="9:16",
                         resolution="720p",
@@ -412,7 +469,7 @@ async def process_video_generation(
                 # Upload clip
                 with open(local_path, "rb") as f:
                     data = f.read()
-                url = await loop.run_in_executor(None, uploader.upload_bytes, data, f"{job_id}_seg{segment_index}_shot{shot_idx}.mp4")
+                url = await loop.run_in_executor(None, get_uploader().upload_bytes, data, f"{job_id}_seg{segment_index}_shot{shot_idx}.mp4")
                 return (segment_index, shot_idx, url)
 
             all_clip_urls = []
@@ -445,7 +502,7 @@ async def process_video_generation(
                 # Fallback to simple loop if script generation fails
                 print("⚠️ Script generation failed, falling back to simple generation.")
                 # Generate a single 8s video with the enriched prompt
-                enriched_prompt = gemini_client.enrich_prompt(
+                enriched_prompt = get_gemini().enrich_prompt(
                     custom_prompt or generate_prompt(niche),
                     segment_context="Single video generation",
                     user_image_description=None
@@ -454,7 +511,7 @@ async def process_video_generation(
                 # Use first user image if available
                 first_image = user_pil_images[0] if user_pil_images else None
                 
-                local_path = veo.generate_video_and_wait(
+                local_path = get_veo().generate_video_and_wait(
                     prompt=enriched_prompt,
                     aspect_ratio="9:16",
                     resolution="720p",
@@ -466,19 +523,19 @@ async def process_video_generation(
                 
                 with open(local_path, "rb") as f:
                     data = f.read()
-                url = uploader.upload_bytes(data, f"{job_id}_fallback.mp4")
+                url = get_uploader().upload_bytes(data, f"{job_id}_fallback.mp4")
                 all_clip_urls = [url]
 
             if len(all_clip_urls) == 1:
                 final_url = all_clip_urls[0]
             elif len(all_clip_urls) > 1:
                 print(f"🎞️ Concatenating {len(all_clip_urls)} clips...")
-                concatenated_data = video_editor.concatenate_videos(all_clip_urls, f"{job_id}.mp4")
-                final_url = uploader.upload_bytes(concatenated_data, f"{job_id}.mp4")
+                concatenated_data = get_video_editor().concatenate_videos(all_clip_urls, f"{job_id}.mp4")
+                final_url = get_uploader().upload_bytes(concatenated_data, f"{job_id}.mp4")
             else:
                 raise Exception("No clips generated")
 
-            supabase.table("video_jobs").update({
+            get_supabase().table("video_jobs").update({
                 "status": "completed",
                 "video_url": final_url,
                 "completed_at": "now()",
@@ -525,7 +582,7 @@ async def process_video_generation(
                 # For image-to-video, use image only for first clip
                 clip_input_reference = input_reference if (i == 0 and input_reference) else None
 
-                local_path = sora.generate_video_and_wait(
+                local_path = get_sora().generate_video_and_wait(
                     prompt=clip_prompt,
                     use_pro=use_pro,
                     size=size,
@@ -536,17 +593,17 @@ async def process_video_generation(
 
                 with open(local_path, "rb") as f:
                     data = f.read()
-                url = uploader.upload_bytes(data, f"{job_id}_clip_{i}.mp4")
+                url = get_uploader().upload_bytes(data, f"{job_id}_clip_{i}.mp4")
                 clip_urls.append(url)
 
             if len(clip_urls) == 1:
                 final_url = clip_urls[0]
             else:
                 print(f"🎞️ Concatenating {len(clip_urls)} Sora clips...")
-                concatenated_data = video_editor.concatenate_videos(clip_urls, f"{job_id}.mp4")
-                final_url = uploader.upload_bytes(concatenated_data, f"{job_id}.mp4")
+                concatenated_data = get_video_editor().concatenate_videos(clip_urls, f"{job_id}.mp4")
+                final_url = get_uploader().upload_bytes(concatenated_data, f"{job_id}.mp4")
 
-            supabase.table("video_jobs").update({
+            get_supabase().table("video_jobs").update({
                 "status": "completed",
                 "video_url": final_url,
                 "completed_at": "now()",
@@ -570,7 +627,7 @@ async def process_video_generation(
             # For now, let's just query the job to get duration/quality if needed, or pass it to this function.
             # We passed duration/quality to this function!
             cost = calculate_credits_cost(duration, quality, ai_model)
-            supabase.rpc("refund_credits", {
+            get_supabase().rpc("refund_credits", {
                 "p_user_id": user_id,
                 "p_amount": cost
             }).execute()
@@ -578,7 +635,7 @@ async def process_video_generation(
         except Exception as refund_error:
             print(f"❌ Error refunding credits: {refund_error}")
 
-        supabase.table("video_jobs").update({
+        get_supabase().table("video_jobs").update({
             "status": "failed",
             "error": str(e)
         }).eq("id", job_id).execute()
@@ -620,17 +677,17 @@ async def generate_video(req: VideoRequest, background_tasks: BackgroundTasks, r
     required_credits = calculate_credits_cost(req.duration, req.quality, req.ai_model)
     
     try:
-        user = supabase.table("profiles").select("*").eq("id", req.user_id).execute()
+        user = get_supabase().table("profiles").select("*").eq("id", req.user_id).execute()
         
         if not user.data:
             print(f"👤 Creating new user: {req.user_id}")
-            supabase.table("profiles").insert({
+            get_supabase().table("profiles").insert({
                 "id": req.user_id,
                 "email": f"{req.user_id}@vykso.com",
                 "credits": 10,
                 "plan": "free"
             }).execute()
-            user = supabase.table("profiles").select("*").eq("id", req.user_id).execute()
+            user = get_supabase().table("profiles").select("*").eq("id", req.user_id).execute()
         
         user_data = user.data[0]
         print(f"👤 User: {req.user_id}, Credits: {user_data['credits']}, Plan: {user_data['plan']}")
@@ -641,7 +698,7 @@ async def generate_video(req: VideoRequest, background_tasks: BackgroundTasks, r
     
     # Deduct credits atomically BEFORE scheduling work (backend source of truth)
     try:
-        decrement = supabase.rpc("decrement_credits", {
+        decrement = get_supabase().rpc("decrement_credits", {
             "p_user_id": req.user_id,
             "p_amount": required_credits,
         }).execute()
@@ -657,7 +714,7 @@ async def generate_video(req: VideoRequest, background_tasks: BackgroundTasks, r
         raise HTTPException(status_code=500, detail="Unable to deduct credits")
     
     try:
-        job = supabase.table("video_jobs").insert({
+        job = get_supabase().table("video_jobs").insert({
             "user_id": req.user_id,
             "status": "pending",
             "niche": req.niche or "custom",
@@ -728,21 +785,21 @@ async def generate_video_advanced(req: VideoRequestAdvanced, background_tasks: B
     
     # Vérifier user et crédits
     try:
-        user = supabase.table("profiles").select("*").eq("id", req.user_id).execute()
+        user = get_supabase().table("profiles").select("*").eq("id", req.user_id).execute()
         
         if not user.data:
-            supabase.table("profiles").insert({
+            get_supabase().table("profiles").insert({
                 "id": req.user_id,
                 "email": f"{req.user_id}@vykso.com",
                 "credits": 10,
                 "plan": "free"
             }).execute()
-            user = supabase.table("profiles").select("*").eq("id", req.user_id).execute()
+            user = get_supabase().table("profiles").select("*").eq("id", req.user_id).execute()
         
         user_data = user.data[0]
         
         # Deduct credits BEFORE scheduling generation
-        decrement = supabase.rpc("decrement_credits", {
+        decrement = get_supabase().rpc("decrement_credits", {
             "p_user_id": req.user_id,
             "p_amount": required_credits,
         }).execute()
@@ -756,7 +813,7 @@ async def generate_video_advanced(req: VideoRequestAdvanced, background_tasks: B
     
     # Créer job
     try:
-        job = supabase.table("video_jobs").insert({
+        job = get_supabase().table("video_jobs").insert({
             "user_id": req.user_id,
             "status": "pending",
             "niche": req.niche or ("storyboard" if req.model_type == "storyboard" else "custom"),
@@ -808,7 +865,7 @@ async def get_video_status(job_id: str, request: Request):
     try:
         # Require auth and ensure ownership
         token_user_id = await _get_authenticated_user_id(request)
-        job = supabase.table("video_jobs").select("*").eq("id", job_id).single().execute()
+        job = get_supabase().table("video_jobs").select("*").eq("id", job_id).single().execute()
         
         if not job.data:
             raise HTTPException(status_code=404, detail="Job not found")
@@ -840,7 +897,7 @@ async def get_user_videos(user_id: str, request: Request, limit: int = 20, offse
         token_user_id = await _get_authenticated_user_id(request)
         if token_user_id != user_id:
             raise HTTPException(status_code=403, detail="Forbidden")
-        videos = supabase.table("video_jobs").select("*").eq("user_id", user_id).order("created_at", desc=True).range(offset, offset + limit - 1).execute()
+        videos = get_supabase().table("video_jobs").select("*").eq("user_id", user_id).order("created_at", desc=True).range(offset, offset + limit - 1).execute()
         
         return {
             "total": len(videos.data),
@@ -857,7 +914,7 @@ async def get_user_info(user_id: str, request: Request):
         token_user_id = await _get_authenticated_user_id(request)
         if token_user_id != user_id:
             raise HTTPException(status_code=403, detail="Forbidden")
-        user = supabase.table("profiles").select("*").eq("id", user_id).single().execute()
+        user = get_supabase().table("profiles").select("*").eq("id", user_id).single().execute()
         
         if not user.data:
             raise HTTPException(status_code=404, detail="User not found")
@@ -886,7 +943,7 @@ async def sync_user_from_auth(user_data: dict, request: Request):
             raise HTTPException(status_code=403, detail="Forbidden")
         
         # Check if user exists
-        existing = supabase.table("profiles").select("*").eq("id", user_id).execute()
+        existing = get_supabase().table("profiles").select("*").eq("id", user_id).execute()
         
         update_data = {
             "email": email or f"{user_id}@vykso.com",
@@ -899,7 +956,7 @@ async def sync_user_from_auth(user_data: dict, request: Request):
         
         if existing.data:
             # Update existing user
-            result = supabase.table("profiles").update(update_data).eq("id", user_id).execute()
+            result = get_supabase().table("profiles").update(update_data).eq("id", user_id).execute()
         else:
             # Create new user
             update_data.update({
@@ -907,7 +964,7 @@ async def sync_user_from_auth(user_data: dict, request: Request):
                 "credits": 10,
                 "plan": "free"
             })
-            result = supabase.table("profiles").insert(update_data).execute()
+            result = get_supabase().table("profiles").insert(update_data).execute()
         
         return {"success": True, "user": result.data[0] if result.data else None}
         
@@ -942,7 +999,7 @@ async def upload_video_to_youtube(job_id: str, request: Request, body: YouTubeUp
     
     try:
         # 1. Get User YouTube Tokens from profiles table
-        user = supabase.table("profiles").select("youtube_tokens").eq("id", token_user_id).single().execute()
+        user = get_supabase().table("profiles").select("youtube_tokens").eq("id", token_user_id).single().execute()
         if not user.data or not user.data.get("youtube_tokens"):
             raise HTTPException(
                 status_code=400, 
@@ -963,7 +1020,7 @@ async def upload_video_to_youtube(job_id: str, request: Request, body: YouTubeUp
             )
         
         # Refresh tokens if needed
-        refreshed_tokens = youtube_client.refresh_credentials(tokens)
+        refreshed_tokens = get_youtube().refresh_credentials(tokens)
         if refreshed_tokens is None:
             raise HTTPException(
                 status_code=400,
@@ -971,13 +1028,13 @@ async def upload_video_to_youtube(job_id: str, request: Request, body: YouTubeUp
             )
         if refreshed_tokens != tokens:
             # Update tokens in database
-            supabase.table("profiles").update({
+            get_supabase().table("profiles").update({
                 "youtube_tokens": refreshed_tokens
             }).eq("id", token_user_id).execute()
             tokens = refreshed_tokens
         
         # 2. Get Video Job Data
-        job = supabase.table("video_jobs").select("*").eq("id", job_id).single().execute()
+        job = get_supabase().table("video_jobs").select("*").eq("id", job_id).single().execute()
         if not job.data:
             raise HTTPException(status_code=404, detail="Job not found")
         
@@ -997,22 +1054,22 @@ async def upload_video_to_youtube(job_id: str, request: Request, body: YouTubeUp
             final_title = body.title
         else:
             print("🎯 Generating clickbait title...")
-            final_title = content_generator.generate_clickbait_title(original_prompt)
+            final_title = get_content_generator().generate_clickbait_title(original_prompt)
         
         # Description
         if body.description:
             final_description = body.description
         else:
             print("📝 Generating description...")
-            final_description = content_generator.generate_description(original_prompt)
+            final_description = get_content_generator().generate_description(original_prompt)
         
         # Ensure #Shorts is present
-        final_title, final_description = content_generator.check_shorts_tag_present(
+        final_title, final_description = get_content_generator().check_shorts_tag_present(
             final_title, final_description
         )
         
         # Tags
-        final_tags = content_generator.get_default_tags(body.tags)
+        final_tags = get_content_generator().get_default_tags(body.tags)
         
         # 4. Calculate schedule time if requested
         schedule_time_iso = None
@@ -1021,9 +1078,9 @@ async def upload_video_to_youtube(job_id: str, request: Request, body: YouTubeUp
         
         if body.schedule:
             print("📅 Calculating optimal publish time...")
-            optimal_time = schedule_calculator.calculate_optimal_publish_time()
-            schedule_time_iso = schedule_calculator.format_for_youtube_api(optimal_time)
-            schedule_time_display = schedule_calculator.format_for_display(optimal_time)
+            optimal_time = get_schedule_calculator().calculate_optimal_publish_time()
+            schedule_time_iso = get_schedule_calculator().format_for_youtube_api(optimal_time)
+            schedule_time_display = get_schedule_calculator().format_for_display(optimal_time)
             # When scheduling, privacy MUST be 'private'
             final_privacy = 'private'
             print(f"⏰ Scheduled for: {schedule_time_display}")
@@ -1036,7 +1093,7 @@ async def upload_video_to_youtube(job_id: str, request: Request, body: YouTubeUp
             r = req_lib.get(video_url, timeout=60)
             video_data = r.content
         else:
-            video_data = supabase.storage.from_(VIDEOS_BUCKET).download(path)
+            video_data = get_supabase().storage.from_(VIDEOS_BUCKET).download(path)
         
         temp_video_path = f"/tmp/{job_id}_upload.mp4"
         with open(temp_video_path, "wb") as f:
@@ -1060,7 +1117,7 @@ async def upload_video_to_youtube(job_id: str, request: Request, body: YouTubeUp
             # Generate thumbnail with Imagen (optimized for YouTube Shorts 9:16)
             print("🖼️ Generating YouTube Shorts thumbnail with AI...")
             try:
-                thumbnail_bytes, thumbnail_path = gemini_client.generate_thumbnail(
+                thumbnail_bytes, thumbnail_path = get_gemini().generate_thumbnail(
                     title=final_title,
                     description=final_description,
                     original_prompt=original_prompt
@@ -1077,7 +1134,7 @@ async def upload_video_to_youtube(job_id: str, request: Request, body: YouTubeUp
                         
                         current_metadata["thumbnail_path"] = thumbnail_path
                         
-                        supabase.table("video_jobs").update({
+                        get_supabase().table("video_jobs").update({
                             "metadata": json.dumps(current_metadata)
                         }).eq("id", job_id).execute()
                         print(f"💾 Thumbnail path saved to metadata: {thumbnail_path}")
@@ -1090,7 +1147,7 @@ async def upload_video_to_youtube(job_id: str, request: Request, body: YouTubeUp
         
         # 7. Upload to YouTube with thumbnail
         print(f"🚀 Uploading to YouTube...")
-        result = youtube_client.upload_video_with_thumbnail(
+        result = get_youtube().upload_video_with_thumbnail(
             file_path=temp_video_path,
             title=final_title,
             description=final_description,
@@ -1138,7 +1195,7 @@ async def upload_video_to_youtube(job_id: str, request: Request, body: YouTubeUp
 @app.get("/api/auth/youtube/url")
 async def get_youtube_auth_url(request: Request):
     token_user_id = await _get_authenticated_user_id(request)
-    url = youtube_client.get_auth_url(user_id=token_user_id)
+    url = get_youtube().get_auth_url(user_id=token_user_id)
     return {"url": url}
 
 @app.get("/api/auth/youtube/callback")
@@ -1148,7 +1205,7 @@ async def youtube_auth_callback(code: str, state: str):
     """
     try:
         user_id = state
-        credentials = youtube_client.get_credentials_from_code(code)
+        credentials = get_youtube().get_credentials_from_code(code)
         
         # Convert credentials to dict - ensure ALL required fields are saved
         creds_dict = {
@@ -1170,7 +1227,7 @@ async def youtube_auth_callback(code: str, state: str):
         print(f"📝 Token URI: {creds_dict.get('token_uri')}")
         
         # Store in DB
-        supabase.table("profiles").update({
+        get_supabase().table("profiles").update({
             "youtube_tokens": creds_dict
         }).eq("id", user_id).execute()
         
@@ -1191,7 +1248,7 @@ async def disconnect_youtube(request: Request):
         token_user_id = await _get_authenticated_user_id(request)
         
         # Clear YouTube tokens
-        supabase.table("profiles").update({
+        get_supabase().table("profiles").update({
             "youtube_tokens": None
         }).eq("id", token_user_id).execute()
         
@@ -1213,7 +1270,7 @@ async def get_youtube_status(request: Request):
     try:
         token_user_id = await _get_authenticated_user_id(request)
         
-        user = supabase.table("profiles").select("youtube_tokens").eq("id", token_user_id).single().execute()
+        user = get_supabase().table("profiles").select("youtube_tokens").eq("id", token_user_id).single().execute()
         
         if not user.data or not user.data.get("youtube_tokens"):
             return {"connected": False, "valid": False, "message": "YouTube not connected"}
@@ -1367,10 +1424,10 @@ async def stripe_webhook(request: Request):
             print(f"💳 Credit purchase: {credits_to_add} credits for user {user_id}")
             
             try:
-                user = supabase.table("profiles").select("credits").eq("id", user_id).single().execute()
+                user = get_supabase().table("profiles").select("credits").eq("id", user_id).single().execute()
                 current_credits = user.data.get('credits', 0)
                 
-                supabase.table("profiles").update({
+                get_supabase().table("profiles").update({
                     "credits": current_credits + credits_to_add
                 }).eq("id", user_id).execute()
                 
@@ -1390,7 +1447,7 @@ async def stripe_webhook(request: Request):
             print(f"✅ Subscription {plan} for user {user_id}")
             
             try:
-                supabase.table("profiles").update({
+                get_supabase().table("profiles").update({
                     "plan": plan,
                     "credits": credits_map.get(plan, 600),
                     "stripe_customer_id": session.get('customer'),
@@ -1407,7 +1464,7 @@ async def stripe_webhook(request: Request):
         
         if subscription_id:
             try:
-                user = supabase.table("profiles").select("*").eq("stripe_subscription_id", subscription_id).single().execute()
+                user = get_supabase().table("profiles").select("*").eq("stripe_subscription_id", subscription_id).single().execute()
                 
                 if user.data:
                     plan = user.data['plan']
@@ -1417,7 +1474,7 @@ async def stripe_webhook(request: Request):
                         "max": 1800
                     }
                     
-                    supabase.table("profiles").update({
+                    get_supabase().table("profiles").update({
                         "credits": credits_map.get(plan, 600)
                     }).eq("id", user.data['id']).execute()
                     
@@ -1433,7 +1490,7 @@ async def download_video(job_id: str, request: Request):
     try:
         # Require auth and ensure ownership
         token_user_id = await _get_authenticated_user_id(request)
-        job = supabase.table("video_jobs").select("video_url, niche, created_at, user_id").eq("id", job_id).single().execute()
+        job = get_supabase().table("video_jobs").select("video_url, niche, created_at, user_id").eq("id", job_id).single().execute()
         if not job.data:
             raise HTTPException(status_code=404, detail="Video not found")
 
@@ -1474,7 +1531,7 @@ async def stream_video(job_id: str, request: Request):
     try:
         # Require auth and ensure ownership
         token_user_id = await _get_authenticated_user_id(request)
-        job = supabase.table("video_jobs").select("video_url, user_id").eq("id", job_id).single().execute()
+        job = get_supabase().table("video_jobs").select("video_url, user_id").eq("id", job_id).single().execute()
         if not job.data:
             raise HTTPException(status_code=404, detail="Video not found")
 
