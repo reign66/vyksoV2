@@ -80,7 +80,7 @@ class GeminiClient:
             """
             
             response = self.client.models.generate_content(
-                model="gemini-2.5-flash-lite-preview-06-17",
+                model="gemini-2.0-flash-lite",
                 contents=user_content,
                 config=types.GenerateContentConfig(
                     system_instruction=system_instruction,
@@ -114,7 +114,7 @@ class GeminiClient:
             )
             
             response = self.client.models.generate_content(
-                model="gemini-2.5-flash-lite-preview-06-17",
+                model="gemini-2.0-flash-lite",
                 contents=[
                     image_part,
                     "Describe this image in detail for TikTok/Shorts video generation. Focus on: subjects, setting, colors, mood, style, key visual elements. Keep it under 200 characters."
@@ -198,7 +198,7 @@ class GeminiClient:
         
         try:
             response = self.client.models.generate_content(
-                model="gemini-2.5-flash-lite-preview-06-17",
+                model="gemini-2.0-flash-lite",
                 contents=user_content,
                 config=types.GenerateContentConfig(
                     system_instruction=system_instruction,
@@ -357,7 +357,7 @@ class GeminiClient:
             """
             
             response = self.client.models.generate_content(
-                model="gemini-2.5-flash-lite-preview-06-17",
+                model="gemini-2.0-flash-lite",
                 contents=user_content,
                 config=types.GenerateContentConfig(
                     system_instruction=system_instruction,

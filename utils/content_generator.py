@@ -96,7 +96,7 @@ class ContentGenerator:
         """
         
         response = self.gemini_client.client.models.generate_content(
-            model="gemini-2.5-flash-lite-preview-06-17",
+            model="gemini-2.0-flash-lite",
             contents=f"Génère un titre clickbait pour cette vidéo: {prompt}",
             config=types.GenerateContentConfig(
                 system_instruction=system_instruction,
