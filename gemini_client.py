@@ -41,6 +41,7 @@ class GeminiClient:
         """
         Enriches a client prompt before image/video generation for higher quality output.
         This adds cinematographic details, visual style, and technical specifications.
+        Uses gemini-2.5-flash-lite for fast text generation.
         
         Args:
             base_prompt: The original user prompt
@@ -48,22 +49,26 @@ class GeminiClient:
             user_image_description: Description of user-provided image if any (optional)
         
         Returns:
-            Enriched prompt optimized for high-quality generation
+            Enriched prompt optimized for high-quality generation with TikTok Shorts aesthetic
         """
+        # TikTok Shorts aesthetic suffix to always append
+        tiktok_suffix = ", vertical 9:16 aspect ratio, TikTok Shorts aesthetic, high contrast vibrant colors, trending social media style, 4K quality"
+        
         try:
             system_instruction = """
-            You are an expert cinematographer and visual director. Your task is to enrich video/image generation prompts
-            to produce stunning, professional-quality content.
+            You are an expert cinematographer and visual director specializing in TikTok and YouTube Shorts content.
+            Your task is to enrich video/image generation prompts to produce stunning, viral-worthy content.
             
             Rules:
             1. Keep the original intent and subject matter intact
             2. Add specific cinematographic details (camera angles, movements, lighting)
             3. Include visual style descriptors (color grading, mood, atmosphere)
             4. Add technical quality markers (resolution, sharpness, professional grade)
-            5. Make it suitable for AI video generation models like Veo 3.1
+            5. Make it suitable for AI video generation models
             6. If a user image is mentioned, incorporate it naturally into the scene
-            7. Keep the prompt under 500 characters for optimal generation
+            7. Keep the prompt under 400 characters (TikTok aesthetic suffix will be added separately)
             8. Output ONLY the enriched prompt, nothing else
+            9. Focus on dynamic, engaging visuals that grab attention in the first frame
             """
             
             user_content = f"""
@@ -71,11 +76,11 @@ class GeminiClient:
             {f'Segment context: {segment_context}' if segment_context else ''}
             {f'User provided image to incorporate: {user_image_description}' if user_image_description else ''}
             
-            Enrich this prompt for high-quality video generation.
+            Enrich this prompt for viral TikTok/YouTube Shorts video generation.
             """
             
             response = self.client.models.generate_content(
-                model="gemini-2.0-flash",
+                model="gemini-2.5-flash-lite-preview-06-17",
                 contents=user_content,
                 config=types.GenerateContentConfig(
                     system_instruction=system_instruction,
@@ -83,33 +88,36 @@ class GeminiClient:
             )
             
             enriched = response.text.strip()
-            print(f"📝 Enriched prompt: {enriched[:100]}...")
-            return enriched
+            # Add TikTok aesthetic suffix
+            final_prompt = f"{enriched}{tiktok_suffix}"
+            print(f"📝 Enriched prompt: {final_prompt[:100]}...")
+            return final_prompt
             
         except Exception as e:
-            print(f"Error enriching prompt: {e}, using original")
-            return base_prompt
+            print(f"Error enriching prompt: {e}, using original with TikTok suffix")
+            return f"{base_prompt}{tiktok_suffix}"
 
     def describe_image_from_url(self, image_url: str) -> str:
         """
         Analyzes a user-provided image and returns a description for prompt enrichment.
+        Uses gemini-2.5-flash-lite for fast text generation.
         """
         try:
             # Download the image
             response = httpx.get(image_url, timeout=30)
             image_bytes = response.content
             
-            # Analyze with Gemini
+            # Analyze with Gemini - use vision model
             image_part = types.Part.from_bytes(
                 data=image_bytes,
                 mime_type="image/png"
             )
             
             response = self.client.models.generate_content(
-                model="gemini-2.0-flash",
+                model="gemini-2.5-flash-lite-preview-06-17",
                 contents=[
                     image_part,
-                    "Describe this image in detail for video generation context. Focus on: subjects, setting, colors, mood, style. Keep it under 200 characters."
+                    "Describe this image in detail for TikTok/Shorts video generation. Focus on: subjects, setting, colors, mood, style, key visual elements. Keep it under 200 characters."
                 ]
             )
             
@@ -118,72 +126,79 @@ class GeminiClient:
             print(f"Error describing image: {e}")
             return None
 
-    def generate_video_script(self, prompt: str, duration: int, num_segments: int, user_images: list = None) -> dict:
+    def generate_video_script(self, prompt: str, duration: int, num_segments: int, user_images: list = None, segment_duration: int = 8) -> dict:
         """
-        Generates a structured script for the video using Gemini 2.0 Flash.
+        Generates a structured script for the video using Gemini 2.5 Flash Lite.
         Returns a JSON object with segments and shots.
+        Uses gemini-2.5-flash-lite for fast text generation.
         
-        Veo 3.1 supports 4s, 6s, or 8s clips, so we'll generate 1-4 shots per 8s segment.
-        Each shot will have its prompt enriched before generation.
+        Args:
+            prompt: The user's prompt for the video
+            duration: Total video duration in seconds
+            num_segments: Number of segments to generate
+            user_images: Optional list of user-provided image URLs
+            segment_duration: Duration per segment (8s for Veo 3.1, 10s for Sora)
+        
+        Returns:
+            JSON object with segments and shots, each with enriched prompts
         """
         import json
         
-        # First, analyze user images if provided
+        # First, analyze user images if provided (parallel would be ideal but keeping it simple)
         image_descriptions = []
         if user_images:
-            for img_url in user_images[:3]:  # Max 3 images for Veo 3.1
+            for img_url in user_images[:3]:  # Max 3 images
                 desc = self.describe_image_from_url(img_url)
                 if desc:
                     image_descriptions.append(desc)
         
-        system_instruction = """
-        You are an expert video director. Create a detailed script for a video.
-        The video is divided into 8-second segments (Veo 3.1 optimal duration).
-        For EACH 8-second segment, you must define 1 to 4 distinct 'shots' (scenes).
+        system_instruction = f"""
+        You are an expert TikTok/YouTube Shorts video director. Create a detailed script for a viral short-form video.
+        The video is divided into {segment_duration}-second segments for optimal AI video generation.
+        For EACH segment, you must define exactly 1 shot (scene) - keep it simple for best quality.
         
-        IMPORTANT: Veo 3.1 can only use up to 3 reference images total per video.
-        If user images are provided, indicate which shots should use them.
+        IMPORTANT: 
+        - Focus on creating visually STUNNING, attention-grabbing content
+        - Each shot should tell a mini-story that hooks viewers immediately
+        - Use dynamic camera movements and dramatic lighting descriptions
+        - If user images are provided, use them strategically for the most impactful shots
         
         Output JSON format:
-        {
+        {{
             "segments": [
-                {
+                {{
                     "segment_index": 1,
                     "shots": [
-                        {
+                        {{
                             "shot_index": 1,
-                            "image_prompt": "Detailed visual description for image generation...",
-                            "video_prompt": "Motion description for video generation including camera movements...",
-                            "duration": 8,
+                            "image_prompt": "Detailed visual description for image generation focusing on composition, lighting, colors...",
+                            "video_prompt": "Motion description for video generation including camera movements, subject actions, transitions...",
+                            "duration": {segment_duration},
                             "use_user_image_index": null
-                        },
-                        ...
+                        }}
                     ]
-                },
-                ...
+                }}
             ]
-        }
+        }}
         
         Note: "use_user_image_index" should be 0, 1, or 2 if this shot should use a user-provided image, or null to generate a new image.
         """
         
-        # Calculate segments based on 8s blocks
-        num_8s_segments = (duration + 7) // 8
-        
         user_content = f"""
-        Create a video script.
+        Create a TikTok/YouTube Shorts video script.
         Topic/Prompt: {prompt}
         Total Duration: {duration} seconds
-        Number of 8s Segments: {num_8s_segments}
+        Number of Segments: {num_segments}
+        Segment Duration: {segment_duration} seconds each
         User Provided Images: {len(user_images) if user_images else 0}
         {f'Image descriptions: {image_descriptions}' if image_descriptions else ''}
         
-        Create {num_8s_segments} segments with 1-4 shots each. Each shot should be 8 seconds for optimal Veo 3.1 quality.
+        Create {num_segments} segments with 1 shot each. Focus on viral TikTok/Shorts aesthetics: bold colors, dynamic movements, attention-grabbing visuals.
         """
         
         try:
             response = self.client.models.generate_content(
-                model="gemini-2.0-flash",
+                model="gemini-2.5-flash-lite-preview-06-17",
                 contents=user_content,
                 config=types.GenerateContentConfig(
                     system_instruction=system_instruction,
@@ -193,9 +208,11 @@ class GeminiClient:
             
             script = json.loads(response.text)
             
-            # Enrich all prompts in the script
+            print(f"📜 Script generated with {len(script.get('segments', []))} segments")
+            
+            # Enrich all prompts in the script (parallel enrichment for speed)
             for segment in script.get("segments", []):
-                segment_context = f"Segment {segment.get('segment_index', 1)} of {num_8s_segments}"
+                segment_context = f"Segment {segment.get('segment_index', 1)} of {num_segments}"
                 for shot in segment.get("shots", []):
                     # Get user image description if applicable
                     user_img_desc = None
@@ -203,7 +220,7 @@ class GeminiClient:
                     if user_img_idx is not None and user_img_idx < len(image_descriptions):
                         user_img_desc = image_descriptions[user_img_idx]
                     
-                    # Enrich both image and video prompts
+                    # Enrich both image and video prompts with TikTok aesthetic
                     if shot.get("image_prompt"):
                         shot["image_prompt"] = self.enrich_prompt(
                             shot["image_prompt"],
@@ -307,7 +324,7 @@ class GeminiClient:
     def _extract_keywords(self, title: str, description: str, original_prompt: str) -> dict:
         """
         Extrait les mots-clés pertinents pour enrichir le prompt Imagen.
-        Utilise Gemini pour analyser intelligemment le contenu.
+        Utilise Gemini 2.5 Flash Lite pour analyser intelligemment le contenu.
         """
         keywords = {
             'main_subject': '',
@@ -317,7 +334,7 @@ class GeminiClient:
         }
         
         try:
-            # Utiliser Gemini pour extraire les mots-clés de manière intelligente
+            # Utiliser Gemini 2.5 Flash Lite pour extraire les mots-clés de manière intelligente
             system_instruction = """
             You are an expert at analyzing video content for thumbnail creation.
             Extract key visual elements from the title and prompt.
@@ -340,7 +357,7 @@ class GeminiClient:
             """
             
             response = self.client.models.generate_content(
-                model="gemini-2.0-flash",
+                model="gemini-2.5-flash-lite-preview-06-17",
                 contents=user_content,
                 config=types.GenerateContentConfig(
                     system_instruction=system_instruction,
