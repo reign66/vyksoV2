@@ -1,4 +1,5 @@
 import os
+import requests
 from google import genai
 from google.genai import types
 import base64
@@ -220,4 +221,144 @@ class GeminiClient:
             
         except Exception as e:
             print(f"Error generating script: {e}")
+            return None
+
+    def generate_thumbnail(self, title: str, description: str, original_prompt: str) -> bytes:
+        """
+        Generates a YouTube thumbnail image using Imagen 4.0.
+        
+        Args:
+            title: The video title (ideally clickbait)
+            description: The video description
+            original_prompt: The original user prompt for the video
+            
+        Returns:
+            Image bytes (PNG format) or None if generation fails
+        """
+        try:
+            # Create an optimized prompt for YouTube thumbnail generation
+            thumbnail_prompt = self._create_thumbnail_prompt(title, description, original_prompt)
+            
+            print(f"🖼️ Generating thumbnail with Imagen 4.0...")
+            print(f"📝 Thumbnail prompt: {thumbnail_prompt[:200]}...")
+            
+            # Call Imagen 4.0 API via Google GenAI
+            # Using the predict endpoint for imagen-4.0-generate-001
+            endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/imagen-4.0-generate-001:predict"
+            
+            headers = {
+                "Content-Type": "application/json",
+            }
+            
+            payload = {
+                "instances": [{"prompt": thumbnail_prompt}],
+                "parameters": {
+                    "sampleCount": 1,
+                    "aspectRatio": "16:9",  # YouTube thumbnail ratio
+                    "personGeneration": "allow_adult"
+                }
+            }
+            
+            response = requests.post(
+                f"{endpoint}?key={self.api_key}",
+                headers=headers,
+                json=payload,
+                timeout=60
+            )
+            
+            if response.status_code == 200:
+                result = response.json()
+                # Extract base64 image from predictions
+                if "predictions" in result and len(result["predictions"]) > 0:
+                    prediction = result["predictions"][0]
+                    if "bytesBase64Encoded" in prediction:
+                        image_bytes = base64.b64decode(prediction["bytesBase64Encoded"])
+                        print("✅ Thumbnail generated successfully")
+                        return image_bytes
+            
+            # Fallback to gemini-3-pro-image-preview if Imagen fails
+            print(f"⚠️ Imagen 4.0 failed (status: {response.status_code}), trying gemini-3-pro-image-preview...")
+            return self._generate_thumbnail_fallback(thumbnail_prompt)
+            
+        except Exception as e:
+            print(f"❌ Error generating thumbnail with Imagen: {e}")
+            # Try fallback
+            try:
+                return self._generate_thumbnail_fallback(thumbnail_prompt)
+            except Exception as fallback_error:
+                print(f"❌ Fallback thumbnail generation also failed: {fallback_error}")
+                return None
+    
+    def _create_thumbnail_prompt(self, title: str, description: str, original_prompt: str) -> str:
+        """
+        Creates an optimized prompt for YouTube thumbnail generation.
+        The prompt describes a visually striking thumbnail, not the video content.
+        """
+        # Extract key words from title (remove emojis and special chars for the prompt)
+        import re
+        clean_title = re.sub(r'[^\w\s]', '', title).strip()
+        
+        # Use Gemini to create an optimized thumbnail description
+        try:
+            system_instruction = """
+            You are an expert YouTube thumbnail designer. Create a detailed image generation prompt
+            for a thumbnail that will maximize clicks.
+            
+            Rules for the prompt:
+            1. Describe a STATIC IMAGE, not a video scene
+            2. Include bold, large text overlay with key words from the title
+            3. Use vibrant, contrasting colors (red, yellow, orange are proven to work)
+            4. Include expressive elements (shocked face emoji, arrows, circles)
+            5. High contrast, saturated colors
+            6. Professional YouTube thumbnail style
+            7. 16:9 aspect ratio composition
+            8. Text should be readable and impactful
+            9. Keep prompt under 300 characters
+            10. Output ONLY the image generation prompt, nothing else
+            """
+            
+            user_content = f"""
+            Video Title: {title}
+            Video Topic: {original_prompt}
+            
+            Create a thumbnail image generation prompt that will make people want to click.
+            """
+            
+            response = self.client.models.generate_content(
+                model="gemini-2.0-flash",
+                contents=user_content,
+                config=types.GenerateContentConfig(
+                    system_instruction=system_instruction,
+                )
+            )
+            
+            optimized_prompt = response.text.strip()
+            return optimized_prompt
+            
+        except Exception as e:
+            print(f"Error creating optimized thumbnail prompt: {e}")
+            # Fallback to a generic but effective thumbnail prompt
+            return f"Bold text '{clean_title[:30]}' in yellow and red colors, vibrant gradient background, high contrast, YouTube thumbnail style, professional design, eye-catching, 16:9 aspect ratio"
+    
+    def _generate_thumbnail_fallback(self, prompt: str) -> bytes:
+        """
+        Fallback thumbnail generation using gemini-3-pro-image-preview.
+        """
+        try:
+            response = self.client.models.generate_content(
+                model='gemini-3-pro-image-preview',
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_modalities=['IMAGE']
+                )
+            )
+            
+            if response.candidates and response.candidates[0].content.parts:
+                for part in response.candidates[0].content.parts:
+                    if hasattr(part, 'inline_data') and part.inline_data:
+                        print("✅ Thumbnail generated with fallback model")
+                        return base64.b64decode(part.inline_data.data)
+            return None
+        except Exception as e:
+            print(f"Error in fallback thumbnail generation: {e}")
             return None

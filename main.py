@@ -14,6 +14,7 @@ from veo_client import VeoAIClient
 from supabase_client import get_client
 from utils.supabase_uploader import SupabaseVideoUploader
 from utils.video_concat import VideoEditor
+from utils.content_generator import ContentGenerator, ScheduleCalculator
 from gemini_client import GeminiClient
 from youtube_client import YouTubeClient
 from io import BytesIO
@@ -50,6 +51,8 @@ uploader = SupabaseVideoUploader()
 video_editor = VideoEditor()
 gemini_client = GeminiClient()
 youtube_client = YouTubeClient()
+content_generator = ContentGenerator(gemini_client=gemini_client)
+schedule_calculator = ScheduleCalculator()
 
 # Stripe
 stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
@@ -201,6 +204,29 @@ class VideoRequestAdvanced(BaseModel):
     shots: Optional[List[StoryboardShot]] = None
     model_type: Literal["text-to-video", "image-to-video", "storyboard"] = "text-to-video"
     ai_model: Literal["sora2", "veo3.1"] = "veo3.1"
+
+
+class YouTubeUploadRequest(BaseModel):
+    """Request model for YouTube upload with flexible parameters"""
+    privacy: Literal["public", "private", "unlisted"] = "public"
+    schedule: bool = False
+    title: Optional[str] = None  # Custom title, or auto-generated if not provided
+    description: Optional[str] = None  # Custom description, or auto-generated if not provided
+    tags: Optional[List[str]] = None  # Custom tags, or default if not provided
+    thumbnail_url: Optional[str] = None  # URL of pre-generated thumbnail (optional)
+
+
+class YouTubeUploadResponse(BaseModel):
+    """Response model for YouTube upload"""
+    success: bool
+    youtube_id: Optional[str] = None
+    youtube_url: Optional[str] = None
+    title: Optional[str] = None
+    description: Optional[str] = None
+    scheduled_for: Optional[str] = None  # ISO 8601 UTC timestamp
+    scheduled_for_display: Optional[str] = None  # Human readable (Paris timezone)
+    error: Optional[str] = None
+    thumbnail_uploaded: bool = False
 
 # ============= FUNCTIONS =============
 
@@ -887,58 +913,183 @@ async def sync_user_from_auth(user_data: dict, request: Request):
         print(f"❌ Error syncing user: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/api/videos/{job_id}/upload-youtube")
-async def upload_video_to_youtube(job_id: str, request: Request):
-    """Upload a generated video to YouTube"""
+@app.post("/api/videos/{job_id}/upload-youtube", response_model=YouTubeUploadResponse)
+async def upload_video_to_youtube(job_id: str, request: Request, body: YouTubeUploadRequest = None):
+    """
+    Upload a generated video to YouTube with flexible options.
+    
+    Parameters:
+    - privacy: 'public', 'private', or 'unlisted' (default: 'public')
+    - schedule: If true, schedules for optimal time (video will be private until then)
+    - title: Custom title (auto-generated clickbait if not provided)
+    - description: Custom description (auto-generated if not provided)
+    - tags: Custom tags list (defaults to ['Shorts', 'AI', 'Vykso'])
+    - thumbnail_url: URL of pre-generated thumbnail (auto-generated with Imagen if not provided)
+    
+    Returns YouTube video URL, ID, and scheduled time if applicable.
+    """
+    import requests as req_lib
+    
     token_user_id = await _get_authenticated_user_id(request)
+    
+    # Default body if not provided
+    if body is None:
+        body = YouTubeUploadRequest()
+    
     try:
-        # 1. Get User Tokens
+        # 1. Get User YouTube Tokens from profiles table
         user = supabase.table("profiles").select("youtube_tokens").eq("id", token_user_id).single().execute()
         if not user.data or not user.data.get("youtube_tokens"):
-            raise HTTPException(status_code=400, detail="User not connected to YouTube")
+            raise HTTPException(
+                status_code=400, 
+                detail="YouTube account not connected. Please connect your YouTube account first."
+            )
         
         tokens = user.data["youtube_tokens"]
         
-        # 2. Get Job Video URL
+        # Refresh tokens if needed
+        refreshed_tokens = youtube_client.refresh_credentials(tokens)
+        if refreshed_tokens and refreshed_tokens != tokens:
+            # Update tokens in database
+            supabase.table("profiles").update({
+                "youtube_tokens": refreshed_tokens
+            }).eq("id", token_user_id).execute()
+            tokens = refreshed_tokens
+        
+        # 2. Get Video Job Data
         job = supabase.table("video_jobs").select("*").eq("id", job_id).single().execute()
         if not job.data:
             raise HTTPException(status_code=404, detail="Job not found")
         
+        # Verify ownership
+        if job.data.get("user_id") != token_user_id:
+            raise HTTPException(status_code=403, detail="Forbidden")
+        
         video_url = job.data.get("video_url")
         if not video_url:
             raise HTTPException(status_code=400, detail="Video not ready")
-            
-        # 3. Download Video to Temp
-        import requests
-        # If private bucket, we might need signed url or service key download. 
-        # Assuming public or we use the proxy logic. For simplicity, let's try direct download if public, 
-        # or use uploader/storage client to download.
-        # Let's use the storage client to download bytes.
-        path = _extract_object_path_from_public_url(video_url, VIDEOS_BUCKET)
-        if not path:
-             # Try direct download if it's a full URL
-             r = requests.get(video_url)
-             video_data = r.content
+        
+        original_prompt = job.data.get("prompt", "AI Generated Video")
+        
+        # 3. Generate or use provided content
+        # Title
+        if body.title:
+            final_title = body.title
         else:
-             video_data = supabase.storage.from_(VIDEOS_BUCKET).download(path)
-             
-        temp_path = f"/tmp/{job_id}_upload.mp4"
-        with open(temp_path, "wb") as f:
-            f.write(video_data)
-            
-        # 4. Upload
-        print(f"🚀 Uploading job {job_id} to YouTube...")
-        youtube_client.upload_video(
-            file_path=temp_path,
-            title=f"Vykso Video {job_id}",
-            description=f"Generated by Vykso.com\nPrompt: {job.data.get('prompt')}",
-            credentials_dict=tokens
+            print("🎯 Generating clickbait title...")
+            final_title = content_generator.generate_clickbait_title(original_prompt)
+        
+        # Description
+        if body.description:
+            final_description = body.description
+        else:
+            print("📝 Generating description...")
+            final_description = content_generator.generate_description(original_prompt)
+        
+        # Ensure #Shorts is present
+        final_title, final_description = content_generator.check_shorts_tag_present(
+            final_title, final_description
         )
         
-        return {"status": "uploaded"}
+        # Tags
+        final_tags = content_generator.get_default_tags(body.tags)
+        
+        # 4. Calculate schedule time if requested
+        schedule_time_iso = None
+        schedule_time_display = None
+        final_privacy = body.privacy
+        
+        if body.schedule:
+            print("📅 Calculating optimal publish time...")
+            optimal_time = schedule_calculator.calculate_optimal_publish_time()
+            schedule_time_iso = schedule_calculator.format_for_youtube_api(optimal_time)
+            schedule_time_display = schedule_calculator.format_for_display(optimal_time)
+            # When scheduling, privacy MUST be 'private'
+            final_privacy = 'private'
+            print(f"⏰ Scheduled for: {schedule_time_display}")
+        
+        # 5. Download video to temp file
+        print(f"📥 Downloading video for upload...")
+        path = _extract_object_path_from_public_url(video_url, VIDEOS_BUCKET)
+        if not path:
+            # Try direct download if it's a full URL
+            r = req_lib.get(video_url, timeout=60)
+            video_data = r.content
+        else:
+            video_data = supabase.storage.from_(VIDEOS_BUCKET).download(path)
+        
+        temp_video_path = f"/tmp/{job_id}_upload.mp4"
+        with open(temp_video_path, "wb") as f:
+            f.write(video_data)
+        
+        # 6. Generate or download thumbnail
+        thumbnail_bytes = None
+        
+        if body.thumbnail_url:
+            # Download thumbnail from provided URL
+            print(f"📥 Downloading provided thumbnail...")
+            try:
+                r = req_lib.get(body.thumbnail_url, timeout=30)
+                if r.status_code == 200:
+                    thumbnail_bytes = r.content
+            except Exception as e:
+                print(f"⚠️ Failed to download thumbnail: {e}")
+        
+        if not thumbnail_bytes:
+            # Generate thumbnail with Imagen
+            print("🖼️ Generating thumbnail with AI...")
+            try:
+                thumbnail_bytes = gemini_client.generate_thumbnail(
+                    title=final_title,
+                    description=final_description,
+                    original_prompt=original_prompt
+                )
+            except Exception as e:
+                print(f"⚠️ Thumbnail generation failed: {e}")
+        
+        # 7. Upload to YouTube with thumbnail
+        print(f"🚀 Uploading to YouTube...")
+        result = youtube_client.upload_video_with_thumbnail(
+            file_path=temp_video_path,
+            title=final_title,
+            description=final_description,
+            credentials_dict=tokens,
+            privacy=final_privacy,
+            tags=final_tags,
+            schedule_time=schedule_time_iso,
+            thumbnail_bytes=thumbnail_bytes
+        )
+        
+        # 8. Cleanup temp file
+        try:
+            os.remove(temp_video_path)
+        except:
+            pass
+        
+        # 9. Return response
+        if result.success:
+            return YouTubeUploadResponse(
+                success=True,
+                youtube_id=result.youtube_id,
+                youtube_url=result.youtube_url,
+                title=final_title,
+                description=final_description,
+                scheduled_for=schedule_time_iso,
+                scheduled_for_display=schedule_time_display,
+                thumbnail_uploaded=result.thumbnail_uploaded
+            )
+        else:
+            return YouTubeUploadResponse(
+                success=False,
+                error=result.error
+            )
 
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"❌ YouTube upload error: {e}")
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 # ============= YOUTUBE AUTH ENDPOINTS =============
@@ -965,7 +1116,7 @@ async def youtube_auth_callback(code: str, state: str):
             'token_uri': credentials.token_uri,
             'client_id': credentials.client_id,
             'client_secret': credentials.client_secret,
-            'scopes': credentials.scopes
+            'scopes': list(credentials.scopes) if credentials.scopes else []
         }
         
         # Store in DB
