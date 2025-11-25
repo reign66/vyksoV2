@@ -223,9 +223,10 @@ class GeminiClient:
             print(f"Error generating script: {e}")
             return None
 
-    def generate_thumbnail(self, title: str, description: str, original_prompt: str) -> bytes:
+    def generate_thumbnail(self, title: str, description: str, original_prompt: str) -> tuple:
         """
-        Generates a YouTube thumbnail image using Imagen 4.0.
+        Generates a YouTube Shorts thumbnail image using Imagen 4.0.
+        Optimized for vertical 9:16 format with reserved zones for text overlay.
         
         Args:
             title: The video title (ideally clickbait)
@@ -233,28 +234,30 @@ class GeminiClient:
             original_prompt: The original user prompt for the video
             
         Returns:
-            Image bytes (PNG format) or None if generation fails
+            Tuple of (image_bytes, thumbnail_path) or (None, None) if generation fails
         """
+        import os
+        
         try:
-            # Create an optimized prompt for YouTube thumbnail generation
-            thumbnail_prompt = self._create_thumbnail_prompt(title, description, original_prompt)
+            # Create an optimized prompt for YouTube Shorts thumbnail generation
+            thumbnail_prompt = self._generate_thumbnail_prompt(title, description, original_prompt)
             
-            print(f"🖼️ Generating thumbnail with Imagen 4.0...")
-            print(f"📝 Thumbnail prompt: {thumbnail_prompt[:200]}...")
+            print(f"🖼️ Generating YouTube Shorts thumbnail with Imagen 4.0...")
+            print(f"📝 Thumbnail prompt: {thumbnail_prompt[:300]}...")
             
             # Call Imagen 4.0 API via Google GenAI
-            # Using the predict endpoint for imagen-4.0-generate-001
             endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/imagen-4.0-generate-001:predict"
             
             headers = {
                 "Content-Type": "application/json",
             }
             
+            # Configuration optimisée pour YouTube Shorts (VERTICAL 9:16)
             payload = {
                 "instances": [{"prompt": thumbnail_prompt}],
                 "parameters": {
                     "sampleCount": 1,
-                    "aspectRatio": "16:9",  # YouTube thumbnail ratio
+                    "aspectRatio": "9:16",  # VERTICAL pour YouTube Shorts
                     "personGeneration": "allow_adult"
                 }
             }
@@ -266,6 +269,8 @@ class GeminiClient:
                 timeout=60
             )
             
+            image_bytes = None
+            
             if response.status_code == 200:
                 result = response.json()
                 # Extract base64 image from predictions
@@ -273,55 +278,65 @@ class GeminiClient:
                     prediction = result["predictions"][0]
                     if "bytesBase64Encoded" in prediction:
                         image_bytes = base64.b64decode(prediction["bytesBase64Encoded"])
-                        print("✅ Thumbnail generated successfully")
-                        return image_bytes
+                        print("✅ Thumbnail generated successfully with Imagen 4.0")
             
             # Fallback to gemini-3-pro-image-preview if Imagen fails
-            print(f"⚠️ Imagen 4.0 failed (status: {response.status_code}), trying gemini-3-pro-image-preview...")
-            return self._generate_thumbnail_fallback(thumbnail_prompt)
+            if not image_bytes:
+                print(f"⚠️ Imagen 4.0 failed (status: {response.status_code}), trying gemini-3-pro-image-preview...")
+                image_bytes = self._generate_thumbnail_fallback(thumbnail_prompt)
+            
+            # Save thumbnail to /tmp/thumbnails/
+            thumbnail_path = None
+            if image_bytes:
+                thumbnail_path = self._save_thumbnail(image_bytes)
+            
+            return image_bytes, thumbnail_path
             
         except Exception as e:
             print(f"❌ Error generating thumbnail with Imagen: {e}")
             # Try fallback
             try:
-                return self._generate_thumbnail_fallback(thumbnail_prompt)
+                image_bytes = self._generate_thumbnail_fallback(thumbnail_prompt)
+                if image_bytes:
+                    thumbnail_path = self._save_thumbnail(image_bytes)
+                    return image_bytes, thumbnail_path
             except Exception as fallback_error:
                 print(f"❌ Fallback thumbnail generation also failed: {fallback_error}")
-                return None
+            return None, None
     
-    def _create_thumbnail_prompt(self, title: str, description: str, original_prompt: str) -> str:
+    def _extract_keywords(self, title: str, description: str, original_prompt: str) -> dict:
         """
-        Creates an optimized prompt for YouTube thumbnail generation.
-        The prompt describes a visually striking thumbnail, not the video content.
+        Extrait les mots-clés pertinents pour enrichir le prompt Imagen.
+        Utilise Gemini pour analyser intelligemment le contenu.
         """
-        # Extract key words from title (remove emojis and special chars for the prompt)
-        import re
-        clean_title = re.sub(r'[^\w\s]', '', title).strip()
+        keywords = {
+            'main_subject': '',
+            'style': 'cinematic dramatic',
+            'mood': 'energetic and engaging',
+            'lighting': 'dramatic professional'
+        }
         
-        # Use Gemini to create an optimized thumbnail description
         try:
+            # Utiliser Gemini pour extraire les mots-clés de manière intelligente
             system_instruction = """
-            You are an expert YouTube thumbnail designer. Create a detailed image generation prompt
-            for a thumbnail that will maximize clicks.
+            You are an expert at analyzing video content for thumbnail creation.
+            Extract key visual elements from the title and prompt.
             
-            Rules for the prompt:
-            1. Describe a STATIC IMAGE, not a video scene
-            2. Include bold, large text overlay with key words from the title
-            3. Use vibrant, contrasting colors (red, yellow, orange are proven to work)
-            4. Include expressive elements (shocked face emoji, arrows, circles)
-            5. High contrast, saturated colors
-            6. Professional YouTube thumbnail style
-            7. 16:9 aspect ratio composition
-            8. Text should be readable and impactful
-            9. Keep prompt under 300 characters
-            10. Output ONLY the image generation prompt, nothing else
+            Output ONLY a JSON object with these exact keys:
+            - main_subject: Detailed visual description of the main subject (e.g., "orange cat wearing tiny suit playing grand piano")
+            - style: Visual style descriptor (e.g., "cinematic dramatic", "vibrant colorful", "dark mysterious")
+            - mood: Emotional mood (e.g., "surprising and entertaining", "inspiring and motivational")
+            - lighting: Lighting description (e.g., "dramatic spotlight from above", "warm golden hour")
+            
+            Be specific and visually descriptive. Focus on what would look AMAZING in a thumbnail.
             """
             
             user_content = f"""
-            Video Title: {title}
-            Video Topic: {original_prompt}
+            Title: {title}
+            Description: {description}
+            Original Prompt: {original_prompt}
             
-            Create a thumbnail image generation prompt that will make people want to click.
+            Extract keywords for a viral YouTube Shorts thumbnail.
             """
             
             response = self.client.models.generate_content(
@@ -329,16 +344,95 @@ class GeminiClient:
                 contents=user_content,
                 config=types.GenerateContentConfig(
                     system_instruction=system_instruction,
+                    response_mime_type="application/json"
                 )
             )
             
-            optimized_prompt = response.text.strip()
-            return optimized_prompt
+            import json
+            extracted = json.loads(response.text)
             
+            if extracted.get('main_subject'):
+                keywords['main_subject'] = extracted['main_subject']
+            if extracted.get('style'):
+                keywords['style'] = extracted['style']
+            if extracted.get('mood'):
+                keywords['mood'] = extracted['mood']
+            if extracted.get('lighting'):
+                keywords['lighting'] = extracted['lighting']
+                
         except Exception as e:
-            print(f"Error creating optimized thumbnail prompt: {e}")
-            # Fallback to a generic but effective thumbnail prompt
-            return f"Bold text '{clean_title[:30]}' in yellow and red colors, vibrant gradient background, high contrast, YouTube thumbnail style, professional design, eye-catching, 16:9 aspect ratio"
+            print(f"⚠️ Error extracting keywords with Gemini: {e}")
+            # Fallback: analyse basique du texte
+            combined_text = f"{title} {description} {original_prompt}".lower()
+            
+            # Détection de thèmes communs
+            if any(word in combined_text for word in ['chat', 'cat', 'kitten', 'chaton']):
+                keywords['main_subject'] = 'adorable cat with expressive face'
+            elif any(word in combined_text for word in ['argent', 'money', 'euro', 'économ', 'save', 'budget']):
+                keywords['main_subject'] = 'pile of money bills and coins, golden piggy bank'
+            elif any(word in combined_text for word in ['cuisine', 'recette', 'food', 'cook', 'recipe']):
+                keywords['main_subject'] = 'delicious gourmet food presentation, steam rising'
+            elif any(word in combined_text for word in ['fitness', 'sport', 'workout', 'muscle']):
+                keywords['main_subject'] = 'athletic person in dynamic pose, muscular definition'
+            elif any(word in combined_text for word in ['tech', 'phone', 'gadget', 'ai', 'robot']):
+                keywords['main_subject'] = 'futuristic technology device with glowing elements'
+            else:
+                keywords['main_subject'] = 'dramatic scene with strong visual impact'
+        
+        return keywords
+    
+    def _generate_thumbnail_prompt(self, title: str, description: str, original_prompt: str) -> str:
+        """
+        Génère un prompt optimisé pour Imagen qui crée un thumbnail YouTube Shorts.
+        
+        Structure du thumbnail :
+        - Top 20-30% : Zone vide pour titre putaclic
+        - Middle 40-50% : Contenu visuel principal
+        - Bottom 20-30% : Zone vide pour CTA/emoji
+        """
+        # Extrait les éléments clés
+        keywords = self._extract_keywords(title, description, original_prompt)
+        
+        # Construit le prompt Imagen optimisé pour YouTube Shorts
+        imagen_prompt = f"""Vertical 9:16 aspect ratio thumbnail for YouTube Shorts.
+
+Visual content (center 40-50%): {keywords['main_subject']} with {keywords['style']} aesthetic.
+
+Layout requirements:
+- Top 20-30% must be EMPTY SPACE (solid dark color or subtle gradient) for text overlay
+- Center 40-50% contains the main visual subject with dramatic lighting and high contrast
+- Bottom 20-30% must be EMPTY SPACE (matching dark gradient) for call-to-action text
+- High saturation vibrant colors optimized for mobile viewing
+- Trending TikTok/YouTube Shorts aesthetic
+- Professional photography quality, 4K sharp details
+- Clear focal point in center area
+- {keywords['mood']} mood with {keywords['lighting']} lighting
+
+Style: Cinematic, eye-catching, clickbait thumbnail style, designed for maximum engagement on social media."""
+
+        return imagen_prompt
+    
+    def _save_thumbnail(self, image_bytes: bytes) -> str:
+        """
+        Sauvegarde le thumbnail dans /tmp/thumbnails/ et retourne le chemin.
+        """
+        import os
+        import uuid
+        
+        # Créer le dossier si nécessaire
+        thumbnails_dir = "/tmp/thumbnails"
+        os.makedirs(thumbnails_dir, exist_ok=True)
+        
+        # Générer un nom unique
+        filename = f"thumbnail_{uuid.uuid4().hex[:8]}.png"
+        filepath = os.path.join(thumbnails_dir, filename)
+        
+        # Sauvegarder l'image
+        with open(filepath, "wb") as f:
+            f.write(image_bytes)
+        
+        print(f"💾 Thumbnail saved to: {filepath}")
+        return filepath
     
     def _generate_thumbnail_fallback(self, prompt: str) -> bytes:
         """

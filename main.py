@@ -170,7 +170,7 @@ class VideoRequest(BaseModel):
     duration: int
     quality: str = "basic"
     custom_prompt: Optional[str] = None
-    ai_model: Literal["sora2", "veo3.1"] = "veo3.1"
+    ai_model: Literal["sora2", "veo3.1", "veo3.1_fast"] = "veo3.1"
 
 class VideoResponse(BaseModel):
     job_id: str
@@ -203,7 +203,7 @@ class VideoRequestAdvanced(BaseModel):
     image_urls: Optional[List[str]] = None
     shots: Optional[List[StoryboardShot]] = None
     model_type: Literal["text-to-video", "image-to-video", "storyboard"] = "text-to-video"
-    ai_model: Literal["sora2", "veo3.1"] = "veo3.1"
+    ai_model: Literal["sora2", "veo3.1", "veo3.1_fast"] = "veo3.1"
 
 
 class YouTubeUploadRequest(BaseModel):
@@ -253,8 +253,8 @@ def generate_prompt(niche: str = None, custom_prompt: str = None, clip_index: in
 
 def calculate_credits_cost(duration: int, quality: str, ai_model: str = "veo3.1") -> int:
     """Calcule le coût en crédits selon la durée, la qualité et le modèle"""
-    # Veo 3.1 uses 8s segments, Sora uses 10s segments
-    if ai_model == "veo3.1":
+    # Veo 3.1 (normal et fast) uses 8s segments, Sora uses 10s segments
+    if ai_model in ("veo3.1", "veo3.1_fast"):
         num_clips = (duration + 7) // 8
     else:
         num_clips = (duration + 9) // 10
@@ -271,8 +271,8 @@ def calculate_credits_cost(duration: int, quality: str, ai_model: str = "veo3.1"
 def _validate_duration_and_model(duration: int, ai_model: str):
     if duration < 8 or duration > 60:
         raise HTTPException(status_code=400, detail="Duration must be between 8 and 60 seconds")
-    if ai_model == "veo3.1":
-        # Veo 3.1 supports 4s, 6s, or 8s clips - duration should be multiple of 8 for segments
+    if ai_model in ("veo3.1", "veo3.1_fast"):
+        # Veo 3.1 (normal et fast) supports 4s, 6s, or 8s clips - duration should be multiple of 8 for segments
         if duration % 8 not in (0,):
             raise HTTPException(status_code=400, detail="Duration must be a multiple of 8 for Veo 3.1 model")
     else:
@@ -318,9 +318,11 @@ async def process_video_generation(
         }).eq("id", job_id).execute()
         
         # ===== DÉTECTION DU MODÈLE AI =====
-        if ai_model == "veo3.1":
+        if ai_model in ("veo3.1", "veo3.1_fast"):
             # ===== MODE VEO 3.1 (Google GenAI) - Parallel Advanced Scripting =====
-            print(f"🎥 Using Veo 3.1 API ({ai_model}) with Parallel Advanced Scripting")
+            use_fast_model = (ai_model == "veo3.1_fast")
+            model_variant = "FAST" if use_fast_model else "NORMAL"
+            print(f"🎥 Using Veo 3.1 API ({model_variant} mode) with Parallel Advanced Scripting")
 
             # 1. Calculate Segments (8s blocks for Veo 3.1)
             num_segments = (duration + 7) // 8
@@ -403,6 +405,7 @@ async def process_video_generation(
                         duration_seconds=veo_duration,
                         image=pil_image,
                         download_path=f"/tmp/{job_id}_seg{segment_index}_shot{shot_idx}.mp4",
+                        use_fast_model=use_fast_model,
                     )
                 )
                 
@@ -458,6 +461,7 @@ async def process_video_generation(
                     duration_seconds=8,
                     image=first_image,
                     download_path=f"/tmp/{job_id}_fallback.mp4",
+                    use_fast_model=use_fast_model,
                 )
                 
                 with open(local_path, "rb") as f:
@@ -608,8 +612,8 @@ async def generate_video(req: VideoRequest, background_tasks: BackgroundTasks, r
     if not req.niche and not req.custom_prompt:
         raise HTTPException(status_code=400, detail="Either niche or custom_prompt is required")
     
-    # Calculate clips based on model (8s for Veo 3.1, 10s for Sora)
-    if req.ai_model == "veo3.1":
+    # Calculate clips based on model (8s for Veo 3.1/fast, 10s for Sora)
+    if req.ai_model in ("veo3.1", "veo3.1_fast"):
         num_clips = (req.duration + 7) // 8
     else:
         num_clips = (req.duration + 9) // 10
@@ -1024,6 +1028,7 @@ async def upload_video_to_youtube(job_id: str, request: Request, body: YouTubeUp
         
         # 6. Generate or download thumbnail
         thumbnail_bytes = None
+        thumbnail_path = None
         
         if body.thumbnail_url:
             # Download thumbnail from provided URL
@@ -1036,16 +1041,36 @@ async def upload_video_to_youtube(job_id: str, request: Request, body: YouTubeUp
                 print(f"⚠️ Failed to download thumbnail: {e}")
         
         if not thumbnail_bytes:
-            # Generate thumbnail with Imagen
-            print("🖼️ Generating thumbnail with AI...")
+            # Generate thumbnail with Imagen (optimized for YouTube Shorts 9:16)
+            print("🖼️ Generating YouTube Shorts thumbnail with AI...")
             try:
-                thumbnail_bytes = gemini_client.generate_thumbnail(
+                thumbnail_bytes, thumbnail_path = gemini_client.generate_thumbnail(
                     title=final_title,
                     description=final_description,
                     original_prompt=original_prompt
                 )
+                
+                # Save thumbnail path to video_jobs metadata
+                if thumbnail_path:
+                    try:
+                        current_metadata = job.data.get("metadata")
+                        if isinstance(current_metadata, str):
+                            current_metadata = json.loads(current_metadata)
+                        elif current_metadata is None:
+                            current_metadata = {}
+                        
+                        current_metadata["thumbnail_path"] = thumbnail_path
+                        
+                        supabase.table("video_jobs").update({
+                            "metadata": json.dumps(current_metadata)
+                        }).eq("id", job_id).execute()
+                        print(f"💾 Thumbnail path saved to metadata: {thumbnail_path}")
+                    except Exception as e:
+                        print(f"⚠️ Failed to save thumbnail path to metadata: {e}")
+                        
             except Exception as e:
                 print(f"⚠️ Thumbnail generation failed: {e}")
+                # Continue without thumbnail - YouTube will auto-generate one
         
         # 7. Upload to YouTube with thumbnail
         print(f"🚀 Uploading to YouTube...")
