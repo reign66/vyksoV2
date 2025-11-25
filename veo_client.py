@@ -53,24 +53,23 @@ class VeoAIClient:
         model_name = self.MODEL_FAST if use_fast_model else self.MODEL_NORMAL
         print(f"🎥 Using Veo 3.1 model: {model_name}")
 
-        # Build config
-        config = {
-            "aspectRatio": aspect_ratio,
-            "durationSeconds": str(duration_seconds),
+        # Build config using types.GenerateVideosConfig (required by Veo 3.1 API)
+        config_kwargs = {
+            "aspect_ratio": aspect_ratio,
+            "number_of_videos": 1,
         }
         
-        # Resolution only for 720p/1080p
-        if resolution:
-            config["resolution"] = resolution
-            
-        if negative_prompt:
-            config["negativePrompt"] = negative_prompt
-            
         # Person generation based on whether we have an image
         if image:
-            config["personGeneration"] = "allow_adult"
+            config_kwargs["person_generation"] = "allow_adult"
         else:
-            config["personGeneration"] = "allow_all"
+            config_kwargs["person_generation"] = "allow_all"
+            
+        if negative_prompt:
+            config_kwargs["negative_prompt"] = negative_prompt
+
+        # Create GenerateVideosConfig object
+        config = types.GenerateVideosConfig(**config_kwargs)
 
         # Build kwargs for generate_videos
         kwargs = {
@@ -83,19 +82,32 @@ class VeoAIClient:
             kwargs["image"] = image
             
         if last_frame:
-            kwargs["lastFrame"] = last_frame
+            kwargs["last_frame"] = last_frame
             
         if reference_images and len(reference_images) > 0:
-            # Veo 3.1 supports up to 3 reference images
-            kwargs["referenceImages"] = reference_images[:3]
+            # Veo 3.1 supports up to 3 reference images - create VideoGenerationReferenceImage objects
+            ref_images = []
+            for ref_img in reference_images[:3]:
+                ref_images.append(types.VideoGenerationReferenceImage(
+                    image=ref_img,
+                    reference_type="asset"
+                ))
+            kwargs["config"] = types.GenerateVideosConfig(
+                **config_kwargs,
+                reference_images=ref_images
+            )
 
+        print(f"🚀 Starting video generation with Veo 3.1...")
         operation = self.client.models.generate_videos(**kwargs)
 
+        print(f"⏳ Waiting for video generation to complete...")
         while not operation.done:
             time.sleep(10)
             operation = self.client.operations.get(operation)
 
+        print(f"✅ Video generation complete, downloading...")
         generated_video = operation.response.generated_videos[0]
         self.client.files.download(file=generated_video.video)
         generated_video.video.save(download_path)
+        print(f"💾 Video saved to: {download_path}")
         return download_path
