@@ -1,6 +1,6 @@
 import os
 import time
-from typing import Optional, List
+from typing import Optional, List, Literal
 
 from google import genai
 from google.genai import types
@@ -8,6 +8,10 @@ from google.genai import types
 
 class VeoAIClient:
     """Client pour Veo 3.1 via l'API Gemini (Google GenAI)."""
+
+    # Modèles Veo 3.1 disponibles
+    MODEL_NORMAL = "veo-3.1-generate-preview"
+    MODEL_FAST = "veo-3.1-fast-generate-preview"
 
     def __init__(self, api_key: Optional[str] = None):
         api_key = api_key or os.getenv("GEMINI_API_KEY")
@@ -27,6 +31,7 @@ class VeoAIClient:
         last_frame: Optional[object] = None,
         reference_images: Optional[List[object]] = None,
         download_path: str = "output.mp4",
+        use_fast_model: bool = False,
     ) -> str:
         """Lance la génération Veo 3.1 et attend la fin, retourne le chemin du MP4.
 
@@ -40,9 +45,13 @@ class VeoAIClient:
         - last_frame: Final image for video interpolation (must be used with image)
         - reference_images: Up to 3 images for style/content reference (Veo 3.1 only, requires 8s duration, 16:9 only)
         - download_path: Local path for the MP4
+        - use_fast_model: If True, uses veo-3.1-fast-generate-preview (faster but may have lower quality)
+                          If False (default), uses veo-3.1-generate-preview (normal quality)
         """
 
-        model_name = "veo-3.1-generate-preview"
+        # Sélection du modèle : fast ou normal
+        model_name = self.MODEL_FAST if use_fast_model else self.MODEL_NORMAL
+        print(f"🎥 Using Veo 3.1 model: {model_name}")
 
         # Build config
         config = {
