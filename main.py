@@ -167,7 +167,7 @@ class VideoRequest(BaseModel):
     duration: int
     quality: str = "basic"
     custom_prompt: Optional[str] = None
-    ai_model: Literal["sora2", "veo3_fast", "veo3"] = "veo3_fast"
+    ai_model: Literal["sora2", "veo3.1"] = "veo3.1"
 
 class VideoResponse(BaseModel):
     job_id: str
@@ -200,7 +200,7 @@ class VideoRequestAdvanced(BaseModel):
     image_urls: Optional[List[str]] = None
     shots: Optional[List[StoryboardShot]] = None
     model_type: Literal["text-to-video", "image-to-video", "storyboard"] = "text-to-video"
-    ai_model: Literal["sora2", "veo3_fast", "veo3"] = "veo3_fast"
+    ai_model: Literal["sora2", "veo3.1"] = "veo3.1"
 
 # ============= FUNCTIONS =============
 
@@ -225,9 +225,13 @@ def generate_prompt(niche: str = None, custom_prompt: str = None, clip_index: in
     
     return f"{base}{sequence_info}, 9:16 vertical format, TikTok optimized, high quality, cinematic"
 
-def calculate_credits_cost(duration: int, quality: str) -> int:
-    """Calcule le coût en crédits selon la durée et la qualité"""
-    num_clips = (duration + 9) // 10
+def calculate_credits_cost(duration: int, quality: str, ai_model: str = "veo3.1") -> int:
+    """Calcule le coût en crédits selon la durée, la qualité et le modèle"""
+    # Veo 3.1 uses 8s segments, Sora uses 10s segments
+    if ai_model == "veo3.1":
+        num_clips = (duration + 7) // 8
+    else:
+        num_clips = (duration + 9) // 10
     
     if quality == "basic":
         return num_clips * 1
@@ -241,9 +245,10 @@ def calculate_credits_cost(duration: int, quality: str) -> int:
 def _validate_duration_and_model(duration: int, ai_model: str):
     if duration < 8 or duration > 60:
         raise HTTPException(status_code=400, detail="Duration must be between 8 and 60 seconds")
-    if ai_model in ["veo3", "veo3_fast"]:
+    if ai_model == "veo3.1":
+        # Veo 3.1 supports 4s, 6s, or 8s clips - duration should be multiple of 8 for segments
         if duration % 8 not in (0,):
-            raise HTTPException(status_code=400, detail="Duration must be a multiple of 8 for Veo models")
+            raise HTTPException(status_code=400, detail="Duration must be a multiple of 8 for Veo 3.1 model")
     else:
         if duration % 10 not in (0,):
             raise HTTPException(status_code=400, detail="Duration must be a multiple of 10 for Sora model")
@@ -287,17 +292,15 @@ async def process_video_generation(
         }).eq("id", job_id).execute()
         
         # ===== DÉTECTION DU MODÈLE AI =====
-        if ai_model in ["veo3", "veo3_fast"]:
-        if ai_model in ["veo3", "veo3_fast"]:
+        if ai_model == "veo3.1":
             # ===== MODE VEO 3.1 (Google GenAI) - Parallel Advanced Scripting =====
             print(f"🎥 Using Veo 3.1 API ({ai_model}) with Parallel Advanced Scripting")
-            use_fast = ai_model == "veo3_fast"
 
-            # 1. Calculate Segments (10s blocks)
-            num_segments = (duration + 9) // 10
+            # 1. Calculate Segments (8s blocks for Veo 3.1)
+            num_segments = (duration + 7) // 8
             
-            # 2. Generate Script using Gemini 2.5 Flash
-            print(f"📜 Generating script for {duration}s video ({num_segments} segments)...")
+            # 2. Generate Script using Gemini with prompt enrichment
+            print(f"📜 Generating enriched script for {duration}s video ({num_segments} segments)...")
             script = gemini_client.generate_video_script(
                 prompt=custom_prompt or generate_prompt(niche),
                 duration=duration,
@@ -305,47 +308,73 @@ async def process_video_generation(
                 user_images=image_urls
             )
             
+            # 3. Download user images if provided (for Veo 3.1 reference images)
+            user_pil_images = []
+            if image_urls:
+                import httpx
+                from PIL import Image
+                for img_url in image_urls[:3]:  # Max 3 images for Veo 3.1
+                    try:
+                        print(f"📥 Downloading user image: {img_url[:50]}...")
+                        resp = httpx.get(img_url, timeout=30)
+                        user_pil_images.append(Image.open(BytesIO(resp.content)))
+                    except Exception as e:
+                        print(f"⚠️ Failed to download image: {e}")
+            
             import asyncio
             from concurrent.futures import ThreadPoolExecutor
             
-            async def process_shot(segment_index, shot_data):
-                """Helper to process a single shot: Image Gen -> Video Gen"""
+            async def process_shot(segment_index, shot_data, user_images_list):
+                """Helper to process a single shot: Image Gen -> Video Gen with Veo 3.1"""
                 shot_idx = shot_data.get("shot_index", 0)
                 img_prompt = shot_data.get("image_prompt")
                 vid_prompt = shot_data.get("video_prompt")
+                use_user_image_idx = shot_data.get("use_user_image_index")
+                shot_duration = shot_data.get("duration", 8)
                 
                 print(f"🎬 Processing Seg {segment_index} Shot {shot_idx}...")
                 
                 loop = asyncio.get_running_loop()
                 
-                # A. Generate Image (Parallel)
-                print(f"  📸 Seg {segment_index} Shot {shot_idx}: Generating Image...")
-                # Run sync Gemini call in thread
-                image_bytes = await loop.run_in_executor(None, gemini_client.generate_image, img_prompt)
-                
                 pil_image = None
-                if image_bytes:
-                    from PIL import Image
-                    pil_image = Image.open(BytesIO(image_bytes))
-                    # Upload ref (fire and forget or await if critical, here we skip await for speed or do it in bg)
-                    try:
-                        img_path = f"/tmp/{job_id}_seg{segment_index}_shot{shot_idx}.png"
-                        with open(img_path, "wb") as f:
-                            f.write(image_bytes)
-                        # We can upload later or now. Let's do it now but don't block main flow too much.
-                        # uploader is sync? Yes. Run in executor.
-                        await loop.run_in_executor(None, uploader.upload_file, img_path, f"{job_id}_seg{segment_index}_shot{shot_idx}.png", "video-images")
-                    except: pass
+                reference_images = None
+                
+                # Check if we should use a user-provided image
+                if use_user_image_idx is not None and use_user_image_idx < len(user_images_list):
+                    print(f"  🖼️ Using user-provided image {use_user_image_idx} for this shot")
+                    pil_image = user_images_list[use_user_image_idx]
+                else:
+                    # A. Generate Image with enriched prompt (Parallel)
+                    print(f"  📸 Seg {segment_index} Shot {shot_idx}: Generating Image with gemini-3-pro-image-preview...")
+                    image_bytes = await loop.run_in_executor(None, gemini_client.generate_image, img_prompt)
+                    
+                    if image_bytes:
+                        from PIL import Image
+                        pil_image = Image.open(BytesIO(image_bytes))
+                        # Upload generated image for reference
+                        try:
+                            img_path = f"/tmp/{job_id}_seg{segment_index}_shot{shot_idx}.png"
+                            with open(img_path, "wb") as f:
+                                f.write(image_bytes)
+                            await loop.run_in_executor(None, uploader.upload_file, img_path, f"{job_id}_seg{segment_index}_shot{shot_idx}.png", "video-images")
+                        except Exception as e:
+                            print(f"⚠️ Failed to upload generated image: {e}")
 
-                # B. Generate Video (Parallel)
-                print(f"  🎥 Seg {segment_index} Shot {shot_idx}: Generating Video...")
-                # Run sync Veo call in thread
+                # B. Generate Video with Veo 3.1 (enriched prompts already applied)
+                print(f"  🎥 Seg {segment_index} Shot {shot_idx}: Generating Video with Veo 3.1...")
+                
+                # Validate duration for Veo 3.1 (4, 6, or 8 seconds)
+                veo_duration = 8  # Default to 8s for best quality
+                if shot_duration in [4, 6, 8]:
+                    veo_duration = shot_duration
+                
                 local_path = await loop.run_in_executor(
                     None, 
                     lambda: veo.generate_video_and_wait(
                         prompt=vid_prompt,
-                        use_fast_model=use_fast,
                         aspect_ratio="9:16",
+                        resolution="720p",
+                        duration_seconds=veo_duration,
                         image=pil_image,
                         download_path=f"/tmp/{job_id}_seg{segment_index}_shot{shot_idx}.mp4",
                     )
@@ -365,9 +394,9 @@ async def process_video_generation(
                 for segment in script["segments"]:
                     seg_idx = segment.get("segment_index", 0)
                     for shot in segment.get("shots", []):
-                        tasks.append(process_shot(seg_idx, shot))
+                        tasks.append(process_shot(seg_idx, shot, user_pil_images))
                 
-                print(f"🚀 Launching {len(tasks)} parallel generation tasks...")
+                print(f"🚀 Launching {len(tasks)} parallel generation tasks with enriched prompts...")
                 # Run all tasks in parallel
                 results = await asyncio.gather(*tasks, return_exceptions=True)
                 
@@ -385,10 +414,30 @@ async def process_video_generation(
                 
             else:
                 # Fallback to simple loop if script generation fails
-                print("⚠️ Script generation failed, falling back to simple loop.")
-                # We should probably implement a parallel simple loop too, but for now let's keep it simple or error.
-                # Let's just error to force script fix.
-                raise Exception("Script generation failed")
+                print("⚠️ Script generation failed, falling back to simple generation.")
+                # Generate a single 8s video with the enriched prompt
+                enriched_prompt = gemini_client.enrich_prompt(
+                    custom_prompt or generate_prompt(niche),
+                    segment_context="Single video generation",
+                    user_image_description=None
+                )
+                
+                # Use first user image if available
+                first_image = user_pil_images[0] if user_pil_images else None
+                
+                local_path = veo.generate_video_and_wait(
+                    prompt=enriched_prompt,
+                    aspect_ratio="9:16",
+                    resolution="720p",
+                    duration_seconds=8,
+                    image=first_image,
+                    download_path=f"/tmp/{job_id}_fallback.mp4",
+                )
+                
+                with open(local_path, "rb") as f:
+                    data = f.read()
+                url = uploader.upload_bytes(data, f"{job_id}_fallback.mp4")
+                all_clip_urls = [url]
 
             if len(all_clip_urls) == 1:
                 final_url = all_clip_urls[0]
@@ -490,7 +539,7 @@ async def process_video_generation(
             # Ideally we should have stored 'cost' in video_jobs.
             # For now, let's just query the job to get duration/quality if needed, or pass it to this function.
             # We passed duration/quality to this function!
-            cost = calculate_credits_cost(duration, quality)
+            cost = calculate_credits_cost(duration, quality, ai_model)
             supabase.rpc("refund_credits", {
                 "p_user_id": user_id,
                 "p_amount": cost
@@ -533,8 +582,12 @@ async def generate_video(req: VideoRequest, background_tasks: BackgroundTasks, r
     if not req.niche and not req.custom_prompt:
         raise HTTPException(status_code=400, detail="Either niche or custom_prompt is required")
     
-    num_clips = (req.duration + 9) // 10
-    required_credits = calculate_credits_cost(req.duration, req.quality)
+    # Calculate clips based on model (8s for Veo 3.1, 10s for Sora)
+    if req.ai_model == "veo3.1":
+        num_clips = (req.duration + 7) // 8
+    else:
+        num_clips = (req.duration + 9) // 10
+    required_credits = calculate_credits_cost(req.duration, req.quality, req.ai_model)
     
     try:
         user = supabase.table("users").select("*").eq("id", req.user_id).execute()
@@ -641,7 +694,7 @@ async def generate_video_advanced(req: VideoRequestAdvanced, background_tasks: B
     _validate_image_urls(req.image_urls)
 
     # Calculer le coût
-    required_credits = calculate_credits_cost(req.duration, req.quality)
+    required_credits = calculate_credits_cost(req.duration, req.quality, req.ai_model)
     
     # Vérifier user et crédits
     try:

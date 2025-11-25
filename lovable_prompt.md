@@ -9,16 +9,18 @@
 1.  **Video Generation Form**:
     *   **Inputs**:
         *   **Prompt**: Text area for the video description.
-        *   **Images**: File upload (multiple allowed) to guide the generation.
-        *   **Duration**: Slider or buttons (10s, 20s, 30s, 60s).
-        *   **Model**: Dropdown (Veo 3 Fast, Veo 3, Sora 2).
+        *   **Images**: File upload (up to 3 images allowed) to guide the generation. Veo 3.1 supports up to 3 reference images.
+        *   **Duration**: Slider or buttons (8s, 16s, 24s, 32s, 40s, 48s, 56s). Must be multiples of 8s for Veo 3.1.
+        *   **Model**: Dropdown with options:
+            - **Veo 3.1** (default) - Google's latest video generation model with reference image support
+            - **Sora 2** - OpenAI's video generation model
     *   **Logic**:
         *   When "Generate" is clicked, upload images to Supabase Storage first (`video-images` bucket).
         *   Then call `POST /api/videos/generate-advanced` with:
             *   `custom_prompt`: The text.
-            *   `image_urls`: List of uploaded image URLs.
-            *   `duration`: Selected duration.
-            *   `ai_model`: Selected model.
+            *   `image_urls`: List of uploaded image URLs (max 3 for Veo 3.1).
+            *   `duration`: Selected duration (must be multiple of 8 for Veo 3.1).
+            *   `ai_model`: "veo3.1" (default) or "sora2".
             *   `model_type`: "text-to-video" (default) or "image-to-video" (if images present).
 
 2.  **YouTube Integration**:
@@ -31,7 +33,15 @@
 
 3.  **Credit System**:
     *   Display user credits (fetch from `/api/users/{id}/info`).
-    *   Show cost estimate before generating (10s = X credits).
+    *   Show cost estimate before generating (8s = 1 credit per segment).
+
+**Veo 3.1 Specifications**:
+*   **Duration**: 4s, 6s, or 8s per clip. Total video duration should be multiple of 8s.
+*   **Aspect Ratio**: 16:9 or 9:16 (vertical for TikTok/Shorts).
+*   **Resolution**: 720p (default) or 1080p (only for 8s clips).
+*   **Reference Images**: Up to 3 images for style/content guidance.
+*   **Image Generation**: Uses gemini-3-pro-image-preview for high-quality images.
+*   **Prompt Enrichment**: All prompts are automatically enriched before generation for professional quality.
 
 **Design Requirements**:
 *   **Aesthetics**: Dark mode, glassmorphism, neon accents (purple/blue), smooth animations.
