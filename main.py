@@ -590,17 +590,17 @@ async def generate_video(req: VideoRequest, background_tasks: BackgroundTasks, r
     required_credits = calculate_credits_cost(req.duration, req.quality, req.ai_model)
     
     try:
-        user = supabase.table("users").select("*").eq("id", req.user_id).execute()
+        user = supabase.table("profiles").select("*").eq("id", req.user_id).execute()
         
         if not user.data:
             print(f"👤 Creating new user: {req.user_id}")
-            supabase.table("users").insert({
+            supabase.table("profiles").insert({
                 "id": req.user_id,
                 "email": f"{req.user_id}@vykso.com",
                 "credits": 10,
                 "plan": "free"
             }).execute()
-            user = supabase.table("users").select("*").eq("id", req.user_id).execute()
+            user = supabase.table("profiles").select("*").eq("id", req.user_id).execute()
         
         user_data = user.data[0]
         print(f"👤 User: {req.user_id}, Credits: {user_data['credits']}, Plan: {user_data['plan']}")
@@ -698,16 +698,16 @@ async def generate_video_advanced(req: VideoRequestAdvanced, background_tasks: B
     
     # Vérifier user et crédits
     try:
-        user = supabase.table("users").select("*").eq("id", req.user_id).execute()
+        user = supabase.table("profiles").select("*").eq("id", req.user_id).execute()
         
         if not user.data:
-            supabase.table("users").insert({
+            supabase.table("profiles").insert({
                 "id": req.user_id,
                 "email": f"{req.user_id}@vykso.com",
                 "credits": 10,
                 "plan": "free"
             }).execute()
-            user = supabase.table("users").select("*").eq("id", req.user_id).execute()
+            user = supabase.table("profiles").select("*").eq("id", req.user_id).execute()
         
         user_data = user.data[0]
         
@@ -827,7 +827,7 @@ async def get_user_info(user_id: str, request: Request):
         token_user_id = await _get_authenticated_user_id(request)
         if token_user_id != user_id:
             raise HTTPException(status_code=403, detail="Forbidden")
-        user = supabase.table("users").select("*").eq("id", user_id).single().execute()
+        user = supabase.table("profiles").select("*").eq("id", user_id).single().execute()
         
         if not user.data:
             raise HTTPException(status_code=404, detail="User not found")
@@ -856,7 +856,7 @@ async def sync_user_from_auth(user_data: dict, request: Request):
             raise HTTPException(status_code=403, detail="Forbidden")
         
         # Check if user exists
-        existing = supabase.table("users").select("*").eq("id", user_id).execute()
+        existing = supabase.table("profiles").select("*").eq("id", user_id).execute()
         
         update_data = {
             "email": email or f"{user_id}@vykso.com",
@@ -869,7 +869,7 @@ async def sync_user_from_auth(user_data: dict, request: Request):
         
         if existing.data:
             # Update existing user
-            result = supabase.table("users").update(update_data).eq("id", user_id).execute()
+            result = supabase.table("profiles").update(update_data).eq("id", user_id).execute()
         else:
             # Create new user
             update_data.update({
@@ -877,7 +877,7 @@ async def sync_user_from_auth(user_data: dict, request: Request):
                 "credits": 10,
                 "plan": "free"
             })
-            result = supabase.table("users").insert(update_data).execute()
+            result = supabase.table("profiles").insert(update_data).execute()
         
         return {"success": True, "user": result.data[0] if result.data else None}
         
@@ -893,7 +893,7 @@ async def upload_video_to_youtube(job_id: str, request: Request):
     token_user_id = await _get_authenticated_user_id(request)
     try:
         # 1. Get User Tokens
-        user = supabase.table("users").select("youtube_tokens").eq("id", token_user_id).single().execute()
+        user = supabase.table("profiles").select("youtube_tokens").eq("id", token_user_id).single().execute()
         if not user.data or not user.data.get("youtube_tokens"):
             raise HTTPException(status_code=400, detail="User not connected to YouTube")
         
@@ -969,7 +969,7 @@ async def youtube_auth_callback(code: str, state: str):
         }
         
         # Store in DB
-        supabase.table("users").update({
+        supabase.table("profiles").update({
             "youtube_tokens": creds_dict
         }).eq("id", user_id).execute()
         
@@ -1107,10 +1107,10 @@ async def stripe_webhook(request: Request):
             print(f"💳 Credit purchase: {credits_to_add} credits for user {user_id}")
             
             try:
-                user = supabase.table("users").select("credits").eq("id", user_id).single().execute()
+                user = supabase.table("profiles").select("credits").eq("id", user_id).single().execute()
                 current_credits = user.data.get('credits', 0)
                 
-                supabase.table("users").update({
+                supabase.table("profiles").update({
                     "credits": current_credits + credits_to_add
                 }).eq("id", user_id).execute()
                 
@@ -1122,17 +1122,17 @@ async def stripe_webhook(request: Request):
             plan = metadata.get('plan')
             
             credits_map = {
-                "starter": 60,
-                "pro": 120,
-                "max": 180
+                "starter": 600,
+                "pro": 1200,
+                "max": 1800
             }
             
             print(f"✅ Subscription {plan} for user {user_id}")
             
             try:
-                supabase.table("users").update({
+                supabase.table("profiles").update({
                     "plan": plan,
-                    "credits": credits_map.get(plan, 60),
+                    "credits": credits_map.get(plan, 600),
                     "stripe_customer_id": session.get('customer'),
                     "stripe_subscription_id": session.get('subscription')
                 }).eq("id", user_id).execute()
@@ -1147,18 +1147,18 @@ async def stripe_webhook(request: Request):
         
         if subscription_id:
             try:
-                user = supabase.table("users").select("*").eq("stripe_subscription_id", subscription_id).single().execute()
+                user = supabase.table("profiles").select("*").eq("stripe_subscription_id", subscription_id).single().execute()
                 
                 if user.data:
                     plan = user.data['plan']
                     credits_map = {
-                        "starter": 60,
-                        "pro": 120,
-                        "max": 180
+                        "starter": 600,
+                        "pro": 1200,
+                        "max": 1800
                     }
                     
-                    supabase.table("users").update({
-                        "credits": credits_map.get(plan, 60)
+                    supabase.table("profiles").update({
+                        "credits": credits_map.get(plan, 600)
                     }).eq("id", user.data['id']).execute()
                     
                     print(f"✅ Monthly credits recharged for user {user.data['id']}: {credits_map.get(plan)} credits")
