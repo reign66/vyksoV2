@@ -112,10 +112,30 @@ class YouTubeClient:
         flow.fetch_token(code=code)
         return flow.credentials
 
+    def _validate_credentials_dict(self, credentials_dict: Dict[str, Any]) -> tuple[bool, str]:
+        """
+        Validates that the credentials dict contains all required fields.
+        
+        Returns:
+            (is_valid, error_message)
+        """
+        required_fields = ['token', 'refresh_token', 'token_uri', 'client_id', 'client_secret']
+        missing_fields = [f for f in required_fields if not credentials_dict.get(f)]
+        
+        if missing_fields:
+            return False, f"Missing required credential fields: {', '.join(missing_fields)}. Please reconnect your YouTube account."
+        
+        return True, ""
+
     def _get_youtube_service(self, credentials_dict: Dict[str, Any]):
         """
         Creates an authenticated YouTube API service.
         """
+        # Validate credentials before attempting to use them
+        is_valid, error_msg = self._validate_credentials_dict(credentials_dict)
+        if not is_valid:
+            raise ValueError(error_msg)
+        
         creds = google.oauth2.credentials.Credentials(**credentials_dict)
         
         # Refresh token if needed
@@ -356,6 +376,12 @@ class YouTubeClient:
             Updated credentials dict or None if refresh failed
         """
         try:
+            # Validate credentials first
+            is_valid, error_msg = self._validate_credentials_dict(credentials_dict)
+            if not is_valid:
+                print(f"❌ Invalid credentials: {error_msg}")
+                return None
+            
             creds = google.oauth2.credentials.Credentials(**credentials_dict)
             
             if creds.expired and creds.refresh_token:
