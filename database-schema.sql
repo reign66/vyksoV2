@@ -142,3 +142,27 @@ CREATE TRIGGER update_users_updated_at
 -- Permissions pour les buckets (? configurer dans l'interface ou via API):
 -- - Authenticated users can upload to video-images
 -- - Authenticated users can read/download from vykso-videos
+
+-- ============================================
+-- MIGRATION: YouTube Tokens
+-- ============================================
+ALTER TABLE users ADD COLUMN IF NOT EXISTS youtube_tokens JSONB;
+
+-- ============================================
+-- FUNCTION: refund_credits
+-- ============================================
+CREATE OR REPLACE FUNCTION refund_credits(p_user_id UUID, p_amount INTEGER)
+RETURNS INTEGER AS $$
+DECLARE
+    current_credits INTEGER;
+BEGIN
+    UPDATE users 
+    SET credits = credits + p_amount,
+        updated_at = NOW()
+    WHERE id = p_user_id
+    RETURNING credits INTO current_credits;
+    
+    RETURN current_credits;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+

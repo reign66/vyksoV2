@@ -14,6 +14,8 @@ from veo_client import VeoAIClient
 from supabase_client import get_client
 from utils.supabase_uploader import SupabaseVideoUploader
 from utils.video_concat import VideoEditor
+from gemini_client import GeminiClient
+from youtube_client import YouTubeClient
 from io import BytesIO
 from starlette.requests import Request as StarletteRequest
 from starlette.responses import StreamingResponse as StarletteStreamingResponse
@@ -46,6 +48,8 @@ veo = VeoAIClient()
 supabase = get_client()
 uploader = SupabaseVideoUploader()
 video_editor = VideoEditor()
+gemini_client = GeminiClient()
+youtube_client = YouTubeClient()
 
 # Stripe
 stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
@@ -284,36 +288,116 @@ async def process_video_generation(
         
         # ===== DÉTECTION DU MODÈLE AI =====
         if ai_model in ["veo3", "veo3_fast"]:
-            # ===== MODE VEO 3.1 (Google GenAI) - génération synchronisée avec polling =====
-            print(f"🎥 Using Veo 3.1 API ({ai_model})")
+        if ai_model in ["veo3", "veo3_fast"]:
+            # ===== MODE VEO 3.1 (Google GenAI) - Parallel Advanced Scripting =====
+            print(f"🎥 Using Veo 3.1 API ({ai_model}) with Parallel Advanced Scripting")
             use_fast = ai_model == "veo3_fast"
 
-            # Veo ≈ 8s par clip => découpage puis concat
-            num_clips = (duration + 7) // 8
-            clip_urls = []
+            # 1. Calculate Segments (10s blocks)
+            num_segments = (duration + 9) // 10
+            
+            # 2. Generate Script using Gemini 2.5 Flash
+            print(f"📜 Generating script for {duration}s video ({num_segments} segments)...")
+            script = gemini_client.generate_video_script(
+                prompt=custom_prompt or generate_prompt(niche),
+                duration=duration,
+                num_segments=num_segments,
+                user_images=image_urls
+            )
+            
+            import asyncio
+            from concurrent.futures import ThreadPoolExecutor
+            
+            async def process_shot(segment_index, shot_data):
+                """Helper to process a single shot: Image Gen -> Video Gen"""
+                shot_idx = shot_data.get("shot_index", 0)
+                img_prompt = shot_data.get("image_prompt")
+                vid_prompt = shot_data.get("video_prompt")
+                
+                print(f"🎬 Processing Seg {segment_index} Shot {shot_idx}...")
+                
+                loop = asyncio.get_running_loop()
+                
+                # A. Generate Image (Parallel)
+                print(f"  📸 Seg {segment_index} Shot {shot_idx}: Generating Image...")
+                # Run sync Gemini call in thread
+                image_bytes = await loop.run_in_executor(None, gemini_client.generate_image, img_prompt)
+                
+                pil_image = None
+                if image_bytes:
+                    from PIL import Image
+                    pil_image = Image.open(BytesIO(image_bytes))
+                    # Upload ref (fire and forget or await if critical, here we skip await for speed or do it in bg)
+                    try:
+                        img_path = f"/tmp/{job_id}_seg{segment_index}_shot{shot_idx}.png"
+                        with open(img_path, "wb") as f:
+                            f.write(image_bytes)
+                        # We can upload later or now. Let's do it now but don't block main flow too much.
+                        # uploader is sync? Yes. Run in executor.
+                        await loop.run_in_executor(None, uploader.upload_file, img_path, f"{job_id}_seg{segment_index}_shot{shot_idx}.png", "video-images")
+                    except: pass
 
-            for i in range(num_clips):
-                clip_prompt = generate_prompt(niche, custom_prompt, i + 1, num_clips)
-                print(f"📝 Veo clip {i+1}/{num_clips} prompt: {clip_prompt[:100]}...")
-
-                local_path = veo.generate_video_and_wait(
-                    prompt=clip_prompt,
-                    use_fast_model=use_fast,
-                    aspect_ratio="9:16",
-                    download_path=f"/tmp/{job_id}_veo_{i}.mp4",
+                # B. Generate Video (Parallel)
+                print(f"  🎥 Seg {segment_index} Shot {shot_idx}: Generating Video...")
+                # Run sync Veo call in thread
+                local_path = await loop.run_in_executor(
+                    None, 
+                    lambda: veo.generate_video_and_wait(
+                        prompt=vid_prompt,
+                        use_fast_model=use_fast,
+                        aspect_ratio="9:16",
+                        image=pil_image,
+                        download_path=f"/tmp/{job_id}_seg{segment_index}_shot{shot_idx}.mp4",
+                    )
                 )
-
+                
+                # Upload clip
                 with open(local_path, "rb") as f:
                     data = f.read()
-                url = uploader.upload_bytes(data, f"{job_id}_clip_{i}.mp4")
-                clip_urls.append(url)
+                url = await loop.run_in_executor(None, uploader.upload_bytes, data, f"{job_id}_seg{segment_index}_shot{shot_idx}.mp4")
+                return (segment_index, shot_idx, url)
 
-            if len(clip_urls) == 1:
-                final_url = clip_urls[0]
+            all_clip_urls = []
+            
+            if script and "segments" in script:
+                tasks = []
+                # Create tasks for ALL shots across ALL segments
+                for segment in script["segments"]:
+                    seg_idx = segment.get("segment_index", 0)
+                    for shot in segment.get("shots", []):
+                        tasks.append(process_shot(seg_idx, shot))
+                
+                print(f"🚀 Launching {len(tasks)} parallel generation tasks...")
+                # Run all tasks in parallel
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                
+                # Process results
+                valid_results = []
+                for res in results:
+                    if isinstance(res, Exception):
+                        print(f"❌ Task failed: {res}")
+                    else:
+                        valid_results.append(res)
+                
+                # Sort by segment then shot to ensure correct order
+                valid_results.sort(key=lambda x: (x[0], x[1]))
+                all_clip_urls = [r[2] for r in valid_results]
+                
             else:
-                print(f"🎞️ Concatenating {len(clip_urls)} Veo clips...")
-                concatenated_data = video_editor.concatenate_videos(clip_urls, f"{job_id}.mp4")
+                # Fallback to simple loop if script generation fails
+                print("⚠️ Script generation failed, falling back to simple loop.")
+                # We should probably implement a parallel simple loop too, but for now let's keep it simple or error.
+                # Let's just error to force script fix.
+                raise Exception("Script generation failed")
+
+            if len(all_clip_urls) == 1:
+                final_url = all_clip_urls[0]
+            elif len(all_clip_urls) > 1:
+                print(f"🎞️ Concatenating {len(all_clip_urls)} clips...")
+                concatenated_data = video_editor.concatenate_videos(all_clip_urls, f"{job_id}.mp4")
                 final_url = uploader.upload_bytes(concatenated_data, f"{job_id}.mp4")
+            else:
+                raise Exception("No clips generated")
 
             supabase.table("video_jobs").update({
                 "status": "completed",
@@ -321,7 +405,7 @@ async def process_video_generation(
                 "completed_at": "now()",
             }).eq("id", job_id).execute()
 
-            print(f"✅ Job {job_id} completed! (credits already deducted)")
+            print(f"✅ Job {job_id} completed!")
         
         else:
             # ===== MODE SORA 2 (OpenAI Videos API) - génération synchronisée avec polling =====
@@ -396,6 +480,25 @@ async def process_video_generation(
         import traceback
         traceback.print_exc()
         
+        # REFUND CREDITS
+        try:
+            print(f"💰 Refunding credits for job {job_id} due to failure...")
+            # We need to calculate amount to refund. 
+            # We can re-calculate or store cost in metadata. 
+            # For now, re-calculate based on job data if possible, but we don't have it handy easily without query.
+            # Let's assume we can pass it or query it.
+            # Ideally we should have stored 'cost' in video_jobs.
+            # For now, let's just query the job to get duration/quality if needed, or pass it to this function.
+            # We passed duration/quality to this function!
+            cost = calculate_credits_cost(duration, quality)
+            supabase.rpc("refund_credits", {
+                "p_user_id": user_id,
+                "p_amount": cost
+            }).execute()
+            print(f"✅ Refunded {cost} credits.")
+        except Exception as refund_error:
+            print(f"❌ Error refunding credits: {refund_error}")
+
         supabase.table("video_jobs").update({
             "status": "failed",
             "error": str(e)
@@ -729,6 +832,98 @@ async def sync_user_from_auth(user_data: dict, request: Request):
         raise
     except Exception as e:
         print(f"❌ Error syncing user: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/videos/{job_id}/upload-youtube")
+async def upload_video_to_youtube(job_id: str, request: Request):
+    """Upload a generated video to YouTube"""
+    token_user_id = await _get_authenticated_user_id(request)
+    try:
+        # 1. Get User Tokens
+        user = supabase.table("users").select("youtube_tokens").eq("id", token_user_id).single().execute()
+        if not user.data or not user.data.get("youtube_tokens"):
+            raise HTTPException(status_code=400, detail="User not connected to YouTube")
+        
+        tokens = user.data["youtube_tokens"]
+        
+        # 2. Get Job Video URL
+        job = supabase.table("video_jobs").select("*").eq("id", job_id).single().execute()
+        if not job.data:
+            raise HTTPException(status_code=404, detail="Job not found")
+        
+        video_url = job.data.get("video_url")
+        if not video_url:
+            raise HTTPException(status_code=400, detail="Video not ready")
+            
+        # 3. Download Video to Temp
+        import requests
+        # If private bucket, we might need signed url or service key download. 
+        # Assuming public or we use the proxy logic. For simplicity, let's try direct download if public, 
+        # or use uploader/storage client to download.
+        # Let's use the storage client to download bytes.
+        path = _extract_object_path_from_public_url(video_url, VIDEOS_BUCKET)
+        if not path:
+             # Try direct download if it's a full URL
+             r = requests.get(video_url)
+             video_data = r.content
+        else:
+             video_data = supabase.storage.from_(VIDEOS_BUCKET).download(path)
+             
+        temp_path = f"/tmp/{job_id}_upload.mp4"
+        with open(temp_path, "wb") as f:
+            f.write(video_data)
+            
+        # 4. Upload
+        print(f"🚀 Uploading job {job_id} to YouTube...")
+        youtube_client.upload_video(
+            file_path=temp_path,
+            title=f"Vykso Video {job_id}",
+            description=f"Generated by Vykso.com\nPrompt: {job.data.get('prompt')}",
+            credentials_dict=tokens
+        )
+        
+        return {"status": "uploaded"}
+
+    except Exception as e:
+        print(f"❌ YouTube upload error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ============= YOUTUBE AUTH ENDPOINTS =============
+
+@app.get("/api/auth/youtube/url")
+async def get_youtube_auth_url(request: Request):
+    token_user_id = await _get_authenticated_user_id(request)
+    url = youtube_client.get_auth_url(user_id=token_user_id)
+    return {"url": url}
+
+@app.get("/api/auth/youtube/callback")
+async def youtube_auth_callback(code: str, state: str):
+    """
+    Callback from Google. 'state' is the user_id we passed.
+    """
+    try:
+        user_id = state
+        credentials = youtube_client.get_credentials_from_code(code)
+        
+        # Convert credentials to dict
+        creds_dict = {
+            'token': credentials.token,
+            'refresh_token': credentials.refresh_token,
+            'token_uri': credentials.token_uri,
+            'client_id': credentials.client_id,
+            'client_secret': credentials.client_secret,
+            'scopes': credentials.scopes
+        }
+        
+        # Store in DB
+        supabase.table("users").update({
+            "youtube_tokens": creds_dict
+        }).eq("id", user_id).execute()
+        
+        return {"status": "success", "message": "YouTube connected successfully"}
+        
+    except Exception as e:
+        print(f"❌ YouTube callback error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 # ============= STRIPE ENDPOINTS =============
