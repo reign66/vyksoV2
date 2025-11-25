@@ -1,8 +1,9 @@
 import os
 import time
-from typing import Optional
+from typing import Optional, List
 
 from google import genai
+from google.genai import types
 
 
 class VeoAIClient:
@@ -18,36 +19,68 @@ class VeoAIClient:
         self,
         prompt: str,
         *,
-        use_fast_model: bool = True,
-        aspect_ratio: str = "16:9",
+        aspect_ratio: str = "9:16",
+        resolution: str = "720p",
+        duration_seconds: int = 8,
         negative_prompt: Optional[str] = None,
         image: Optional[object] = None,
+        last_frame: Optional[object] = None,
+        reference_images: Optional[List[object]] = None,
         download_path: str = "output.mp4",
     ) -> str:
-        """Lance la génération Veo 3 et attend la fin, retourne le chemin du MP4.
+        """Lance la génération Veo 3.1 et attend la fin, retourne le chemin du MP4.
 
-        - use_fast_model: True => veo-3.0-fast-generate-001, False => veo-3.0-generate-001
-        - aspect_ratio: "16:9" ou "9:16"
-        - image: optionnel, objet image pour image-to-video
-        - download_path: chemin local du MP4
+        Veo 3.1 Parameters:
+        - prompt: Text description of the video (supports audio cues)
+        - aspect_ratio: "16:9" (default for 720p/1080p) or "9:16"
+        - resolution: "720p" (default) or "1080p" (only supports 8s duration)
+        - duration_seconds: 4, 6, or 8 (must be 8 for extension/interpolation/referenceImages)
+        - negative_prompt: Text describing what to exclude from the video
+        - image: Initial image to animate (Image object)
+        - last_frame: Final image for video interpolation (must be used with image)
+        - reference_images: Up to 3 images for style/content reference (Veo 3.1 only, requires 8s duration, 16:9 only)
+        - download_path: Local path for the MP4
         """
 
-        model_name = "veo-3.0-fast-generate-001" if use_fast_model else "veo-3.0-generate-001"
+        model_name = "veo-3.1-generate-preview"
 
-        config = None
-        if negative_prompt or aspect_ratio:
-            config = {}
-            if negative_prompt:
-                config["negativePrompt"] = negative_prompt
-            if aspect_ratio:
-                config["aspectRatio"] = aspect_ratio
+        # Build config
+        config = {
+            "aspectRatio": aspect_ratio,
+            "durationSeconds": str(duration_seconds),
+        }
+        
+        # Resolution only for 720p/1080p
+        if resolution:
+            config["resolution"] = resolution
+            
+        if negative_prompt:
+            config["negativePrompt"] = negative_prompt
+            
+        # Person generation based on whether we have an image
+        if image:
+            config["personGeneration"] = "allow_adult"
+        else:
+            config["personGeneration"] = "allow_all"
 
-        operation = self.client.models.generate_videos(
-            model=model_name,
-            prompt=prompt,
-            image=image,
-            config=config,
-        )
+        # Build kwargs for generate_videos
+        kwargs = {
+            "model": model_name,
+            "prompt": prompt,
+            "config": config,
+        }
+        
+        if image:
+            kwargs["image"] = image
+            
+        if last_frame:
+            kwargs["lastFrame"] = last_frame
+            
+        if reference_images and len(reference_images) > 0:
+            # Veo 3.1 supports up to 3 reference images
+            kwargs["referenceImages"] = reference_images[:3]
+
+        operation = self.client.models.generate_videos(**kwargs)
 
         while not operation.done:
             time.sleep(10)
