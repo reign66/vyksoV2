@@ -227,7 +227,7 @@ class VideoRequest(BaseModel):
     duration: int
     quality: str = "basic"
     custom_prompt: Optional[str] = None
-    ai_model: Literal["sora2", "veo3.1", "veo3.1_fast"] = "veo3.1"
+    ai_model: Literal["sora-2", "sora-2-pro", "veo-3.1-generate-preview", "veo-3.1-fast-generate-preview"] = "veo-3.1-generate-preview"
 
 class VideoResponse(BaseModel):
     job_id: str
@@ -260,7 +260,7 @@ class VideoRequestAdvanced(BaseModel):
     image_urls: Optional[List[str]] = None
     shots: Optional[List[StoryboardShot]] = None
     model_type: Literal["text-to-video", "image-to-video", "storyboard"] = "text-to-video"
-    ai_model: Literal["sora2", "veo3.1", "veo3.1_fast"] = "veo3.1"
+    ai_model: Literal["sora-2", "sora-2-pro", "veo-3.1-generate-preview", "veo-3.1-fast-generate-preview"] = "veo-3.1-generate-preview"
 
 
 class YouTubeUploadRequest(BaseModel):
@@ -308,10 +308,10 @@ def generate_prompt(niche: str = None, custom_prompt: str = None, clip_index: in
     
     return f"{base}{sequence_info}, 9:16 vertical format, TikTok optimized, high quality, cinematic"
 
-def calculate_credits_cost(duration: int, quality: str, ai_model: str = "veo3.1") -> int:
+def calculate_credits_cost(duration: int, quality: str, ai_model: str = "veo-3.1-generate-preview") -> int:
     """Calcule le coût en crédits selon la durée, la qualité et le modèle"""
     # Veo 3.1 (normal et fast) uses 8s segments, Sora uses 10s segments
-    if ai_model in ("veo3.1", "veo3.1_fast"):
+    if ai_model in ("veo-3.1-generate-preview", "veo-3.1-fast-generate-preview"):
         num_clips = (duration + 7) // 8
     else:
         num_clips = (duration + 9) // 10
@@ -326,15 +326,14 @@ def calculate_credits_cost(duration: int, quality: str, ai_model: str = "veo3.1"
         return num_clips
 
 def _validate_duration_and_model(duration: int, ai_model: str):
-    if duration < 8 or duration > 60:
-        raise HTTPException(status_code=400, detail="Duration must be between 8 and 60 seconds")
-    if ai_model in ("veo3.1", "veo3.1_fast"):
-        # Veo 3.1 (normal et fast) supports 4s, 6s, or 8s clips - duration should be multiple of 8 for segments
-        if duration % 8 not in (0,):
-            raise HTTPException(status_code=400, detail="Duration must be a multiple of 8 for Veo 3.1 model")
+    if duration < 6 or duration > 60:
+        raise HTTPException(status_code=400, detail="Duration must be between 6 and 60 seconds")
+    if ai_model in ("veo-3.1-generate-preview", "veo-3.1-fast-generate-preview"):
+        # Veo 3.1 (normal et fast) supports flexible durations
+        pass  # Accept any duration between 6-60
     else:
-        if duration % 10 not in (0,):
-            raise HTTPException(status_code=400, detail="Duration must be a multiple of 10 for Sora model")
+        # Sora uses 10s segments
+        pass  # Accept any duration between 6-60
 
 def _validate_image_urls(image_urls: Optional[List[str]]):
     if not image_urls:
@@ -362,7 +361,7 @@ async def process_video_generation(
     image_urls: List[str] = None,
     shots: List[dict] = None,
     model_type: str = "text-to-video",
-    ai_model: str = "veo3_fast"
+    ai_model: str = "veo-3.1-generate-preview"
 ):
     """Background task : génère la vidéo (tous les modèles supportés)"""
     try:
@@ -375,9 +374,9 @@ async def process_video_generation(
         }).eq("id", job_id).execute()
         
         # ===== DÉTECTION DU MODÈLE AI =====
-        if ai_model in ("veo3.1", "veo3.1_fast"):
+        if ai_model in ("veo-3.1-generate-preview", "veo-3.1-fast-generate-preview"):
             # ===== MODE VEO 3.1 (Google GenAI) - Parallel Advanced Scripting =====
-            use_fast_model = (ai_model == "veo3.1_fast")
+            use_fast_model = (ai_model == "veo-3.1-fast-generate-preview")
             model_variant = "FAST" if use_fast_model else "NORMAL"
             print(f"🎥 Using Veo 3.1 API ({model_variant} mode) with Parallel Advanced Scripting")
 
@@ -390,7 +389,8 @@ async def process_video_generation(
                 prompt=custom_prompt or generate_prompt(niche),
                 duration=duration,
                 num_segments=num_segments,
-                user_images=image_urls
+                user_images=image_urls,
+                segment_duration=8  # Veo 3.1 uses 8s segments
             )
             
             # 3. Download user images if provided (for Veo 3.1 reference images)
@@ -544,64 +544,185 @@ async def process_video_generation(
             print(f"✅ Job {job_id} completed!")
         
         else:
-            # ===== MODE SORA 2 (OpenAI Videos API) - génération synchronisée avec polling =====
-            print(f"🎥 Using Sora 2 API")
+            # ===== MODE SORA 2 (OpenAI Videos API) - Parallel Advanced Scripting =====
+            use_pro_model = (ai_model == "sora-2-pro")
+            model_variant = "PRO" if use_pro_model else "STANDARD"
+            print(f"🎥 Using Sora 2 API ({model_variant} mode) with Parallel Advanced Scripting")
 
             def quality_to_sora_params(q: str):
-                # Map simple: basic => default, pro_720p => size 1280x720 + pro, pro_1080p => size 1920x1080 + pro
+                # Map simple: basic => default, pro_720p => size 1280x720, pro_1080p => size 1920x1080
                 if q == "pro_1080p":
-                    return True, "1920x1080"
+                    return "1920x1080"
                 if q == "pro_720p":
-                    return True, "1280x720"
-                return False, None
+                    return "1280x720"
+                return None
 
-            use_pro, size = quality_to_sora_params(quality)
+            size = quality_to_sora_params(quality)
 
-            # Sora gère 10s/15s; découpons en clips de 10s
-            num_clips = (duration + 9) // 10
-            clip_seconds = 10
-            clip_urls = []
+            # 1. Calculate Segments (10s blocks for Sora)
+            num_segments = (duration + 9) // 10
+            
+            # 2. Generate Script using Gemini with prompt enrichment
+            print(f"📜 Generating enriched script for {duration}s video ({num_segments} segments)...")
+            script = get_gemini().generate_video_script(
+                prompt=custom_prompt or generate_prompt(niche),
+                duration=duration,
+                num_segments=num_segments,
+                user_images=image_urls,
+                segment_duration=10  # Sora uses 10s segments
+            )
+            
+            # 3. Download user images if provided
+            user_pil_images = []
+            if image_urls:
+                import httpx
+                from PIL import Image
+                for img_url in image_urls[:3]:  # Max 3 images
+                    try:
+                        print(f"📥 Downloading user image: {img_url[:50]}...")
+                        resp = httpx.get(img_url, timeout=30)
+                        user_pil_images.append(Image.open(BytesIO(resp.content)))
+                    except Exception as e:
+                        print(f"⚠️ Failed to download image: {e}")
+            
+            import asyncio
+            from concurrent.futures import ThreadPoolExecutor
+            
+            async def process_sora_shot(segment_index, shot_data, user_images_list):
+                """Helper to process a single shot: Image Gen -> Video Gen with Sora 2"""
+                shot_idx = shot_data.get("shot_index", 0)
+                img_prompt = shot_data.get("image_prompt")
+                vid_prompt = shot_data.get("video_prompt")
+                use_user_image_idx = shot_data.get("use_user_image_index")
+                shot_duration = shot_data.get("duration", 10)
+                
+                print(f"🎬 Processing Seg {segment_index} Shot {shot_idx}...")
+                
+                loop = asyncio.get_running_loop()
+                
+                input_reference = None
+                
+                # Check if we should use a user-provided image
+                if use_user_image_idx is not None and use_user_image_idx < len(user_images_list):
+                    print(f"  🖼️ Using user-provided image {use_user_image_idx} for this shot")
+                    # Save user image to temp file for Sora
+                    import tempfile
+                    with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
+                        user_images_list[use_user_image_idx].save(tmp.name)
+                        input_reference = tmp.name
+                else:
+                    # A. Generate Image with enriched prompt (Parallel)
+                    print(f"  📸 Seg {segment_index} Shot {shot_idx}: Generating Image with gemini-3-pro-image-preview...")
+                    image_bytes = await loop.run_in_executor(None, get_gemini().generate_image, img_prompt)
+                    
+                    if image_bytes:
+                        # Save generated image for Sora input
+                        import tempfile
+                        with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
+                            tmp.write(image_bytes)
+                            input_reference = tmp.name
+                        # Upload generated image for reference
+                        try:
+                            await loop.run_in_executor(None, get_uploader().upload_bytes, image_bytes, f"{job_id}_seg{segment_index}_shot{shot_idx}.png")
+                        except Exception as e:
+                            print(f"⚠️ Failed to upload generated image: {e}")
 
-            # Handle image-to-video: download images if provided
-            input_reference = None
-            if model_type == "image-to-video" and image_urls and len(image_urls) > 0:
-                # Use first image for all clips (or can be extended to use different images per clip)
-                image_url = image_urls[0]
-                print(f"🖼️ Using image reference: {image_url}")
-                input_reference = image_url  # sora_client will download it from URL
-
-            if model_type == "storyboard" and shots:
-                iterable = enumerate(shots)
-            else:
-                iterable = enumerate([None] * num_clips)
-
-            for i, shot in iterable:
-                clip_prompt = shot["Scene"] if shot else generate_prompt(niche, custom_prompt, i + 1, num_clips)
-                print(f"📝 Sora clip {i+1} prompt: {clip_prompt[:100]}...")
-
-                # For image-to-video, use image only for first clip
-                clip_input_reference = input_reference if (i == 0 and input_reference) else None
-
-                local_path = get_sora().generate_video_and_wait(
-                    prompt=clip_prompt,
-                    use_pro=use_pro,
-                    size=size,
-                    seconds=(int(shot["duration"]) if shot else clip_seconds),
-                    input_reference=clip_input_reference,
-                    download_path=f"/tmp/{job_id}_sora_{i}.mp4",
+                # B. Generate Video with Sora 2
+                print(f"  🎥 Seg {segment_index} Shot {shot_idx}: Generating Video with Sora 2...")
+                
+                # Sora accepts 4, 8, or 12 second videos
+                sora_duration = 8  # Default to 8s
+                if shot_duration <= 4:
+                    sora_duration = 4
+                elif shot_duration <= 8:
+                    sora_duration = 8
+                else:
+                    sora_duration = 12
+                
+                local_path = await loop.run_in_executor(
+                    None, 
+                    lambda: get_sora().generate_video_and_wait(
+                        prompt=vid_prompt,
+                        use_pro=use_pro_model,
+                        size=size,
+                        seconds=sora_duration,
+                        input_reference=input_reference,
+                        download_path=f"/tmp/{job_id}_seg{segment_index}_shot{shot_idx}.mp4",
+                    )
                 )
-
+                
+                # Upload clip
                 with open(local_path, "rb") as f:
                     data = f.read()
-                url = get_uploader().upload_bytes(data, f"{job_id}_clip_{i}.mp4")
-                clip_urls.append(url)
+                url = await loop.run_in_executor(None, get_uploader().upload_bytes, data, f"{job_id}_seg{segment_index}_shot{shot_idx}.mp4")
+                return (segment_index, shot_idx, url)
 
-            if len(clip_urls) == 1:
-                final_url = clip_urls[0]
+            all_clip_urls = []
+            
+            if script and "segments" in script:
+                tasks = []
+                # Create tasks for ALL shots across ALL segments
+                for segment in script["segments"]:
+                    seg_idx = segment.get("segment_index", 0)
+                    for shot in segment.get("shots", []):
+                        tasks.append(process_sora_shot(seg_idx, shot, user_pil_images))
+                
+                print(f"🚀 Launching {len(tasks)} parallel generation tasks with enriched prompts...")
+                # Run all tasks in parallel
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                
+                # Process results
+                valid_results = []
+                for res in results:
+                    if isinstance(res, Exception):
+                        print(f"❌ Task failed: {res}")
+                    else:
+                        valid_results.append(res)
+                
+                # Sort by segment then shot to ensure correct order
+                valid_results.sort(key=lambda x: (x[0], x[1]))
+                all_clip_urls = [r[2] for r in valid_results]
+                
             else:
-                print(f"🎞️ Concatenating {len(clip_urls)} Sora clips...")
-                concatenated_data = get_video_editor().concatenate_videos(clip_urls, f"{job_id}.mp4")
+                # Fallback to simple generation if script generation fails
+                print("⚠️ Script generation failed, falling back to simple generation.")
+                # Generate a single video with the enriched prompt
+                enriched_prompt = get_gemini().enrich_prompt(
+                    custom_prompt or generate_prompt(niche),
+                    segment_context="Single video generation",
+                    user_image_description=None
+                )
+                
+                # Use first user image if available
+                input_ref = None
+                if user_pil_images:
+                    import tempfile
+                    with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
+                        user_pil_images[0].save(tmp.name)
+                        input_ref = tmp.name
+                
+                local_path = get_sora().generate_video_and_wait(
+                    prompt=enriched_prompt,
+                    use_pro=use_pro_model,
+                    size=size,
+                    seconds=8,
+                    input_reference=input_ref,
+                    download_path=f"/tmp/{job_id}_fallback.mp4",
+                )
+                
+                with open(local_path, "rb") as f:
+                    data = f.read()
+                url = get_uploader().upload_bytes(data, f"{job_id}_fallback.mp4")
+                all_clip_urls = [url]
+
+            if len(all_clip_urls) == 1:
+                final_url = all_clip_urls[0]
+            elif len(all_clip_urls) > 1:
+                print(f"🎞️ Concatenating {len(all_clip_urls)} Sora clips...")
+                concatenated_data = get_video_editor().concatenate_videos(all_clip_urls, f"{job_id}.mp4")
                 final_url = get_uploader().upload_bytes(concatenated_data, f"{job_id}.mp4")
+            else:
+                raise Exception("No clips generated")
 
             get_supabase().table("video_jobs").update({
                 "status": "completed",
@@ -670,7 +791,7 @@ async def generate_video(req: VideoRequest, background_tasks: BackgroundTasks, r
         raise HTTPException(status_code=400, detail="Either niche or custom_prompt is required")
     
     # Calculate clips based on model (8s for Veo 3.1/fast, 10s for Sora)
-    if req.ai_model in ("veo3.1", "veo3.1_fast"):
+    if req.ai_model in ("veo-3.1-generate-preview", "veo-3.1-fast-generate-preview"):
         num_clips = (req.duration + 7) // 8
     else:
         num_clips = (req.duration + 9) // 10

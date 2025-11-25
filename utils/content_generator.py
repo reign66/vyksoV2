@@ -71,7 +71,7 @@ class ContentGenerator:
     
     def _generate_title_with_ai(self, prompt: str, max_length: int) -> Optional[str]:
         """
-        Uses Gemini to generate a clickbait title.
+        Uses Gemini 2.5 Flash Lite to generate a clickbait title.
         """
         from google.genai import types
         
@@ -96,7 +96,7 @@ class ContentGenerator:
         """
         
         response = self.gemini_client.client.models.generate_content(
-            model="gemini-2.0-flash",
+            model="gemini-2.5-flash-lite-preview-06-17",
             contents=f"Génère un titre clickbait pour cette vidéo: {prompt}",
             config=types.GenerateContentConfig(
                 system_instruction=system_instruction,

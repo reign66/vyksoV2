@@ -54,9 +54,11 @@ class SoraClient:
 
         - use_pro: True => model "sora-2-pro", else "sora-2"
         - size: optional (e.g., 1280x720); if None, Sora default is used
-        - seconds: optional duration; if None, Sora default is used
+        - seconds: optional duration; if None, Sora default is used (4, 8, or 12)
         - input_reference: optional image file path, URL, or bytes for image-to-video
         Returns the local file path to the downloaded MP4.
+        
+        Note: Model names for API are "sora-2" and "sora-2-pro".
         """
         if self.use_sdk:
             return self._generate_with_sdk(prompt, use_pro, size, seconds, input_reference, download_path)
