@@ -1,28 +1,30 @@
 -- Schema SQL pour Vykso
--- ? ex?cuter dans l'?diteur SQL de Supabase
+-- À exécuter dans l'éditeur SQL de Supabase
+-- NOUVELLE ARCHITECTURE: auth.users (Supabase Auth) + public.profiles (données métier)
 
 -- ============================================
--- TABLE: users
+-- TABLE: profiles (remplace l'ancienne table users)
+-- Le id fait référence à auth.users.id
 -- ============================================
-CREATE TABLE IF NOT EXISTS users (
-    id UUID PRIMARY KEY,
-    email TEXT NOT NULL,
-    first_name TEXT,
-    last_name TEXT,
+CREATE TABLE IF NOT EXISTS profiles (
+    id UUID PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
+    full_name TEXT,
     credits INTEGER DEFAULT 10,
     plan TEXT DEFAULT 'free',
     stripe_customer_id TEXT,
     stripe_subscription_id TEXT,
+    youtube_tokens JSONB,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
 -- ============================================
 -- TABLE: video_jobs
+-- Note: user_id pointe maintenant vers auth.users.id (et par extension profiles.id)
 -- ============================================
 CREATE TABLE IF NOT EXISTS video_jobs (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+    user_id UUID REFERENCES auth.users(id) ON DELETE CASCADE,
     status TEXT DEFAULT 'pending',
     video_url TEXT,
     niche TEXT,
@@ -36,30 +38,68 @@ CREATE TABLE IF NOT EXISTS video_jobs (
 );
 
 -- ============================================
+-- TABLE: credit_transactions (optionnel - pour historique)
+-- ============================================
+CREATE TABLE IF NOT EXISTS credit_transactions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID REFERENCES auth.users(id) ON DELETE CASCADE,
+    amount INTEGER NOT NULL,
+    type TEXT NOT NULL, -- 'debit', 'credit', 'refund', 'subscription'
+    description TEXT,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- ============================================
 -- INDEXES pour performance
 -- ============================================
 CREATE INDEX IF NOT EXISTS idx_video_jobs_user_id ON video_jobs(user_id);
 CREATE INDEX IF NOT EXISTS idx_video_jobs_status ON video_jobs(status);
 CREATE INDEX IF NOT EXISTS idx_video_jobs_created_at ON video_jobs(created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
+CREATE INDEX IF NOT EXISTS idx_profiles_stripe_subscription ON profiles(stripe_subscription_id);
+CREATE INDEX IF NOT EXISTS idx_credit_transactions_user_id ON credit_transactions(user_id);
+
+-- ============================================
+-- TRIGGER: handle_new_user
+-- Crée automatiquement un profil quand un utilisateur s'inscrit via auth.users
+-- ============================================
+CREATE OR REPLACE FUNCTION public.handle_new_user()
+RETURNS TRIGGER AS $$
+BEGIN
+    INSERT INTO public.profiles (id, full_name, credits, plan)
+    VALUES (
+        NEW.id,
+        COALESCE(NEW.raw_user_meta_data->>'full_name', NEW.raw_user_meta_data->>'name', ''),
+        10, -- Crédits initiaux pour le plan free
+        'free'
+    );
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- Créer le trigger sur auth.users
+DROP TRIGGER IF EXISTS on_auth_user_created ON auth.users;
+CREATE TRIGGER on_auth_user_created
+    AFTER INSERT ON auth.users
+    FOR EACH ROW EXECUTE FUNCTION public.handle_new_user();
 
 -- ============================================
 -- ROW LEVEL SECURITY (RLS)
 -- ============================================
 
 -- Enable RLS
-ALTER TABLE users ENABLE ROW LEVEL SECURITY;
+ALTER TABLE profiles ENABLE ROW LEVEL SECURITY;
 ALTER TABLE video_jobs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE credit_transactions ENABLE ROW LEVEL SECURITY;
 
--- Users policies
-DROP POLICY IF EXISTS "Users can view their own data" ON users;
-CREATE POLICY "Users can view their own data"
-    ON users FOR SELECT
+-- Profiles policies
+DROP POLICY IF EXISTS "Users can view their own profile" ON profiles;
+CREATE POLICY "Users can view their own profile"
+    ON profiles FOR SELECT
     USING (auth.uid() = id);
 
-DROP POLICY IF EXISTS "Users can update their own data" ON users;
-CREATE POLICY "Users can update their own data"
-    ON users FOR UPDATE
+DROP POLICY IF EXISTS "Users can update their own profile" ON profiles;
+CREATE POLICY "Users can update their own profile"
+    ON profiles FOR UPDATE
     USING (auth.uid() = id);
 
 -- Video jobs policies
@@ -73,10 +113,16 @@ CREATE POLICY "Users can insert their own jobs"
     ON video_jobs FOR INSERT
     WITH CHECK (auth.uid() = user_id);
 
--- Service role can do everything (for backend)
-DROP POLICY IF EXISTS "Service role full access users" ON users;
-CREATE POLICY "Service role full access users"
-    ON users FOR ALL
+-- Credit transactions policies
+DROP POLICY IF EXISTS "Users can view their own transactions" ON credit_transactions;
+CREATE POLICY "Users can view their own transactions"
+    ON credit_transactions FOR SELECT
+    USING (auth.uid() = user_id);
+
+-- Service role can do everything (for backend avec SUPABASE_SERVICE_KEY)
+DROP POLICY IF EXISTS "Service role full access profiles" ON profiles;
+CREATE POLICY "Service role full access profiles"
+    ON profiles FOR ALL
     USING (auth.jwt() ->> 'role' = 'service_role');
 
 DROP POLICY IF EXISTS "Service role full access video_jobs" ON video_jobs;
@@ -84,15 +130,21 @@ CREATE POLICY "Service role full access video_jobs"
     ON video_jobs FOR ALL
     USING (auth.jwt() ->> 'role' = 'service_role');
 
+DROP POLICY IF EXISTS "Service role full access credit_transactions" ON credit_transactions;
+CREATE POLICY "Service role full access credit_transactions"
+    ON credit_transactions FOR ALL
+    USING (auth.jwt() ->> 'role' = 'service_role');
+
 -- ============================================
 -- FUNCTION: decrement_credits
+-- 1 crédit = 1 seconde de vidéo
 -- ============================================
 CREATE OR REPLACE FUNCTION decrement_credits(p_user_id UUID, p_amount INTEGER)
 RETURNS INTEGER AS $$
 DECLARE
     current_credits INTEGER;
 BEGIN
-    SELECT credits INTO current_credits FROM users WHERE id = p_user_id;
+    SELECT credits INTO current_credits FROM profiles WHERE id = p_user_id;
     
     IF current_credits IS NULL THEN
         RAISE EXCEPTION 'User not found';
@@ -102,12 +154,65 @@ BEGIN
         RAISE EXCEPTION 'Insufficient credits';
     END IF;
     
-    UPDATE users 
+    UPDATE profiles 
     SET credits = credits - p_amount,
         updated_at = NOW()
     WHERE id = p_user_id;
     
+    -- Enregistrer la transaction (optionnel)
+    INSERT INTO credit_transactions (user_id, amount, type, description)
+    VALUES (p_user_id, -p_amount, 'debit', 'Video generation');
+    
     RETURN current_credits - p_amount;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- ============================================
+-- FUNCTION: refund_credits
+-- ============================================
+CREATE OR REPLACE FUNCTION refund_credits(p_user_id UUID, p_amount INTEGER)
+RETURNS INTEGER AS $$
+DECLARE
+    current_credits INTEGER;
+BEGIN
+    UPDATE profiles 
+    SET credits = credits + p_amount,
+        updated_at = NOW()
+    WHERE id = p_user_id
+    RETURNING credits INTO current_credits;
+    
+    -- Enregistrer la transaction (optionnel)
+    INSERT INTO credit_transactions (user_id, amount, type, description)
+    VALUES (p_user_id, p_amount, 'refund', 'Video generation refund');
+    
+    RETURN current_credits;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- ============================================
+-- FUNCTION: add_credits (pour achats et abonnements)
+-- ============================================
+CREATE OR REPLACE FUNCTION add_credits(p_user_id UUID, p_amount INTEGER, p_type TEXT DEFAULT 'credit')
+RETURNS INTEGER AS $$
+DECLARE
+    current_credits INTEGER;
+BEGIN
+    UPDATE profiles 
+    SET credits = credits + p_amount,
+        updated_at = NOW()
+    WHERE id = p_user_id
+    RETURNING credits INTO current_credits;
+    
+    -- Enregistrer la transaction
+    INSERT INTO credit_transactions (user_id, amount, type, description)
+    VALUES (p_user_id, p_amount, p_type, 
+        CASE 
+            WHEN p_type = 'subscription' THEN 'Monthly subscription credits'
+            ELSE 'Credit purchase'
+        END
+    );
+    
+    RETURN current_credits;
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
 
@@ -122,47 +227,31 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- Trigger for users
-DROP TRIGGER IF EXISTS update_users_updated_at ON users;
-CREATE TRIGGER update_users_updated_at
-    BEFORE UPDATE ON users
+-- Trigger for profiles
+DROP TRIGGER IF EXISTS update_profiles_updated_at ON profiles;
+CREATE TRIGGER update_profiles_updated_at
+    BEFORE UPDATE ON profiles
     FOR EACH ROW
     EXECUTE FUNCTION update_updated_at_column();
 
 -- ============================================
 -- STORAGE BUCKETS
 -- ============================================
--- Note: Les buckets doivent ?tre cr??s manuellement dans l'interface Supabase
+-- Note: Les buckets doivent être créés manuellement dans l'interface Supabase
 -- Storage > Create Bucket
 
--- Buckets ? cr?er:
+-- Buckets à créer:
 -- 1. vykso-videos (public ou private selon vos besoins)
 -- 2. video-images (public)
 
--- Permissions pour les buckets (? configurer dans l'interface ou via API):
+-- Permissions pour les buckets (à configurer dans l'interface ou via API):
 -- - Authenticated users can upload to video-images
 -- - Authenticated users can read/download from vykso-videos
 
 -- ============================================
--- MIGRATION: YouTube Tokens
+-- CREDITS MAPPING (référence - 1 crédit = 1 seconde)
 -- ============================================
-ALTER TABLE users ADD COLUMN IF NOT EXISTS youtube_tokens JSONB;
-
--- ============================================
--- FUNCTION: refund_credits
--- ============================================
-CREATE OR REPLACE FUNCTION refund_credits(p_user_id UUID, p_amount INTEGER)
-RETURNS INTEGER AS $$
-DECLARE
-    current_credits INTEGER;
-BEGIN
-    UPDATE users 
-    SET credits = credits + p_amount,
-        updated_at = NOW()
-    WHERE id = p_user_id
-    RETURNING credits INTO current_credits;
-    
-    RETURN current_credits;
-END;
-$$ LANGUAGE plpgsql SECURITY DEFINER;
-
+-- Plan Starter (Premium): 600 crédits = 10 minutes
+-- Plan Pro: 1200 crédits = 20 minutes
+-- Plan Max: 1800 crédits = 30 minutes
+-- Free: 10 crédits par défaut (pour tester)
