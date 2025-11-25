@@ -20,7 +20,7 @@
             *   `custom_prompt`: The text.
             *   `image_urls`: List of uploaded image URLs (max 3 for Veo 3.1).
             *   `duration`: Selected duration (must be multiple of 8 for Veo 3.1).
-            *   `ai_model`: "veo3.1" (default) or "sora2".
+            *   `ai_model`: "veo3.1" (default), "veo3.1-fast" (faster generation), "sora2", or "sora2-pro".
             *   `model_type`: "text-to-video" (default) or "image-to-video" (if images present).
 
 2.  **YouTube Integration**:

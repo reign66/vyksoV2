@@ -8,7 +8,7 @@ from typing import Optional, List, Dict, Literal
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from sora_client import SoraClient
 from veo_client import VeoAIClient
 from supabase_client import get_client
@@ -221,13 +221,79 @@ async def _proxy_supabase_object_stream(object_path: str, range_header: Optional
 
 # ============= MODELS =============
 
+# AI Model name normalization - accepts various formats from frontend
+AI_MODEL_ALIASES = {
+    # Veo 3.1 normal
+    "veo-3.1-generate-preview": "veo-3.1-generate-preview",
+    "veo-3.1": "veo-3.1-generate-preview",
+    "veo3.1": "veo-3.1-generate-preview",
+    "veo 3.1": "veo-3.1-generate-preview",
+    "veo": "veo-3.1-generate-preview",
+    "veo-3": "veo-3.1-generate-preview",
+    "veo3": "veo-3.1-generate-preview",
+    # Veo 3.1 fast (all variations)
+    "veo-3.1-fast-generate-preview": "veo-3.1-fast-generate-preview",
+    "veo-3.1-fast": "veo-3.1-fast-generate-preview",
+    "veo3.1-fast": "veo-3.1-fast-generate-preview",
+    "veo3.1 fast": "veo-3.1-fast-generate-preview",
+    "veo3.1fast": "veo-3.1-fast-generate-preview",
+    "veo 3.1 fast": "veo-3.1-fast-generate-preview",
+    "veo-fast": "veo-3.1-fast-generate-preview",
+    "veo fast": "veo-3.1-fast-generate-preview",
+    "veofast": "veo-3.1-fast-generate-preview",
+    "veo-3-fast": "veo-3.1-fast-generate-preview",
+    "veo3-fast": "veo-3.1-fast-generate-preview",
+    "veo3fast": "veo-3.1-fast-generate-preview",
+    # Sora 2
+    "sora-2": "sora-2",
+    "sora2": "sora-2",
+    "sora 2": "sora-2",
+    "sora": "sora-2",
+    # Sora 2 Pro
+    "sora-2-pro": "sora-2-pro",
+    "sora2-pro": "sora-2-pro",
+    "sora2pro": "sora-2-pro",
+    "sora 2 pro": "sora-2-pro",
+    "sora-pro": "sora-2-pro",
+    "sora pro": "sora-2-pro",
+    "sorapro": "sora-2-pro",
+}
+
+VALID_AI_MODELS = ["sora-2", "sora-2-pro", "veo-3.1-generate-preview", "veo-3.1-fast-generate-preview"]
+
+def normalize_ai_model(value: str) -> str:
+    """Normalize AI model name to the expected format."""
+    if not value:
+        return "veo-3.1-generate-preview"
+    
+    # Lowercase and strip for matching
+    normalized = value.lower().strip()
+    
+    # Check aliases
+    if normalized in AI_MODEL_ALIASES:
+        return AI_MODEL_ALIASES[normalized]
+    
+    # Check if it's already a valid model
+    if normalized in VALID_AI_MODELS:
+        return normalized
+    
+    # Default fallback
+    print(f"⚠️ Unknown ai_model '{value}', defaulting to veo-3.1-generate-preview")
+    return "veo-3.1-generate-preview"
+
+
 class VideoRequest(BaseModel):
     user_id: str  # Ignored server-side; derived from JWT
     niche: Optional[str] = None
     duration: int
     quality: str = "basic"
     custom_prompt: Optional[str] = None
-    ai_model: Literal["sora-2", "sora-2-pro", "veo-3.1-generate-preview", "veo-3.1-fast-generate-preview"] = "veo-3.1-generate-preview"
+    ai_model: str = "veo-3.1-generate-preview"
+    
+    @field_validator('ai_model', mode='before')
+    @classmethod
+    def normalize_model(cls, v):
+        return normalize_ai_model(v)
 
 class VideoResponse(BaseModel):
     job_id: str
@@ -260,7 +326,12 @@ class VideoRequestAdvanced(BaseModel):
     image_urls: Optional[List[str]] = None
     shots: Optional[List[StoryboardShot]] = None
     model_type: Literal["text-to-video", "image-to-video", "storyboard"] = "text-to-video"
-    ai_model: Literal["sora-2", "sora-2-pro", "veo-3.1-generate-preview", "veo-3.1-fast-generate-preview"] = "veo-3.1-generate-preview"
+    ai_model: str = "veo-3.1-generate-preview"
+    
+    @field_validator('ai_model', mode='before')
+    @classmethod
+    def normalize_model(cls, v):
+        return normalize_ai_model(v)
 
 
 class YouTubeUploadRequest(BaseModel):
