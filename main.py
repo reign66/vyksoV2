@@ -951,9 +951,25 @@ async def upload_video_to_youtube(job_id: str, request: Request, body: YouTubeUp
         
         tokens = user.data["youtube_tokens"]
         
+        # Validate tokens have all required fields
+        required_fields = ['token', 'refresh_token', 'token_uri', 'client_id', 'client_secret']
+        missing_fields = [f for f in required_fields if not tokens.get(f)]
+        
+        if missing_fields:
+            print(f"❌ YouTube tokens missing fields: {missing_fields}")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Your YouTube connection is incomplete (missing: {', '.join(missing_fields)}). Please disconnect and reconnect your YouTube account."
+            )
+        
         # Refresh tokens if needed
         refreshed_tokens = youtube_client.refresh_credentials(tokens)
-        if refreshed_tokens and refreshed_tokens != tokens:
+        if refreshed_tokens is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Failed to refresh YouTube credentials. Please disconnect and reconnect your YouTube account."
+            )
+        if refreshed_tokens != tokens:
             # Update tokens in database
             supabase.table("profiles").update({
                 "youtube_tokens": refreshed_tokens
@@ -1134,7 +1150,7 @@ async def youtube_auth_callback(code: str, state: str):
         user_id = state
         credentials = youtube_client.get_credentials_from_code(code)
         
-        # Convert credentials to dict
+        # Convert credentials to dict - ensure ALL required fields are saved
         creds_dict = {
             'token': credentials.token,
             'refresh_token': credentials.refresh_token,
@@ -1143,6 +1159,15 @@ async def youtube_auth_callback(code: str, state: str):
             'client_secret': credentials.client_secret,
             'scopes': list(credentials.scopes) if credentials.scopes else []
         }
+        
+        # Validate that we got a refresh_token (required for long-term access)
+        if not creds_dict.get('refresh_token'):
+            print("⚠️ Warning: No refresh_token received from Google. User may need to revoke app access and reconnect.")
+        
+        # Log credential fields for debugging (not values, just keys)
+        print(f"📝 Storing YouTube credentials with fields: {list(creds_dict.keys())}")
+        print(f"📝 Refresh token present: {bool(creds_dict.get('refresh_token'))}")
+        print(f"📝 Token URI: {creds_dict.get('token_uri')}")
         
         # Store in DB
         supabase.table("profiles").update({
@@ -1153,6 +1178,65 @@ async def youtube_auth_callback(code: str, state: str):
         
     except Exception as e:
         print(f"❌ YouTube callback error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/auth/youtube/disconnect")
+async def disconnect_youtube(request: Request):
+    """
+    Disconnect YouTube account by clearing stored tokens.
+    User will need to reconnect to upload videos again.
+    """
+    try:
+        token_user_id = await _get_authenticated_user_id(request)
+        
+        # Clear YouTube tokens
+        supabase.table("profiles").update({
+            "youtube_tokens": None
+        }).eq("id", token_user_id).execute()
+        
+        print(f"🔌 YouTube disconnected for user {token_user_id}")
+        return {"status": "success", "message": "YouTube account disconnected successfully"}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ YouTube disconnect error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/auth/youtube/status")
+async def get_youtube_status(request: Request):
+    """
+    Check if the user has a valid YouTube connection.
+    """
+    try:
+        token_user_id = await _get_authenticated_user_id(request)
+        
+        user = supabase.table("profiles").select("youtube_tokens").eq("id", token_user_id).single().execute()
+        
+        if not user.data or not user.data.get("youtube_tokens"):
+            return {"connected": False, "valid": False, "message": "YouTube not connected"}
+        
+        tokens = user.data["youtube_tokens"]
+        
+        # Check for required fields
+        required_fields = ['token', 'refresh_token', 'token_uri', 'client_id', 'client_secret']
+        missing_fields = [f for f in required_fields if not tokens.get(f)]
+        
+        if missing_fields:
+            return {
+                "connected": True,
+                "valid": False,
+                "message": f"Connection incomplete. Missing: {', '.join(missing_fields)}. Please reconnect."
+            }
+        
+        return {"connected": True, "valid": True, "message": "YouTube connected and ready"}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ YouTube status check error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 # ============= STRIPE ENDPOINTS =============
