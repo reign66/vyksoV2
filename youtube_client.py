@@ -45,10 +45,19 @@ class YouTubeClient:
     def get_credentials_from_code(self, code: str):
         """
         Exchanges the auth code for credentials.
+        Google may return additional scopes (userinfo.email, userinfo.profile, openid)
+        that we need to accept to avoid scope validation errors.
         """
+        # Include scopes that Google automatically adds to avoid validation errors
+        extended_scopes = SCOPES + [
+            'https://www.googleapis.com/auth/userinfo.email',
+            'https://www.googleapis.com/auth/userinfo.profile',
+            'openid'
+        ]
+        
         flow = Flow.from_client_secrets_file(
             self.client_secrets_file,
-            scopes=SCOPES,
+            scopes=extended_scopes,
             redirect_uri=self.redirect_uri
         )
         flow.fetch_token(code=code)
