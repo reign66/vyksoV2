@@ -9,14 +9,63 @@
 CREATE TABLE IF NOT EXISTS profiles (
     id UUID PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
     full_name TEXT,
+    email TEXT,
+    first_name TEXT,
+    last_name TEXT,
     credits INTEGER DEFAULT 10,
     plan TEXT DEFAULT 'free',
+    -- Stripe subscription fields
     stripe_customer_id TEXT,
     stripe_subscription_id TEXT,
+    price_id TEXT,                              -- Current Stripe price ID
+    subscription_status TEXT DEFAULT 'inactive', -- active, canceled, past_due, etc.
+    plan_tier TEXT,                              -- basic, pro, max, starter, etc.
+    plan_interval TEXT,                          -- monthly, yearly, annual
+    plan_family TEXT DEFAULT 'professional',     -- creator or professional
+    current_period_end TIMESTAMP WITH TIME ZONE, -- When subscription renews
+    canceled_at TIMESTAMP WITH TIME ZONE,        -- When subscription was canceled
+    -- YouTube integration
     youtube_tokens JSONB,
+    -- Timestamps
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
+
+-- Add new columns to existing profiles table (run if table already exists)
+-- Run these ALTER statements only if the columns don't exist
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'profiles' AND column_name = 'email') THEN
+        ALTER TABLE profiles ADD COLUMN email TEXT;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'profiles' AND column_name = 'first_name') THEN
+        ALTER TABLE profiles ADD COLUMN first_name TEXT;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'profiles' AND column_name = 'last_name') THEN
+        ALTER TABLE profiles ADD COLUMN last_name TEXT;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'profiles' AND column_name = 'price_id') THEN
+        ALTER TABLE profiles ADD COLUMN price_id TEXT;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'profiles' AND column_name = 'subscription_status') THEN
+        ALTER TABLE profiles ADD COLUMN subscription_status TEXT DEFAULT 'inactive';
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'profiles' AND column_name = 'plan_tier') THEN
+        ALTER TABLE profiles ADD COLUMN plan_tier TEXT;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'profiles' AND column_name = 'plan_interval') THEN
+        ALTER TABLE profiles ADD COLUMN plan_interval TEXT;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'profiles' AND column_name = 'plan_family') THEN
+        ALTER TABLE profiles ADD COLUMN plan_family TEXT DEFAULT 'professional';
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'profiles' AND column_name = 'current_period_end') THEN
+        ALTER TABLE profiles ADD COLUMN current_period_end TIMESTAMP WITH TIME ZONE;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'profiles' AND column_name = 'canceled_at') THEN
+        ALTER TABLE profiles ADD COLUMN canceled_at TIMESTAMP WITH TIME ZONE;
+    END IF;
+END $$;
 
 -- ============================================
 -- TABLE: video_jobs
@@ -50,13 +99,46 @@ CREATE TABLE IF NOT EXISTS credit_transactions (
 );
 
 -- ============================================
+-- TABLE: webhook_logs (for Stripe webhook debugging)
+-- ============================================
+CREATE TABLE IF NOT EXISTS webhook_logs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    event_type TEXT NOT NULL,
+    event_id TEXT NOT NULL,
+    timestamp TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    data_summary JSONB,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- ============================================
+-- TABLE: notifications (for in-app notifications)
+-- ============================================
+CREATE TABLE IF NOT EXISTS notifications (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID REFERENCES auth.users(id) ON DELETE CASCADE,
+    type TEXT NOT NULL,         -- 'payment_failed', 'subscription_renewed', etc.
+    title TEXT NOT NULL,
+    message TEXT NOT NULL,
+    action_url TEXT,            -- Optional link for user action
+    read BOOLEAN DEFAULT FALSE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- ============================================
 -- INDEXES pour performance
 -- ============================================
 CREATE INDEX IF NOT EXISTS idx_video_jobs_user_id ON video_jobs(user_id);
 CREATE INDEX IF NOT EXISTS idx_video_jobs_status ON video_jobs(status);
 CREATE INDEX IF NOT EXISTS idx_video_jobs_created_at ON video_jobs(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_profiles_stripe_subscription ON profiles(stripe_subscription_id);
+CREATE INDEX IF NOT EXISTS idx_profiles_stripe_customer ON profiles(stripe_customer_id);
+CREATE INDEX IF NOT EXISTS idx_profiles_plan ON profiles(plan);
+CREATE INDEX IF NOT EXISTS idx_profiles_plan_family ON profiles(plan_family);
 CREATE INDEX IF NOT EXISTS idx_credit_transactions_user_id ON credit_transactions(user_id);
+CREATE INDEX IF NOT EXISTS idx_webhook_logs_event_type ON webhook_logs(event_type);
+CREATE INDEX IF NOT EXISTS idx_webhook_logs_event_id ON webhook_logs(event_id);
+CREATE INDEX IF NOT EXISTS idx_notifications_user_id ON notifications(user_id);
+CREATE INDEX IF NOT EXISTS idx_notifications_read ON notifications(user_id, read);
 
 -- ============================================
 -- TRIGGER: handle_new_user
@@ -249,31 +331,99 @@ CREATE TRIGGER update_profiles_updated_at
 -- - Authenticated users can read/download from vykso-videos
 
 -- ============================================
--- CREDITS MAPPING - TWO TIER SYSTEM
+-- RLS for webhook_logs and notifications
+-- ============================================
+ALTER TABLE webhook_logs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE notifications ENABLE ROW LEVEL SECURITY;
+
+-- Webhook logs - service role only (backend operations)
+DROP POLICY IF EXISTS "Service role full access webhook_logs" ON webhook_logs;
+CREATE POLICY "Service role full access webhook_logs"
+    ON webhook_logs FOR ALL
+    USING (auth.jwt() ->> 'role' = 'service_role');
+
+-- Notifications - users can view their own
+DROP POLICY IF EXISTS "Users can view their own notifications" ON notifications;
+CREATE POLICY "Users can view their own notifications"
+    ON notifications FOR SELECT
+    USING (auth.uid() = user_id);
+
+DROP POLICY IF EXISTS "Users can update their own notifications" ON notifications;
+CREATE POLICY "Users can update their own notifications"
+    ON notifications FOR UPDATE
+    USING (auth.uid() = user_id);
+
+DROP POLICY IF EXISTS "Service role full access notifications" ON notifications;
+CREATE POLICY "Service role full access notifications"
+    ON notifications FOR ALL
+    USING (auth.jwt() ->> 'role' = 'service_role');
+
+-- ============================================
+-- PRICING STRUCTURE - COMPLETE MAPPING
 -- ============================================
 
 -- ============================================
 -- PROFESSIONAL TIER (for ads/commercials)
--- ============================================
 -- Variable duration (6-60s), multiple sequences, ad-optimized prompts
--- Plan Starter (Premium): 600 crédits = 10 minutes
--- Plan Pro: 1200 crédits = 20 minutes
--- Plan Max: 1800 crédits = 30 minutes
+-- ============================================
+
+-- Professionnel Premium (starter):
+--   Monthly: 199,00 €/mois → STRIPE_PRICE_STARTER
+--   Annual: 179,00 €/mois (2 148,00 €/an total) → STRIPE_PRICE_STARTER_ANNUAL
+--   Credits: 600 crédits = 10 minutes
+
+-- Professionnel Pro:
+--   Monthly: 589,00 €/mois → STRIPE_PRICE_PRO
+--   Annual: 530,00 €/mois (6 360,00 €/an total) → STRIPE_PRICE_PRO_ANNUAL
+--   Credits: 1200 crédits = 20 minutes
+
+-- Professionnel Max:
+--   Monthly: 1 199,00 €/mois → STRIPE_PRICE_MAX
+--   Annual: 1 079,00 €/mois (12 948,00 €/an total) → STRIPE_PRICE_MAX_ANNUAL
+--   Credits: 1800 crédits = 30 minutes
 
 -- ============================================
 -- CREATOR TIER (for TikTok/YouTube Shorts)
--- ============================================
 -- Fixed duration (10s Sora, 8s VEO), no duration selection, viral prompts
--- Plan creator_basic: 34.99€/month = 100 crédits = 10 videos de 10s
--- Plan creator_pro: 65.99€/month = 200 crédits = 20 videos de 10s  
--- Plan creator_max: 89.99€/month = 300 crédits = 30 videos de 10s
+-- ============================================
+
+-- Creator Basic:
+--   Monthly: 34,99 €/mois → STRIPE_PRICE_BASIC_MONTHLY
+--   Yearly: 377,89 €/an (31,49 €/mois équivalent) → STRIPE_PRICE_BASIC_YEARLY
+--   Credits: 100 crédits = 10 videos de 10s
+
+-- Creator Pro:
+--   Monthly: 65,99 €/mois → STRIPE_PRICE_PRO_MONTHLY
+--   Yearly: 712,69 €/an (59,39 €/mois équivalent) → STRIPE_PRICE_PRO_YEARLY
+--   Credits: 200 crédits = 20 videos de 10s
+
+-- Creator Max:
+--   Monthly: 89,99 €/mois → STRIPE_PRICE_MAX_MONTHLY
+--   Yearly: 971,89 €/an (80,99 €/mois équivalent) → STRIPE_PRICE_MAX_YEARLY
+--   Credits: 300 crédits = 30 videos de 10s
 
 -- Free: 10 crédits par défaut (pour tester)
 
 -- ============================================
 -- PLAN VALUES FOR profiles.plan COLUMN
 -- ============================================
--- Professional tier plans:
+-- Professional tier plans (monthly):
 --   'free', 'starter', 'pro', 'max'
--- Creator tier plans:
+-- Professional tier plans (annual):
+--   'starter_annual', 'pro_annual', 'max_annual'
+-- Creator tier plans (monthly):
 --   'creator_basic', 'creator_pro', 'creator_max'
+-- Creator tier plans (yearly):
+--   'creator_basic_yearly', 'creator_pro_yearly', 'creator_max_yearly'
+
+-- ============================================
+-- ENVIRONMENT VARIABLES NAMING CONVENTION
+-- ============================================
+-- PROFESSIONAL plans use: _ANNUAL suffix for yearly (e.g., STRIPE_PRICE_PRO_ANNUAL)
+-- CREATOR plans use: _YEARLY suffix for yearly (e.g., STRIPE_PRICE_PRO_YEARLY)
+-- 
+-- Be careful with naming conflicts:
+-- - STRIPE_PRICE_PRO = Professional Pro monthly
+-- - STRIPE_PRICE_PRO_MONTHLY = Creator Pro monthly
+-- - STRIPE_PRICE_MAX = Professional Max monthly
+-- - STRIPE_PRICE_MAX_MONTHLY = Creator Max monthly
