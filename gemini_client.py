@@ -4,6 +4,12 @@ from google import genai
 from google.genai import types
 import base64
 import httpx
+from typing import Optional, List, Literal
+from PIL import Image
+from io import BytesIO
+
+# User tier types for differentiated prompts
+UserTier = Literal["creator", "professional"]
 
 class GeminiClient:
     def __init__(self):
@@ -11,72 +17,246 @@ class GeminiClient:
         if not self.api_key:
             raise ValueError("GEMINI_API_KEY not set")
         self.client = genai.Client(api_key=self.api_key)
+        # Store active chat sessions for multi-turn image editing
+        self._chat_sessions = {}
 
-    def generate_image(self, prompt: str) -> bytes:
+    def generate_image(
+        self, 
+        prompt: str, 
+        reference_images: Optional[List[Image.Image]] = None,
+        aspect_ratio: str = "9:16",
+        resolution: str = "2K",
+        use_google_search: bool = False
+    ) -> bytes:
         """
         Generates an image using Gemini 3 Pro Image Preview model.
-        Uses generate_content with IMAGE modality for the new model.
+        
+        Args:
+            prompt: Text description of the image to generate
+            reference_images: Optional list of PIL Images (up to 18) for reference
+            aspect_ratio: Image aspect ratio ("1:1","2:3","3:2","3:4","4:3","4:5","5:4","9:16","16:9","21:9")
+            resolution: Image resolution ("1K", "2K", "4K")
+            use_google_search: Whether to use Google Search for grounding (real-time data)
+        
+        Returns:
+            Image bytes or None if generation fails
         """
         try:
-            # Use gemini-3-pro-image-preview as requested
+            # Build contents - can include multiple reference images (up to 18)
+            contents = [prompt]
+            
+            if reference_images:
+                # Gemini 3 Pro supports up to 14-18 reference images
+                for img in reference_images[:18]:
+                    if isinstance(img, Image.Image):
+                        contents.append(img)
+            
+            # Build config with image settings
+            config_kwargs = {
+                "response_modalities": ['TEXT', 'IMAGE'],  # Must include both per docs
+                "image_config": types.ImageConfig(
+                    aspect_ratio=aspect_ratio,
+                    image_size=resolution
+                )
+            }
+            
+            # Add Google Search tool if requested (for real-time data grounding)
+            if use_google_search:
+                config_kwargs["tools"] = [{"google_search": {}}]
+            
             response = self.client.models.generate_content(
                 model='gemini-3-pro-image-preview',
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_modalities=['IMAGE']
-                )
+                contents=contents,
+                config=types.GenerateContentConfig(**config_kwargs)
             )
             
-            # Extract image bytes from the response
+            # Extract image bytes from the response (skip thought images)
+            for part in response.parts:
+                # Skip thought parts (intermediate images)
+                if hasattr(part, 'thought') and part.thought:
+                    continue
+                # Check for image data
+                if hasattr(part, 'inline_data') and part.inline_data:
+                    if part.inline_data.mime_type and 'image' in part.inline_data.mime_type:
+                        return base64.b64decode(part.inline_data.data)
+                # Alternative: use as_image() helper
+                try:
+                    image = part.as_image()
+                    if image:
+                        # Convert PIL Image to bytes
+                        buffer = BytesIO()
+                        image.save(buffer, format='PNG')
+                        return buffer.getvalue()
+                except:
+                    pass
+            
+            # Fallback: check candidates structure
             if response.candidates and response.candidates[0].content.parts:
                 for part in response.candidates[0].content.parts:
+                    if hasattr(part, 'thought') and part.thought:
+                        continue
                     if hasattr(part, 'inline_data') and part.inline_data:
                         return base64.b64decode(part.inline_data.data)
+            
+            print("⚠️ No image found in Gemini response")
             return None
+            
         except Exception as e:
             print(f"Error generating image with gemini-3-pro-image-preview: {e}")
             raise e
 
-    def enrich_prompt(self, base_prompt: str, segment_context: str = None, user_image_description: str = None) -> str:
+    def create_image_chat(self, session_id: str, use_google_search: bool = False):
+        """
+        Creates a multi-turn chat session for iterative image generation/editing.
+        
+        Args:
+            session_id: Unique identifier for this chat session
+            use_google_search: Whether to enable Google Search grounding
+        
+        Returns:
+            The chat session object
+        """
+        config_kwargs = {
+            "response_modalities": ['TEXT', 'IMAGE'],
+        }
+        
+        if use_google_search:
+            config_kwargs["tools"] = [{"google_search": {}}]
+        
+        chat = self.client.chats.create(
+            model="gemini-3-pro-image-preview",
+            config=types.GenerateContentConfig(**config_kwargs)
+        )
+        
+        self._chat_sessions[session_id] = chat
+        return chat
+
+    def chat_generate_image(
+        self,
+        session_id: str,
+        message: str,
+        aspect_ratio: str = "9:16",
+        resolution: str = "2K"
+    ) -> bytes:
+        """
+        Sends a message in an existing chat session to generate/edit images.
+        This allows iterative modifications like "Update this to Spanish" etc.
+        
+        Args:
+            session_id: The chat session ID
+            message: The instruction/prompt for this turn
+            aspect_ratio: Desired aspect ratio for the output
+            resolution: Desired resolution ("1K", "2K", "4K")
+        
+        Returns:
+            Image bytes or None
+        """
+        chat = self._chat_sessions.get(session_id)
+        if not chat:
+            chat = self.create_image_chat(session_id)
+        
+        try:
+            response = chat.send_message(
+                message,
+                config=types.GenerateContentConfig(
+                    image_config=types.ImageConfig(
+                        aspect_ratio=aspect_ratio,
+                        image_size=resolution
+                    ),
+                )
+            )
+            
+            # Extract image from response
+            for part in response.parts:
+                if hasattr(part, 'thought') and part.thought:
+                    continue
+                try:
+                    image = part.as_image()
+                    if image:
+                        buffer = BytesIO()
+                        image.save(buffer, format='PNG')
+                        return buffer.getvalue()
+                except:
+                    pass
+                if hasattr(part, 'inline_data') and part.inline_data:
+                    return base64.b64decode(part.inline_data.data)
+            
+            return None
+            
+        except Exception as e:
+            print(f"Error in chat image generation: {e}")
+            raise e
+
+    def close_chat(self, session_id: str):
+        """Closes and removes a chat session."""
+        if session_id in self._chat_sessions:
+            del self._chat_sessions[session_id]
+
+    def enrich_prompt(
+        self, 
+        base_prompt: str, 
+        segment_context: str = None, 
+        user_image_description: str = None,
+        user_tier: UserTier = "creator"
+    ) -> str:
         """
         Enriches a client prompt before image/video generation for higher quality output.
         This adds cinematographic details, visual style, and technical specifications.
-        Uses gemini-2.5-flash-lite for fast text generation.
+        Uses gemini-2.0-flash-lite for fast text generation.
         
         Args:
             base_prompt: The original user prompt
             segment_context: Context about where this shot fits in the video (optional)
             user_image_description: Description of user-provided image if any (optional)
+            user_tier: "creator" for TikTok/Shorts content, "professional" for ads
         
         Returns:
-            Enriched prompt optimized for high-quality generation with TikTok Shorts aesthetic
+            Enriched prompt optimized for high-quality generation
         """
-        # TikTok Shorts aesthetic suffix to always append
-        tiktok_suffix = ", vertical 9:16 aspect ratio, TikTok Shorts aesthetic, high contrast vibrant colors, trending social media style, 4K quality"
+        if user_tier == "creator":
+            return self._enrich_prompt_creator(base_prompt, segment_context, user_image_description)
+        else:
+            return self._enrich_prompt_professional(base_prompt, segment_context, user_image_description)
+
+    def _enrich_prompt_creator(self, base_prompt: str, segment_context: str = None, user_image_description: str = None) -> str:
+        """
+        Enriches prompt for CREATOR tier - optimized for TikTok/YouTube Shorts.
+        Focus on viral content, attention-grabbing visuals, trendy aesthetics.
+        """
+        # TikTok Shorts aesthetic suffix
+        creator_suffix = ", vertical 9:16 aspect ratio, TikTok Shorts aesthetic, high contrast vibrant colors, trending social media style, viral potential, 4K quality, hook in first 3 seconds"
         
         try:
             system_instruction = """
-            You are an expert cinematographer and visual director specializing in TikTok and YouTube Shorts content.
-            Your task is to enrich video/image generation prompts to produce stunning, viral-worthy content.
+            You are an expert TikTok/YouTube Shorts content creator and viral video specialist.
+            Your task is to enrich video/image generation prompts to produce VIRAL, engaging short-form content.
             
-            Rules:
-            1. Keep the original intent and subject matter intact
-            2. Add specific cinematographic details (camera angles, movements, lighting)
-            3. Include visual style descriptors (color grading, mood, atmosphere)
-            4. Add technical quality markers (resolution, sharpness, professional grade)
-            5. Make it suitable for AI video generation models
-            6. If a user image is mentioned, incorporate it naturally into the scene
-            7. Keep the prompt under 400 characters (TikTok aesthetic suffix will be added separately)
-            8. Output ONLY the enriched prompt, nothing else
-            9. Focus on dynamic, engaging visuals that grab attention in the first frame
+            CREATOR STYLE RULES:
+            1. Keep the original intent but make it MORE EXCITING and attention-grabbing
+            2. Add dynamic camera movements (quick zooms, sweeping shots, dramatic reveals)
+            3. Use bold, saturated colors that POP on mobile screens
+            4. Include trendy visual effects (glitch effects, speed ramps, transitions)
+            5. Create INSTANT HOOKS - the first frame must grab attention
+            6. Use high energy, fast-paced visual storytelling
+            7. Incorporate current social media trends and aesthetics
+            8. If a user image is mentioned, make it the star of a viral moment
+            9. Keep the prompt under 400 characters
+            10. Output ONLY the enriched prompt, nothing else
+            
+            VIRAL ELEMENTS TO INCLUDE:
+            - Dramatic lighting changes
+            - Unexpected visual twists
+            - Satisfying visual moments
+            - Relatable/shareable content hooks
+            - Mobile-optimized composition (centered subjects)
             """
             
             user_content = f"""
             Original prompt: {base_prompt}
-            {f'Segment context: {segment_context}' if segment_context else ''}
-            {f'User provided image to incorporate: {user_image_description}' if user_image_description else ''}
+            {f'Scene context: {segment_context}' if segment_context else ''}
+            {f'User provided image to feature: {user_image_description}' if user_image_description else ''}
             
-            Enrich this prompt for viral TikTok/YouTube Shorts video generation.
+            Transform this into a VIRAL TikTok/YouTube Shorts video prompt. Make it irresistible to scroll past!
             """
             
             response = self.client.models.generate_content(
@@ -88,14 +268,72 @@ class GeminiClient:
             )
             
             enriched = response.text.strip()
-            # Add TikTok aesthetic suffix
-            final_prompt = f"{enriched}{tiktok_suffix}"
-            print(f"📝 Enriched prompt: {final_prompt[:100]}...")
+            final_prompt = f"{enriched}{creator_suffix}"
+            print(f"📝 [CREATOR] Enriched prompt: {final_prompt[:100]}...")
             return final_prompt
             
         except Exception as e:
-            print(f"Error enriching prompt: {e}, using original with TikTok suffix")
-            return f"{base_prompt}{tiktok_suffix}"
+            print(f"Error enriching creator prompt: {e}, using original with suffix")
+            return f"{base_prompt}{creator_suffix}"
+
+    def _enrich_prompt_professional(self, base_prompt: str, segment_context: str = None, user_image_description: str = None) -> str:
+        """
+        Enriches prompt for PROFESSIONAL tier - optimized for ads, commercials, brand content.
+        Focus on polished, high-end production quality, brand-safe, conversion-focused.
+        """
+        # Professional ad aesthetic suffix
+        professional_suffix = ", cinematic 9:16 vertical format, premium advertising quality, professional color grading, brand-safe content, high-end production value, 4K HDR quality, commercial grade"
+        
+        try:
+            system_instruction = """
+            You are an elite advertising director and commercial cinematographer.
+            Your task is to enrich video/image generation prompts for PROFESSIONAL ADVERTISING content.
+            
+            PROFESSIONAL AD STYLE RULES:
+            1. Maintain brand-safe, polished, premium aesthetics
+            2. Use sophisticated camera work (smooth tracking shots, elegant reveals, product showcases)
+            3. Apply refined, professional color grading (not oversaturated - elegant and clean)
+            4. Create aspirational, lifestyle-driven narratives
+            5. Focus on product/service benefits and emotional connection
+            6. Use professional lighting setups (3-point lighting, soft fills, dramatic key lights)
+            7. Include subtle but effective call-to-action moments
+            8. If a user image is mentioned, integrate it as a premium product/brand showcase
+            9. Keep the prompt under 400 characters
+            10. Output ONLY the enriched prompt, nothing else
+            
+            ADVERTISING ELEMENTS TO INCLUDE:
+            - Clean, uncluttered compositions
+            - Professional model/product positioning
+            - Aspirational lifestyle imagery
+            - Trust-building visual elements
+            - Conversion-focused storytelling arcs
+            - Multi-sequence narrative potential (for longer ads)
+            """
+            
+            user_content = f"""
+            Original prompt: {base_prompt}
+            {f'Sequence context: {segment_context}' if segment_context else ''}
+            {f'Brand/product image to feature: {user_image_description}' if user_image_description else ''}
+            
+            Transform this into a PROFESSIONAL ADVERTISING video prompt. Premium quality, conversion-focused, brand-safe.
+            """
+            
+            response = self.client.models.generate_content(
+                model="gemini-2.0-flash-lite",
+                contents=user_content,
+                config=types.GenerateContentConfig(
+                    system_instruction=system_instruction,
+                )
+            )
+            
+            enriched = response.text.strip()
+            final_prompt = f"{enriched}{professional_suffix}"
+            print(f"📝 [PROFESSIONAL] Enriched prompt: {final_prompt[:100]}...")
+            return final_prompt
+            
+        except Exception as e:
+            print(f"Error enriching professional prompt: {e}, using original with suffix")
+            return f"{base_prompt}{professional_suffix}"
 
     def describe_image_from_url(self, image_url: str) -> str:
         """
@@ -126,74 +364,59 @@ class GeminiClient:
             print(f"Error describing image: {e}")
             return None
 
-    def generate_video_script(self, prompt: str, duration: int, num_segments: int, user_images: list = None, segment_duration: int = 8) -> dict:
+    def generate_video_script(
+        self, 
+        prompt: str, 
+        duration: int, 
+        num_segments: int, 
+        user_images: list = None, 
+        segment_duration: int = 8,
+        user_tier: UserTier = "creator",
+        images_per_segment: int = 1
+    ) -> dict:
         """
-        Generates a structured script for the video using Gemini 2.5 Flash Lite.
+        Generates a structured script for the video using Gemini 2.0 Flash Lite.
         Returns a JSON object with segments and shots.
-        Uses gemini-2.5-flash-lite for fast text generation.
         
         Args:
             prompt: The user's prompt for the video
             duration: Total video duration in seconds
             num_segments: Number of segments to generate
-            user_images: Optional list of user-provided image URLs
+            user_images: Optional list of user-provided image URLs (up to 18)
             segment_duration: Duration per segment (8s for Veo 3.1, 10s for Sora)
+            user_tier: "creator" for TikTok/Shorts, "professional" for ads
+            images_per_segment: Number of images to generate per segment (1-3 for creator, more for professional)
         
         Returns:
             JSON object with segments and shots, each with enriched prompts
         """
         import json
         
-        # First, analyze user images if provided (parallel would be ideal but keeping it simple)
+        # Analyze user images if provided (now supports up to 18 images)
         image_descriptions = []
         if user_images:
-            for img_url in user_images[:3]:  # Max 3 images
+            for img_url in user_images[:18]:  # Support up to 18 images
                 desc = self.describe_image_from_url(img_url)
                 if desc:
                     image_descriptions.append(desc)
         
-        system_instruction = f"""
-        You are an expert TikTok/YouTube Shorts video director. Create a detailed script for a viral short-form video.
-        The video is divided into {segment_duration}-second segments for optimal AI video generation.
-        For EACH segment, you must define exactly 1 shot (scene) - keep it simple for best quality.
-        
-        IMPORTANT: 
-        - Focus on creating visually STUNNING, attention-grabbing content
-        - Each shot should tell a mini-story that hooks viewers immediately
-        - Use dynamic camera movements and dramatic lighting descriptions
-        - If user images are provided, use them strategically for the most impactful shots
-        
-        Output JSON format:
-        {{
-            "segments": [
-                {{
-                    "segment_index": 1,
-                    "shots": [
-                        {{
-                            "shot_index": 1,
-                            "image_prompt": "Detailed visual description for image generation focusing on composition, lighting, colors...",
-                            "video_prompt": "Motion description for video generation including camera movements, subject actions, transitions...",
-                            "duration": {segment_duration},
-                            "use_user_image_index": null
-                        }}
-                    ]
-                }}
-            ]
-        }}
-        
-        Note: "use_user_image_index" should be 0, 1, or 2 if this shot should use a user-provided image, or null to generate a new image.
-        """
+        # Choose system instruction based on user tier
+        if user_tier == "creator":
+            system_instruction = self._get_creator_script_instruction(segment_duration, len(user_images) if user_images else 0)
+        else:
+            system_instruction = self._get_professional_script_instruction(segment_duration, len(user_images) if user_images else 0)
         
         user_content = f"""
-        Create a TikTok/YouTube Shorts video script.
+        Create a video script.
         Topic/Prompt: {prompt}
         Total Duration: {duration} seconds
         Number of Segments: {num_segments}
         Segment Duration: {segment_duration} seconds each
         User Provided Images: {len(user_images) if user_images else 0}
+        Images Per Segment: {images_per_segment}
         {f'Image descriptions: {image_descriptions}' if image_descriptions else ''}
         
-        Create {num_segments} segments with 1 shot each. Focus on viral TikTok/Shorts aesthetics: bold colors, dynamic movements, attention-grabbing visuals.
+        Create {num_segments} segments. {"Make it viral-worthy!" if user_tier == "creator" else "Make it premium advertising quality."}
         """
         
         try:
@@ -208,9 +431,9 @@ class GeminiClient:
             
             script = json.loads(response.text)
             
-            print(f"📜 Script generated with {len(script.get('segments', []))} segments")
+            print(f"📜 Script generated with {len(script.get('segments', []))} segments for {user_tier.upper()} tier")
             
-            # Enrich all prompts in the script (parallel enrichment for speed)
+            # Enrich all prompts in the script with tier-specific enrichment
             for segment in script.get("segments", []):
                 segment_context = f"Segment {segment.get('segment_index', 1)} of {num_segments}"
                 for shot in segment.get("shots", []):
@@ -220,18 +443,20 @@ class GeminiClient:
                     if user_img_idx is not None and user_img_idx < len(image_descriptions):
                         user_img_desc = image_descriptions[user_img_idx]
                     
-                    # Enrich both image and video prompts with TikTok aesthetic
+                    # Enrich both image and video prompts with tier-specific style
                     if shot.get("image_prompt"):
                         shot["image_prompt"] = self.enrich_prompt(
                             shot["image_prompt"],
                             segment_context=segment_context,
-                            user_image_description=user_img_desc
+                            user_image_description=user_img_desc,
+                            user_tier=user_tier
                         )
                     if shot.get("video_prompt"):
                         shot["video_prompt"] = self.enrich_prompt(
                             shot["video_prompt"],
                             segment_context=segment_context,
-                            user_image_description=user_img_desc
+                            user_image_description=user_img_desc,
+                            user_tier=user_tier
                         )
             
             return script
@@ -239,6 +464,94 @@ class GeminiClient:
         except Exception as e:
             print(f"Error generating script: {e}")
             return None
+
+    def _get_creator_script_instruction(self, segment_duration: int, num_user_images: int) -> str:
+        """Returns system instruction for CREATOR tier video scripts (TikTok/Shorts)."""
+        return f"""
+        You are an expert TikTok/YouTube Shorts video director specializing in VIRAL content.
+        Create a script optimized for short-form social media that will get maximum engagement.
+        
+        VIDEO STRUCTURE:
+        - Each segment is {segment_duration} seconds
+        - For CREATOR tier: Keep it SIMPLE - 1 main shot per segment for scene changes
+        - Generate 1-3 images per segment to create visual variety within the scene
+        - User has provided {num_user_images} reference images that can be used
+        
+        CREATOR STYLE REQUIREMENTS:
+        - VIRAL HOOKS: First 3 seconds must be impossibly attention-grabbing
+        - FAST PACING: Quick cuts, dynamic transitions, never boring
+        - BOLD VISUALS: Saturated colors, high contrast, mobile-optimized
+        - TRENDY: Use current TikTok trends, challenges, aesthetics
+        - EMOTIONAL: Create surprise, awe, humor, or curiosity
+        - VERTICAL: Everything composed for 9:16 mobile viewing
+        
+        Output JSON format:
+        {{
+            "segments": [
+                {{
+                    "segment_index": 1,
+                    "shots": [
+                        {{
+                            "shot_index": 1,
+                            "image_prompt": "Detailed visual for the main scene...",
+                            "video_prompt": "Dynamic motion and action description...",
+                            "duration": {segment_duration},
+                            "use_user_image_index": null,
+                            "scene_images": ["variation 1 prompt", "variation 2 prompt"]
+                        }}
+                    ]
+                }}
+            ]
+        }}
+        
+        Note: "use_user_image_index" can be 0-{num_user_images - 1 if num_user_images > 0 else 0} to use a user image, or null to generate.
+        "scene_images" contains 1-3 additional image prompts for scene variety (scene changes within the segment).
+        """
+
+    def _get_professional_script_instruction(self, segment_duration: int, num_user_images: int) -> str:
+        """Returns system instruction for PROFESSIONAL tier video scripts (ads)."""
+        return f"""
+        You are an elite advertising director creating a PROFESSIONAL commercial video.
+        Create a script optimized for conversion, brand building, and premium production quality.
+        
+        VIDEO STRUCTURE:
+        - Each segment is {segment_duration} seconds
+        - For PROFESSIONAL tier: Multiple sequences with narrative arc
+        - Multiple shots per segment for complex storytelling
+        - User has provided {num_user_images} brand/product images that should be featured
+        
+        PROFESSIONAL AD REQUIREMENTS:
+        - NARRATIVE ARC: Problem → Solution → Benefit → CTA flow
+        - PREMIUM QUALITY: Cinematic lighting, elegant composition, refined colors
+        - BRAND SAFE: Professional, trustworthy, aspirational imagery
+        - PRODUCT FOCUS: Clear product/service showcase moments
+        - CONVERSION: Build desire and urgency, clear value proposition
+        - MULTI-SEQUENCE: Create coherent story across segments
+        
+        Output JSON format:
+        {{
+            "segments": [
+                {{
+                    "segment_index": 1,
+                    "narrative_beat": "introduction/problem/solution/benefit/cta",
+                    "shots": [
+                        {{
+                            "shot_index": 1,
+                            "image_prompt": "Premium visual composition description...",
+                            "video_prompt": "Sophisticated camera movement and action...",
+                            "duration": {segment_duration},
+                            "use_user_image_index": null,
+                            "scene_images": ["angle 1", "angle 2", "detail shot"]
+                        }}
+                    ]
+                }}
+            ]
+        }}
+        
+        Note: "use_user_image_index" can be 0-{num_user_images - 1 if num_user_images > 0 else 0} to feature a brand image, or null to generate.
+        "scene_images" contains multiple image prompts for comprehensive product/brand coverage.
+        "narrative_beat" describes where this segment fits in the ad's story arc.
+        """
 
     def generate_thumbnail(self, title: str, description: str, original_prompt: str) -> tuple:
         """
@@ -454,18 +767,43 @@ Style: Cinematic, eye-catching, clickbait thumbnail style, designed for maximum 
     def _generate_thumbnail_fallback(self, prompt: str) -> bytes:
         """
         Fallback thumbnail generation using gemini-3-pro-image-preview.
+        Uses proper API format with TEXT + IMAGE modalities and image config.
         """
         try:
             response = self.client.models.generate_content(
                 model='gemini-3-pro-image-preview',
                 contents=prompt,
                 config=types.GenerateContentConfig(
-                    response_modalities=['IMAGE']
+                    response_modalities=['TEXT', 'IMAGE'],
+                    image_config=types.ImageConfig(
+                        aspect_ratio="9:16",
+                        image_size="2K"
+                    )
                 )
             )
             
+            # Extract image from response (skip thought images)
+            for part in response.parts:
+                if hasattr(part, 'thought') and part.thought:
+                    continue
+                try:
+                    image = part.as_image()
+                    if image:
+                        buffer = BytesIO()
+                        image.save(buffer, format='PNG')
+                        print("✅ Thumbnail generated with fallback model")
+                        return buffer.getvalue()
+                except:
+                    pass
+                if hasattr(part, 'inline_data') and part.inline_data:
+                    print("✅ Thumbnail generated with fallback model")
+                    return base64.b64decode(part.inline_data.data)
+            
+            # Fallback check candidates structure
             if response.candidates and response.candidates[0].content.parts:
                 for part in response.candidates[0].content.parts:
+                    if hasattr(part, 'thought') and part.thought:
+                        continue
                     if hasattr(part, 'inline_data') and part.inline_data:
                         print("✅ Thumbnail generated with fallback model")
                         return base64.b64decode(part.inline_data.data)

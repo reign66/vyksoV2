@@ -282,6 +282,43 @@ def normalize_ai_model(value: str) -> str:
     return "veo-3.1-generate-preview"
 
 
+# ============= USER TIER SYSTEM =============
+# Creator plans: optimized for TikTok/YouTube Shorts content creators
+# Professional plans: optimized for professional ads and commercials
+
+CREATOR_PLANS = ["creator_basic", "creator_pro", "creator_max"]
+PROFESSIONAL_PLANS = ["starter", "pro", "max", "free"]  # Existing professional plans
+
+def get_user_tier(plan: str) -> str:
+    """
+    Determines user tier based on their plan.
+    
+    Returns:
+        "creator" for TikTok/Shorts focused plans
+        "professional" for ad-focused plans
+    """
+    if plan in CREATOR_PLANS:
+        return "creator"
+    return "professional"
+
+def get_fixed_duration_for_creator(ai_model: str) -> int:
+    """
+    Returns fixed duration for Creator tier users.
+    Creator users cannot change duration - it's fixed based on model.
+    
+    - Sora models: 10 seconds
+    - VEO models: 8 seconds
+    """
+    if ai_model in ("sora-2", "sora-2-pro"):
+        return 10
+    else:  # VEO models
+        return 8
+
+def is_creator_plan(plan: str) -> bool:
+    """Check if a plan is a Creator tier plan."""
+    return plan in CREATOR_PLANS
+
+
 class VideoRequest(BaseModel):
     user_id: str  # Ignored server-side; derived from JWT
     niche: Optional[str] = None
@@ -406,13 +443,28 @@ def _validate_duration_and_model(duration: int, ai_model: str):
         # Sora uses 10s segments
         pass  # Accept any duration between 6-60
 
-def _validate_image_urls(image_urls: Optional[List[str]]):
+def _validate_image_urls(image_urls: Optional[List[str]], max_images: int = 18):
+    """
+    Validates image URLs for video generation.
+    
+    Args:
+        image_urls: List of image URLs to validate
+        max_images: Maximum allowed images (default 18 for Gemini 3 Pro)
+    """
     if not image_urls:
         return
+    
+    if len(image_urls) > max_images:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Too many images. Maximum allowed: {max_images}, provided: {len(image_urls)}"
+        )
+    
     try:
         supabase_host = urlparse(SUPABASE_URL).netloc
     except Exception:
         supabase_host = None
+    
     for url in image_urls:
         parsed = urlparse(url)
         if not parsed.scheme.startswith("http"):
@@ -432,13 +484,29 @@ async def process_video_generation(
     image_urls: List[str] = None,
     shots: List[dict] = None,
     model_type: str = "text-to-video",
-    ai_model: str = "veo-3.1-generate-preview"
+    ai_model: str = "veo-3.1-generate-preview",
+    user_tier: str = "professional"
 ):
-    """Background task : génère la vidéo (tous les modèles supportés)"""
+    """Background task : génère la vidéo (tous les modèles supportés)
+    
+    Args:
+        job_id: Unique job identifier
+        niche: Content niche/category
+        duration: Video duration in seconds
+        quality: Video quality setting
+        user_id: User identifier
+        custom_prompt: Optional custom prompt
+        image_urls: List of reference image URLs (up to 18)
+        shots: List of storyboard shots
+        model_type: Type of generation (text-to-video, image-to-video, storyboard)
+        ai_model: AI model to use
+        user_tier: "creator" for TikTok/Shorts or "professional" for ads
+    """
     try:
         print(f"🎬 Starting generation for job {job_id}")
         print(f"🤖 AI Model: {ai_model}")
         print(f"📊 Model type: {model_type}")
+        print(f"👤 User tier: {user_tier.upper()}")
         
         get_supabase().table("video_jobs").update({
             "status": "generating"
@@ -450,26 +518,35 @@ async def process_video_generation(
             use_fast_model = (ai_model == "veo-3.1-fast-generate-preview")
             model_variant = "FAST" if use_fast_model else "NORMAL"
             print(f"🎥 Using Veo 3.1 API ({model_variant} mode) with Parallel Advanced Scripting")
+            print(f"🎨 User tier: {user_tier} - {'TikTok/Shorts optimized' if user_tier == 'creator' else 'Professional ads optimized'}")
 
             # 1. Calculate Segments (8s blocks for Veo 3.1)
             num_segments = (duration + 7) // 8
             
-            # 2. Generate Script using Gemini with prompt enrichment
-            print(f"📜 Generating enriched script for {duration}s video ({num_segments} segments)...")
+            # For Creator tier: simpler structure (1-3 images for scene changes, no complex sequences)
+            # For Professional tier: complex sequences with multiple shots
+            images_per_segment = 1 if user_tier == "creator" else 3
+            
+            # 2. Generate Script using Gemini with tier-specific prompt enrichment
+            print(f"📜 Generating {user_tier.upper()} script for {duration}s video ({num_segments} segments)...")
             script = get_gemini().generate_video_script(
                 prompt=custom_prompt or generate_prompt(niche),
                 duration=duration,
                 num_segments=num_segments,
                 user_images=image_urls,
-                segment_duration=8  # Veo 3.1 uses 8s segments
+                segment_duration=8,  # Veo 3.1 uses 8s segments
+                user_tier=user_tier,
+                images_per_segment=images_per_segment
             )
             
-            # 3. Download user images if provided (for Veo 3.1 reference images)
+            # 3. Download user images if provided (now supports up to 18 images)
             user_pil_images = []
             if image_urls:
                 import httpx
                 from PIL import Image
-                for img_url in image_urls[:3]:  # Max 3 images for Veo 3.1
+                # VEO 3.1 supports up to 3 reference images per video, but we can distribute across segments
+                # For image generation with Gemini 3 Pro, we support up to 18 reference images
+                for img_url in image_urls[:18]:  # Support up to 18 images
                     try:
                         print(f"📥 Downloading user image: {img_url[:50]}...")
                         resp = httpx.get(img_url, timeout=30)
@@ -480,29 +557,50 @@ async def process_video_generation(
             import asyncio
             from concurrent.futures import ThreadPoolExecutor
             
-            async def process_shot(segment_index, shot_data, user_images_list):
+            async def process_shot(segment_index, shot_data, user_images_list, tier=user_tier):
                 """Helper to process a single shot: Image Gen -> Video Gen with Veo 3.1"""
                 shot_idx = shot_data.get("shot_index", 0)
                 img_prompt = shot_data.get("image_prompt")
                 vid_prompt = shot_data.get("video_prompt")
                 use_user_image_idx = shot_data.get("use_user_image_index")
                 shot_duration = shot_data.get("duration", 8)
+                scene_images = shot_data.get("scene_images", [])  # Additional scene variation prompts
                 
-                print(f"🎬 Processing Seg {segment_index} Shot {shot_idx}...")
+                print(f"🎬 Processing Seg {segment_index} Shot {shot_idx} ({tier.upper()} tier)...")
                 
                 loop = asyncio.get_running_loop()
                 
                 pil_image = None
-                reference_images = None
                 
                 # Check if we should use a user-provided image
                 if use_user_image_idx is not None and use_user_image_idx < len(user_images_list):
                     print(f"  🖼️ Using user-provided image {use_user_image_idx} for this shot")
                     pil_image = user_images_list[use_user_image_idx]
                 else:
-                    # A. Generate Image with enriched prompt (Parallel)
+                    # A. Generate Image with Gemini 3 Pro using enriched prompt and reference images
                     print(f"  📸 Seg {segment_index} Shot {shot_idx}: Generating Image with gemini-3-pro-image-preview...")
-                    image_bytes = await loop.run_in_executor(None, get_gemini().generate_image, img_prompt)
+                    
+                    # For Creator tier: use 1-3 reference images for scene consistency
+                    # For Professional tier: use up to 3 images per segment for product/brand consistency
+                    ref_images_for_generation = None
+                    if tier == "creator" and len(user_images_list) > 0:
+                        # Creator: use first 3 user images as style reference
+                        ref_images_for_generation = user_images_list[:3]
+                    elif tier == "professional" and len(user_images_list) > 0:
+                        # Professional: distribute images across segments for brand consistency
+                        start_idx = (segment_index - 1) * 3 % len(user_images_list)
+                        ref_images_for_generation = user_images_list[start_idx:start_idx + 3]
+                    
+                    # Generate with reference images if available
+                    def generate_with_refs():
+                        return get_gemini().generate_image(
+                            prompt=img_prompt,
+                            reference_images=ref_images_for_generation,
+                            aspect_ratio="9:16",
+                            resolution="4K"  # 4K quality for both tiers
+                        )
+                    
+                    image_bytes = await loop.run_in_executor(None, generate_with_refs)
                     
                     if image_bytes:
                         from PIL import Image
@@ -619,6 +717,7 @@ async def process_video_generation(
             use_pro_model = (ai_model == "sora-2-pro")
             model_variant = "PRO" if use_pro_model else "STANDARD"
             print(f"🎥 Using Sora 2 API ({model_variant} mode) with Parallel Advanced Scripting")
+            print(f"🎨 User tier: {user_tier} - {'TikTok/Shorts optimized' if user_tier == 'creator' else 'Professional ads optimized'}")
 
             def quality_to_sora_params(q: str):
                 # Map simple: basic => default, pro_720p => size 1280x720, pro_1080p => size 1920x1080
@@ -633,22 +732,28 @@ async def process_video_generation(
             # 1. Calculate Segments (10s blocks for Sora)
             num_segments = (duration + 9) // 10
             
-            # 2. Generate Script using Gemini with prompt enrichment
-            print(f"📜 Generating enriched script for {duration}s video ({num_segments} segments)...")
+            # For Creator tier: simpler structure (1-3 images for scene changes)
+            # For Professional tier: complex sequences with multiple shots
+            images_per_segment = 1 if user_tier == "creator" else 3
+            
+            # 2. Generate Script using Gemini with tier-specific prompt enrichment
+            print(f"📜 Generating {user_tier.upper()} script for {duration}s video ({num_segments} segments)...")
             script = get_gemini().generate_video_script(
                 prompt=custom_prompt or generate_prompt(niche),
                 duration=duration,
                 num_segments=num_segments,
                 user_images=image_urls,
-                segment_duration=10  # Sora uses 10s segments
+                segment_duration=10,  # Sora uses 10s segments
+                user_tier=user_tier,
+                images_per_segment=images_per_segment
             )
             
-            # 3. Download user images if provided
+            # 3. Download user images if provided (now supports up to 18 images)
             user_pil_images = []
             if image_urls:
                 import httpx
                 from PIL import Image
-                for img_url in image_urls[:3]:  # Max 3 images
+                for img_url in image_urls[:18]:  # Support up to 18 images
                     try:
                         print(f"📥 Downloading user image: {img_url[:50]}...")
                         resp = httpx.get(img_url, timeout=30)
@@ -659,15 +764,16 @@ async def process_video_generation(
             import asyncio
             from concurrent.futures import ThreadPoolExecutor
             
-            async def process_sora_shot(segment_index, shot_data, user_images_list):
+            async def process_sora_shot(segment_index, shot_data, user_images_list, tier=user_tier):
                 """Helper to process a single shot: Image Gen -> Video Gen with Sora 2"""
                 shot_idx = shot_data.get("shot_index", 0)
                 img_prompt = shot_data.get("image_prompt")
                 vid_prompt = shot_data.get("video_prompt")
                 use_user_image_idx = shot_data.get("use_user_image_index")
                 shot_duration = shot_data.get("duration", 10)
+                scene_images = shot_data.get("scene_images", [])  # Additional scene variation prompts
                 
-                print(f"🎬 Processing Seg {segment_index} Shot {shot_idx}...")
+                print(f"🎬 Processing Seg {segment_index} Shot {shot_idx} ({tier.upper()} tier)...")
                 
                 loop = asyncio.get_running_loop()
                 
@@ -682,9 +788,29 @@ async def process_video_generation(
                         user_images_list[use_user_image_idx].save(tmp.name)
                         input_reference = tmp.name
                 else:
-                    # A. Generate Image with enriched prompt (Parallel)
+                    # A. Generate Image with Gemini 3 Pro using enriched prompt and reference images
                     print(f"  📸 Seg {segment_index} Shot {shot_idx}: Generating Image with gemini-3-pro-image-preview...")
-                    image_bytes = await loop.run_in_executor(None, get_gemini().generate_image, img_prompt)
+                    
+                    # Select reference images based on tier
+                    ref_images_for_generation = None
+                    if tier == "creator" and len(user_images_list) > 0:
+                        # Creator: use first 3 user images as style reference
+                        ref_images_for_generation = user_images_list[:3]
+                    elif tier == "professional" and len(user_images_list) > 0:
+                        # Professional: distribute images across segments for brand consistency
+                        start_idx = (segment_index - 1) * 3 % len(user_images_list)
+                        ref_images_for_generation = user_images_list[start_idx:start_idx + 3]
+                    
+                    # Generate with reference images if available
+                    def generate_with_refs():
+                        return get_gemini().generate_image(
+                            prompt=img_prompt,
+                            reference_images=ref_images_for_generation,
+                            aspect_ratio="9:16",
+                            resolution="4K"  # 4K quality for both tiers
+                        )
+                    
+                    image_bytes = await loop.run_in_executor(None, generate_with_refs)
                     
                     if image_bytes:
                         # Save generated image for Sora input
@@ -849,24 +975,17 @@ def health():
 
 @app.post("/api/videos/generate", response_model=VideoResponse)
 async def generate_video(req: VideoRequest, background_tasks: BackgroundTasks, request: Request):
-    """Endpoint principal : génère une vidéo de durée variable"""
+    """
+    Endpoint principal : génère une vidéo de durée variable
+    
+    Handles two user tiers:
+    - CREATOR tier: Fixed duration (8s VEO, 10s Sora), TikTok/Shorts optimized
+    - PROFESSIONAL tier: Variable duration, ad-optimized
+    """
     # Auth: derive user_id from JWT
     token_user_id = await _get_authenticated_user_id(request)
     # Security: ignore body user_id and use token subject
     req.user_id = token_user_id
-
-    # Validate model/duration
-    _validate_duration_and_model(req.duration, req.ai_model)
-    
-    if not req.niche and not req.custom_prompt:
-        raise HTTPException(status_code=400, detail="Either niche or custom_prompt is required")
-    
-    # Calculate clips based on model (8s for Veo 3.1/fast, 10s for Sora)
-    if req.ai_model in ("veo-3.1-generate-preview", "veo-3.1-fast-generate-preview"):
-        num_clips = (req.duration + 7) // 8
-    else:
-        num_clips = (req.duration + 9) // 10
-    required_credits = calculate_credits_cost(req.duration, req.quality, req.ai_model)
     
     try:
         user = get_supabase().table("profiles").select("*").eq("id", req.user_id).execute()
@@ -882,11 +1001,32 @@ async def generate_video(req: VideoRequest, background_tasks: BackgroundTasks, r
             user = get_supabase().table("profiles").select("*").eq("id", req.user_id).execute()
         
         user_data = user.data[0]
-        print(f"👤 User: {req.user_id}, Credits: {user_data['credits']}, Plan: {user_data['plan']}")
+        user_plan = user_data.get("plan", "free")
+        user_tier = get_user_tier(user_plan)
+        print(f"👤 User: {req.user_id}, Credits: {user_data['credits']}, Plan: {user_plan}, Tier: {user_tier}")
         
     except Exception as e:
         print(f"❌ Error checking user: {e}")
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+    
+    # For CREATOR tier: Force fixed duration (no choice)
+    if is_creator_plan(user_plan):
+        fixed_duration = get_fixed_duration_for_creator(req.ai_model)
+        req.duration = fixed_duration
+        print(f"👤 Creator tier detected - forcing duration to {fixed_duration}s")
+
+    # Validate model/duration
+    _validate_duration_and_model(req.duration, req.ai_model)
+    
+    if not req.niche and not req.custom_prompt:
+        raise HTTPException(status_code=400, detail="Either niche or custom_prompt is required")
+    
+    # Calculate clips based on model (8s for Veo 3.1/fast, 10s for Sora)
+    if req.ai_model in ("veo-3.1-generate-preview", "veo-3.1-fast-generate-preview"):
+        num_clips = (req.duration + 7) // 8
+    else:
+        num_clips = (req.duration + 9) // 10
+    required_credits = calculate_credits_cost(req.duration, req.quality, req.ai_model)
     
     # Deduct credits atomically BEFORE scheduling work (backend source of truth)
     try:
@@ -917,7 +1057,8 @@ async def generate_video(req: VideoRequest, background_tasks: BackgroundTasks, r
                 "num_clips": num_clips,
                 "target_duration": req.duration,
                 "custom_prompt": req.custom_prompt,
-                "ai_model": req.ai_model
+                "ai_model": req.ai_model,
+                "user_tier": user_tier
             })
         }).execute()
         
@@ -939,7 +1080,8 @@ async def generate_video(req: VideoRequest, background_tasks: BackgroundTasks, r
         None,
         None,
         "text-to-video",
-        req.ai_model
+        req.ai_model,
+        user_tier  # Pass user tier for differentiated prompts
     )
     
     estimated_time = num_clips * 40
@@ -953,29 +1095,18 @@ async def generate_video(req: VideoRequest, background_tasks: BackgroundTasks, r
 
 @app.post("/api/videos/generate-advanced")
 async def generate_video_advanced(req: VideoRequestAdvanced, background_tasks: BackgroundTasks, request: Request):
-    """Endpoint avancé : supporte storyboard, image-to-video, etc."""
+    """
+    Endpoint avancé : supporte storyboard, image-to-video, etc.
+    
+    Handles two user tiers:
+    - CREATOR tier: Fixed duration (8s VEO, 10s Sora), TikTok/Shorts optimized, 1-3 images
+    - PROFESSIONAL tier: Variable duration, ad-optimized, multiple sequences
+    """
     # Auth: derive user_id from JWT
     token_user_id = await _get_authenticated_user_id(request)
     req.user_id = token_user_id
 
-    # Calculer la durée totale pour storyboard
-    if req.model_type == "storyboard" and req.shots:
-        total_duration = sum(shot.duration for shot in req.shots)
-        req.duration = int(total_duration)
-    # Validate model/duration
-    _validate_duration_and_model(req.duration, req.ai_model)
-    
-    if req.model_type != "storyboard":
-        if not req.niche and not req.custom_prompt:
-            raise HTTPException(status_code=400, detail="Either niche or custom_prompt is required")
-    
-    # Additional server-side validations
-    _validate_image_urls(req.image_urls)
-
-    # Calculer le coût
-    required_credits = calculate_credits_cost(req.duration, req.quality, req.ai_model)
-    
-    # Vérifier user et crédits
+    # Vérifier user pour déterminer le tier
     try:
         user = get_supabase().table("profiles").select("*").eq("id", req.user_id).execute()
         
@@ -989,7 +1120,37 @@ async def generate_video_advanced(req: VideoRequestAdvanced, background_tasks: B
             user = get_supabase().table("profiles").select("*").eq("id", req.user_id).execute()
         
         user_data = user.data[0]
+        user_plan = user_data.get("plan", "free")
+        user_tier = get_user_tier(user_plan)
         
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+    
+    # For CREATOR tier: Force fixed duration (no choice)
+    if is_creator_plan(user_plan):
+        fixed_duration = get_fixed_duration_for_creator(req.ai_model)
+        req.duration = fixed_duration
+        print(f"👤 Creator tier detected - forcing duration to {fixed_duration}s")
+
+    # Calculer la durée totale pour storyboard
+    if req.model_type == "storyboard" and req.shots:
+        total_duration = sum(shot.duration for shot in req.shots)
+        req.duration = int(total_duration)
+    
+    # Validate model/duration
+    _validate_duration_and_model(req.duration, req.ai_model)
+    
+    if req.model_type != "storyboard":
+        if not req.niche and not req.custom_prompt:
+            raise HTTPException(status_code=400, detail="Either niche or custom_prompt is required")
+    
+    # Additional server-side validations - now supports up to 18 images
+    _validate_image_urls(req.image_urls, max_images=18)
+
+    # Calculer le coût
+    required_credits = calculate_credits_cost(req.duration, req.quality, req.ai_model)
+    
+    try:
         # Deduct credits BEFORE scheduling generation
         decrement = get_supabase().rpc("decrement_credits", {
             "p_user_id": req.user_id,
@@ -1015,8 +1176,10 @@ async def generate_video_advanced(req: VideoRequestAdvanced, background_tasks: B
             "metadata": json.dumps({
                 "model_type": req.model_type,
                 "has_images": bool(req.image_urls),
+                "num_images": len(req.image_urls) if req.image_urls else 0,
                 "num_shots": len(req.shots) if req.shots else 0,
-                "ai_model": req.ai_model
+                "ai_model": req.ai_model,
+                "user_tier": user_tier
             })
         }).execute()
         
@@ -1025,7 +1188,7 @@ async def generate_video_advanced(req: VideoRequestAdvanced, background_tasks: B
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
     
-    # Lancer génération
+    # Lancer génération with user_tier
     shots_dict = [shot.dict() for shot in req.shots] if req.shots else None
     
     background_tasks.add_task(
@@ -1039,7 +1202,8 @@ async def generate_video_advanced(req: VideoRequestAdvanced, background_tasks: B
         req.image_urls,
         shots_dict,
         req.model_type,
-        req.ai_model
+        req.ai_model,
+        user_tier  # Pass user tier for differentiated prompts
     )
     
     estimated_time = (len(req.shots) if req.shots else 1) * 40
@@ -1112,6 +1276,72 @@ async def get_user_info(user_id: str, request: Request):
             raise HTTPException(status_code=404, detail="User not found")
         
         return user.data
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/users/{user_id}/tier")
+async def get_user_tier_info(user_id: str, request: Request):
+    """
+    Get user tier information for frontend to adapt UI.
+    
+    Returns:
+        - plan: Current plan name
+        - tier: "creator" or "professional"
+        - is_creator: Boolean for quick check
+        - fixed_duration: Fixed duration if creator tier (null for professional)
+        - max_images: Maximum images allowed (18 for all)
+        - features: Dictionary of tier-specific features
+    """
+    try:
+        # Require auth and ensure user matches token
+        token_user_id = await _get_authenticated_user_id(request)
+        if token_user_id != user_id:
+            raise HTTPException(status_code=403, detail="Forbidden")
+        
+        user = get_supabase().table("profiles").select("plan, credits").eq("id", user_id).single().execute()
+        
+        if not user.data:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        plan = user.data.get("plan", "free")
+        credits = user.data.get("credits", 0)
+        tier = get_user_tier(plan)
+        is_creator = is_creator_plan(plan)
+        
+        # Build tier-specific features
+        if is_creator:
+            features = {
+                "duration_selection": False,  # Creator tier cannot select duration
+                "fixed_duration_veo": 8,
+                "fixed_duration_sora": 10,
+                "prompt_style": "viral_tiktok_shorts",
+                "sequences": False,  # No complex sequences
+                "max_images_per_segment": 3,
+                "description": "Optimized for TikTok and YouTube Shorts content"
+            }
+        else:
+            features = {
+                "duration_selection": True,  # Professional can select duration
+                "min_duration": 6,
+                "max_duration": 60,
+                "prompt_style": "professional_advertising",
+                "sequences": True,  # Complex multi-sequence videos
+                "max_images_per_segment": 6,
+                "description": "Optimized for professional ads and commercials"
+            }
+        
+        return {
+            "plan": plan,
+            "tier": tier,
+            "is_creator": is_creator,
+            "credits": credits,
+            "max_images": 18,  # Both tiers support up to 18 reference images
+            "features": features
+        }
+        
     except HTTPException:
         raise
     except Exception as e:
@@ -1492,28 +1722,56 @@ async def get_youtube_status(request: Request):
 
 @app.post("/api/stripe/create-checkout")
 async def create_checkout_session(req: CheckoutRequest, request: Request):
-    """Créer une session Stripe Checkout pour abonnement"""
+    """
+    Créer une session Stripe Checkout pour abonnement
+    
+    Supports both PROFESSIONAL and CREATOR tier plans:
+    
+    PROFESSIONAL plans (existing):
+    - starter: For professional ad creation
+    - pro: Enhanced professional features
+    - max: Maximum professional features
+    
+    CREATOR plans (new):
+    - creator_basic: 34.99€/month, 100 credits (10 videos of 10s)
+    - creator_pro: 65.99€/month, 200 credits (20 videos of 10s)
+    - creator_max: 89.99€/month, 300 credits (30 videos of 10s)
+    """
     # Auth: derive user_id from JWT and ignore body value
     token_user_id = await _get_authenticated_user_id(request)
     req.user_id = token_user_id
 
-    price_ids = {
+    # Professional tier price IDs
+    professional_price_ids = {
         "starter": os.getenv("STRIPE_PRICE_STARTER"),
         "pro": os.getenv("STRIPE_PRICE_PRO"),
         "max": os.getenv("STRIPE_PRICE_MAX")
     }
     
-    if req.plan not in price_ids:
-        raise HTTPException(status_code=400, detail="Invalid plan")
+    # Creator tier price IDs (new)
+    creator_price_ids = {
+        "creator_basic": os.getenv("STRIPE_PRICE_CREATOR_BASIC"),
+        "creator_pro": os.getenv("STRIPE_PRICE_CREATOR_PRO"),
+        "creator_max": os.getenv("STRIPE_PRICE_CREATOR_MAX")
+    }
     
-    if not price_ids[req.plan]:
+    # Combine all price IDs
+    all_price_ids = {**professional_price_ids, **creator_price_ids}
+    
+    if req.plan not in all_price_ids:
+        raise HTTPException(status_code=400, detail=f"Invalid plan. Valid plans: {', '.join(all_price_ids.keys())}")
+    
+    if not all_price_ids[req.plan]:
         raise HTTPException(status_code=500, detail=f"Price ID for {req.plan} not configured")
+    
+    # Determine tier type for metadata
+    tier_type = "creator" if req.plan in creator_price_ids else "professional"
     
     try:
         session = stripe.checkout.Session.create(
             payment_method_types=['card'],
             line_items=[{
-                'price': price_ids[req.plan],
+                'price': all_price_ids[req.plan],
                 'quantity': 1,
             }],
             mode='subscription',
@@ -1523,6 +1781,7 @@ async def create_checkout_session(req: CheckoutRequest, request: Request):
             metadata={
                 'user_id': req.user_id,
                 'plan': req.plan,
+                'tier_type': tier_type,
                 'type': 'subscription'
             }
         )
@@ -1629,24 +1888,40 @@ async def stripe_webhook(request: Request):
         
         elif metadata.get('type') == 'subscription':
             plan = metadata.get('plan')
+            tier_type = metadata.get('tier_type', 'professional')
             
-            credits_map = {
+            # Credits mapping for both tiers
+            # Professional plans (existing)
+            professional_credits_map = {
                 "starter": 600,
                 "pro": 1200,
                 "max": 1800
             }
             
-            print(f"✅ Subscription {plan} for user {user_id}")
+            # Creator plans (new) - 1 credit = 1 video of 10s
+            # creator_basic: 34.99€/month = 100 credits (10 videos)
+            # creator_pro: 65.99€/month = 200 credits (20 videos)
+            # creator_max: 89.99€/month = 300 credits (30 videos)
+            creator_credits_map = {
+                "creator_basic": 100,
+                "creator_pro": 200,
+                "creator_max": 300
+            }
+            
+            # Combined credits map
+            credits_map = {**professional_credits_map, **creator_credits_map}
+            
+            print(f"✅ Subscription {plan} ({tier_type} tier) for user {user_id}")
             
             try:
                 get_supabase().table("profiles").update({
                     "plan": plan,
-                    "credits": credits_map.get(plan, 600),
+                    "credits": credits_map.get(plan, 100 if tier_type == "creator" else 600),
                     "stripe_customer_id": session.get('customer'),
                     "stripe_subscription_id": session.get('subscription')
                 }).eq("id", user_id).execute()
                 
-                print(f"✅ User {user_id} upgraded to {plan} with {credits_map.get(plan)} credits")
+                print(f"✅ User {user_id} upgraded to {plan} ({tier_type} tier) with {credits_map.get(plan)} credits")
             except Exception as e:
                 print(f"❌ Error updating user: {e}")
     
@@ -1660,17 +1935,30 @@ async def stripe_webhook(request: Request):
                 
                 if user.data:
                     plan = user.data['plan']
-                    credits_map = {
+                    
+                    # Credits mapping for both tiers
+                    professional_credits_map = {
                         "starter": 600,
                         "pro": 1200,
                         "max": 1800
                     }
                     
+                    creator_credits_map = {
+                        "creator_basic": 100,
+                        "creator_pro": 200,
+                        "creator_max": 300
+                    }
+                    
+                    credits_map = {**professional_credits_map, **creator_credits_map}
+                    
+                    # Determine tier for logging
+                    tier_type = "creator" if plan in creator_credits_map else "professional"
+                    
                     get_supabase().table("profiles").update({
-                        "credits": credits_map.get(plan, 600)
+                        "credits": credits_map.get(plan, 100 if tier_type == "creator" else 600)
                     }).eq("id", user.data['id']).execute()
                     
-                    print(f"✅ Monthly credits recharged for user {user.data['id']}: {credits_map.get(plan)} credits")
+                    print(f"✅ Monthly credits recharged for {tier_type} user {user.data['id']}: {credits_map.get(plan)} credits")
             except Exception as e:
                 print(f"❌ Error recharging credits: {e}")
     

@@ -249,9 +249,31 @@ CREATE TRIGGER update_profiles_updated_at
 -- - Authenticated users can read/download from vykso-videos
 
 -- ============================================
--- CREDITS MAPPING (référence - 1 crédit = 1 seconde)
+-- CREDITS MAPPING - TWO TIER SYSTEM
 -- ============================================
+
+-- ============================================
+-- PROFESSIONAL TIER (for ads/commercials)
+-- ============================================
+-- Variable duration (6-60s), multiple sequences, ad-optimized prompts
 -- Plan Starter (Premium): 600 crédits = 10 minutes
 -- Plan Pro: 1200 crédits = 20 minutes
 -- Plan Max: 1800 crédits = 30 minutes
+
+-- ============================================
+-- CREATOR TIER (for TikTok/YouTube Shorts)
+-- ============================================
+-- Fixed duration (10s Sora, 8s VEO), no duration selection, viral prompts
+-- Plan creator_basic: 34.99€/month = 100 crédits = 10 videos de 10s
+-- Plan creator_pro: 65.99€/month = 200 crédits = 20 videos de 10s  
+-- Plan creator_max: 89.99€/month = 300 crédits = 30 videos de 10s
+
 -- Free: 10 crédits par défaut (pour tester)
+
+-- ============================================
+-- PLAN VALUES FOR profiles.plan COLUMN
+-- ============================================
+-- Professional tier plans:
+--   'free', 'starter', 'pro', 'max'
+-- Creator tier plans:
+--   'creator_basic', 'creator_pro', 'creator_max'
