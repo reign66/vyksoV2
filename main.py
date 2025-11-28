@@ -22,6 +22,16 @@ from starlette.requests import Request as StarletteRequest
 from starlette.responses import StreamingResponse as StarletteStreamingResponse
 from urllib.parse import urlparse
 
+# Import new Stripe configuration and routes
+from config.stripe_config import get_stripe_config, get_plan_type
+from routes.checkout import router as checkout_router
+from routes.webhook import router as webhook_router
+from services.supabase_service import (
+    update_user_subscription,
+    add_credits_to_user,
+    get_user_by_stripe_subscription,
+)
+
 app = FastAPI(
     title="Vykso API",
     description="API de génération vidéo automatique via Sora 2",
@@ -42,6 +52,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Include Stripe routes
+# IMPORTANT: Webhook route must be included to receive raw body for signature verification
+app.include_router(checkout_router)
+app.include_router(webhook_router)
 
 # Clients - Lazy initialization to prevent startup crashes
 # These will be initialized on first use, allowing the server to start
@@ -1725,66 +1740,106 @@ async def create_checkout_session(req: CheckoutRequest, request: Request):
     """
     Créer une session Stripe Checkout pour abonnement
     
-    Supports both PROFESSIONAL and CREATOR tier plans:
+    Supports both PROFESSIONAL and CREATOR tier plans with monthly AND yearly billing:
     
-    PROFESSIONAL plans (existing):
-    - starter: For professional ad creation
-    - pro: Enhanced professional features
-    - max: Maximum professional features
+    PROFESSIONAL plans:
+    - starter: 199€/month or 179€/month yearly (600 credits)
+    - pro: 589€/month or 530€/month yearly (1200 credits)
+    - max: 1199€/month or 1079€/month yearly (1800 credits)
     
-    CREATOR plans (new):
-    - creator_basic: 34.99€/month, 100 credits (10 videos of 10s)
-    - creator_pro: 65.99€/month, 200 credits (20 videos of 10s)
-    - creator_max: 89.99€/month, 300 credits (30 videos of 10s)
+    CREATOR plans:
+    - creator_basic: 34.99€/month or 31.49€/month yearly (100 credits)
+    - creator_pro: 65.99€/month or 59.39€/month yearly (200 credits)
+    - creator_max: 89.99€/month or 80.99€/month yearly (300 credits)
+    
+    Plan names can include interval suffix: 'creator_basic_yearly', 'pro_annual', etc.
     """
     # Auth: derive user_id from JWT and ignore body value
     token_user_id = await _get_authenticated_user_id(request)
     req.user_id = token_user_id
-
-    # Professional tier price IDs
-    professional_price_ids = {
-        "starter": os.getenv("STRIPE_PRICE_STARTER"),
-        "pro": os.getenv("STRIPE_PRICE_PRO"),
-        "max": os.getenv("STRIPE_PRICE_MAX")
-    }
     
-    # Creator tier price IDs (new)
-    creator_price_ids = {
-        "creator_basic": os.getenv("STRIPE_PRICE_CREATOR_BASIC"),
-        "creator_pro": os.getenv("STRIPE_PRICE_CREATOR_PRO"),
-        "creator_max": os.getenv("STRIPE_PRICE_CREATOR_MAX")
-    }
+    config = get_stripe_config()
     
-    # Combine all price IDs
-    all_price_ids = {**professional_price_ids, **creator_price_ids}
+    # Parse plan name and interval
+    plan_name = req.plan
+    interval = "monthly"
     
-    if req.plan not in all_price_ids:
-        raise HTTPException(status_code=400, detail=f"Invalid plan. Valid plans: {', '.join(all_price_ids.keys())}")
+    # Check for interval suffix
+    if plan_name.endswith("_yearly") or plan_name.endswith("_annual"):
+        interval = "yearly" if plan_name.endswith("_yearly") else "annual"
+        plan_name = plan_name.replace("_yearly", "").replace("_annual", "")
     
-    if not all_price_ids[req.plan]:
-        raise HTTPException(status_code=500, detail=f"Price ID for {req.plan} not configured")
+    # Map plan name to price ID
+    price_id = None
+    
+    # Creator plans (use _YEARLY suffix)
+    if plan_name == "creator_basic":
+        price_id = config.PRICE_BASIC_YEARLY if interval in ["yearly", "annual"] else config.PRICE_BASIC_MONTHLY
+    elif plan_name == "creator_pro":
+        price_id = config.PRICE_PRO_YEARLY if interval in ["yearly", "annual"] else config.PRICE_PRO_MONTHLY
+    elif plan_name == "creator_max":
+        price_id = config.PRICE_MAX_YEARLY if interval in ["yearly", "annual"] else config.PRICE_MAX_MONTHLY
+    # Professional plans (use _ANNUAL suffix)
+    elif plan_name == "starter":
+        price_id = config.PRICE_STARTER_ANNUAL if interval in ["yearly", "annual"] else config.PRICE_STARTER
+    elif plan_name == "pro":
+        price_id = config.PRICE_PRO_ANNUAL if interval in ["yearly", "annual"] else config.PRICE_PRO
+    elif plan_name == "max":
+        price_id = config.PRICE_MAX_ANNUAL if interval in ["yearly", "annual"] else config.PRICE_MAX
+    
+    if not price_id:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Invalid plan: {req.plan}. Valid plans: creator_basic, creator_pro, creator_max, starter, pro, max (with optional _yearly/_annual suffix)"
+        )
+    
+    # Get plan info from config
+    plan_info = get_plan_type(price_id)
+    if not plan_info:
+        raise HTTPException(status_code=500, detail=f"Price ID {price_id} not configured in Stripe")
     
     # Determine tier type for metadata
-    tier_type = "creator" if req.plan in creator_price_ids else "professional"
+    tier_type = plan_info['planFamily']
+    internal_plan_name = config.get_plan_name_from_price_id(price_id)
     
     try:
         session = stripe.checkout.Session.create(
             payment_method_types=['card'],
             line_items=[{
-                'price': all_price_ids[req.plan],
+                'price': price_id,
                 'quantity': 1,
             }],
             mode='subscription',
+            allow_promotion_codes=True,
             success_url=f"{os.getenv('FRONTEND_URL', 'https://vykso.lovable.app')}/payment-success?session_id={{CHECKOUT_SESSION_ID}}",
             cancel_url=f"{os.getenv('FRONTEND_URL', 'https://vykso.lovable.app')}/pricing",
             client_reference_id=req.user_id,
             metadata={
                 'user_id': req.user_id,
-                'plan': req.plan,
-                'tier_type': tier_type,
+                'userId': req.user_id,
+                'plan': internal_plan_name,
+                'tier': plan_info['tier'],
+                'planFamily': tier_type,
+                'interval': plan_info['interval'],
+                'credits': str(plan_info['credits']),
                 'type': 'subscription'
+            },
+            subscription_data={
+                'metadata': {
+                    'user_id': req.user_id,
+                    'userId': req.user_id,
+                    'plan': internal_plan_name,
+                    'tier': plan_info['tier'],
+                    'planFamily': tier_type,
+                    'credits': str(plan_info['credits']),
+                }
             }
         )
+        
+        print(f"✅ Checkout session created for {plan_info['name']}")
+        print(f"   Plan: {internal_plan_name} ({tier_type})")
+        print(f"   Interval: {plan_info['interval']}")
+        print(f"   Credits: {plan_info['credits']}")
         
         return {"checkout_url": session.url}
     
@@ -1844,9 +1899,14 @@ async def buy_credits(req: BuyCreditsRequest, request: Request):
         print(f"❌ Stripe error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/api/webhooks/stripe")
-async def stripe_webhook(request: Request):
-    """Webhook Stripe pour gérer les paiements"""
+@app.post("/api/webhooks/stripe-legacy")
+async def stripe_webhook_legacy(request: Request):
+    """
+    Legacy Webhook Stripe endpoint (kept for backward compatibility).
+    
+    The main webhook handler is now in routes/webhook.py
+    This endpoint handles the same events but with the old logic.
+    """
     
     payload = await request.body()
     sig_header = request.headers.get('stripe-signature')
@@ -1862,12 +1922,13 @@ async def stripe_webhook(request: Request):
         print(f"❌ Invalid signature: {e}")
         raise HTTPException(status_code=400, detail="Invalid signature")
     
-    print(f"📨 Received Stripe webhook: {event['type']}")
+    config = get_stripe_config()
+    print(f"📨 Received Stripe webhook (legacy): {event['type']}")
     
     if event['type'] == 'checkout.session.completed':
         session = event['data']['object']
         metadata = session.get('metadata', {})
-        user_id = metadata.get('user_id')
+        user_id = metadata.get('user_id') or metadata.get('userId')
         
         if metadata.get('type') == 'credit_purchase':
             credits_to_add = int(metadata.get('credits', 0))
@@ -1875,92 +1936,109 @@ async def stripe_webhook(request: Request):
             print(f"💳 Credit purchase: {credits_to_add} credits for user {user_id}")
             
             try:
-                user = get_supabase().table("profiles").select("credits").eq("id", user_id).single().execute()
-                current_credits = user.data.get('credits', 0)
-                
-                get_supabase().table("profiles").update({
-                    "credits": current_credits + credits_to_add
-                }).eq("id", user_id).execute()
-                
-                print(f"✅ Added {credits_to_add} credits to user {user_id} (total: {current_credits + credits_to_add})")
+                add_credits_to_user(user_id, credits_to_add)
+                print(f"✅ Added {credits_to_add} credits to user {user_id}")
             except Exception as e:
                 print(f"❌ Error adding credits: {e}")
         
         elif metadata.get('type') == 'subscription':
+            subscription_id = session.get('subscription')
+            customer_id = session.get('customer')
+            
+            # Get plan info from metadata or fetch from Stripe
             plan = metadata.get('plan')
-            tier_type = metadata.get('tier_type', 'professional')
+            tier_type = metadata.get('planFamily') or metadata.get('tier_type', 'professional')
+            credits = int(metadata.get('credits', 0))
             
-            # Credits mapping for both tiers
-            # Professional plans (existing)
-            professional_credits_map = {
-                "starter": 600,
-                "pro": 1200,
-                "max": 1800
-            }
+            # If credits not in metadata, get from config
+            if credits == 0:
+                credits = config.get_credits_for_plan(plan)
             
-            # Creator plans (new) - 1 credit = 1 video of 10s
-            # creator_basic: 34.99€/month = 100 credits (10 videos)
-            # creator_pro: 65.99€/month = 200 credits (20 videos)
-            # creator_max: 89.99€/month = 300 credits (30 videos)
-            creator_credits_map = {
-                "creator_basic": 100,
-                "creator_pro": 200,
-                "creator_max": 300
-            }
-            
-            # Combined credits map
-            credits_map = {**professional_credits_map, **creator_credits_map}
+            # Fallback to old mapping if still 0
+            if credits == 0:
+                professional_credits_map = {
+                    "starter": 600, "starter_annual": 600,
+                    "pro": 1200, "pro_annual": 1200,
+                    "max": 1800, "max_annual": 1800
+                }
+                creator_credits_map = {
+                    "creator_basic": 100, "creator_basic_yearly": 100,
+                    "creator_pro": 200, "creator_pro_yearly": 200,
+                    "creator_max": 300, "creator_max_yearly": 300
+                }
+                credits_map = {**professional_credits_map, **creator_credits_map}
+                credits = credits_map.get(plan, 100 if tier_type == "creator" else 600)
             
             print(f"✅ Subscription {plan} ({tier_type} tier) for user {user_id}")
             
             try:
-                get_supabase().table("profiles").update({
-                    "plan": plan,
-                    "credits": credits_map.get(plan, 100 if tier_type == "creator" else 600),
-                    "stripe_customer_id": session.get('customer'),
-                    "stripe_subscription_id": session.get('subscription')
-                }).eq("id", user_id).execute()
+                update_user_subscription(user_id, {
+                    'plan': plan,
+                    'credits': credits,
+                    'stripe_customer_id': customer_id,
+                    'stripe_subscription_id': subscription_id,
+                    'status': 'active',
+                    'plan_family': tier_type,
+                })
                 
-                print(f"✅ User {user_id} upgraded to {plan} ({tier_type} tier) with {credits_map.get(plan)} credits")
+                print(f"✅ User {user_id} upgraded to {plan} ({tier_type} tier) with {credits} credits")
             except Exception as e:
                 print(f"❌ Error updating user: {e}")
     
     elif event['type'] == 'invoice.payment_succeeded':
         invoice = event['data']['object']
         subscription_id = invoice.get('subscription')
+        billing_reason = invoice.get('billing_reason')
         
-        if subscription_id:
+        if subscription_id and billing_reason == 'subscription_cycle':
             try:
-                user = get_supabase().table("profiles").select("*").eq("stripe_subscription_id", subscription_id).single().execute()
+                user = get_user_by_stripe_subscription(subscription_id)
                 
-                if user.data:
-                    plan = user.data['plan']
+                if user:
+                    plan = user.get('plan', 'free')
                     
-                    # Credits mapping for both tiers
-                    professional_credits_map = {
-                        "starter": 600,
-                        "pro": 1200,
-                        "max": 1800
-                    }
+                    # Get credits from config
+                    credits = config.get_credits_for_plan(plan)
                     
-                    creator_credits_map = {
-                        "creator_basic": 100,
-                        "creator_pro": 200,
-                        "creator_max": 300
-                    }
+                    # Fallback to old mapping
+                    if credits == 0:
+                        professional_credits_map = {
+                            "starter": 600, "starter_annual": 600,
+                            "pro": 1200, "pro_annual": 1200,
+                            "max": 1800, "max_annual": 1800
+                        }
+                        creator_credits_map = {
+                            "creator_basic": 100, "creator_basic_yearly": 100,
+                            "creator_pro": 200, "creator_pro_yearly": 200,
+                            "creator_max": 300, "creator_max_yearly": 300
+                        }
+                        credits_map = {**professional_credits_map, **creator_credits_map}
+                        tier_type = "creator" if plan.startswith("creator_") else "professional"
+                        credits = credits_map.get(plan, 100 if tier_type == "creator" else 600)
                     
-                    credits_map = {**professional_credits_map, **creator_credits_map}
+                    update_user_subscription(user['id'], {'credits': credits})
                     
-                    # Determine tier for logging
-                    tier_type = "creator" if plan in creator_credits_map else "professional"
-                    
-                    get_supabase().table("profiles").update({
-                        "credits": credits_map.get(plan, 100 if tier_type == "creator" else 600)
-                    }).eq("id", user.data['id']).execute()
-                    
-                    print(f"✅ Monthly credits recharged for {tier_type} user {user.data['id']}: {credits_map.get(plan)} credits")
+                    print(f"✅ Monthly credits recharged for user {user['id']}: {credits} credits")
             except Exception as e:
                 print(f"❌ Error recharging credits: {e}")
+    
+    elif event['type'] == 'customer.subscription.deleted':
+        subscription = event['data']['object']
+        metadata = subscription.get('metadata', {})
+        user_id = metadata.get('user_id') or metadata.get('userId')
+        
+        if not user_id:
+            user = get_user_by_stripe_subscription(subscription['id'])
+            if user:
+                user_id = user.get('id')
+        
+        if user_id:
+            print(f"🚫 Subscription canceled for user {user_id}")
+            update_user_subscription(user_id, {
+                'status': 'canceled',
+                'credits': 0,
+                'plan': 'free',
+            })
     
     return {"status": "success"}
 
