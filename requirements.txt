@@ -9,7 +9,7 @@ pydantic-settings==2.5.2
 stripe==8.0.0
 python-multipart==0.0.9
 openai==1.51.2
-google-genai==0.3.0
+google-genai>=1.50.0
 google-auth
 google-auth-oauthlib
 google-api-python-client

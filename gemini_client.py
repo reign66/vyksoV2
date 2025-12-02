@@ -56,7 +56,7 @@ class GeminiClient:
                 "response_modalities": ['TEXT', 'IMAGE'],  # Must include both per docs
                 "image_config": types.ImageConfig(
                     aspect_ratio=aspect_ratio,
-                    image_size=resolution
+                    image_size=resolution.lower()  # e.g. "1k", "2k", "4k"
                 )
             }
             
@@ -161,7 +161,7 @@ class GeminiClient:
                 config=types.GenerateContentConfig(
                     image_config=types.ImageConfig(
                         aspect_ratio=aspect_ratio,
-                        image_size=resolution
+                        image_size=resolution.lower()  # e.g. "1k", "2k", "4k"
                     ),
                 )
             )
@@ -777,7 +777,7 @@ Style: Cinematic, eye-catching, clickbait thumbnail style, designed for maximum 
                     response_modalities=['TEXT', 'IMAGE'],
                     image_config=types.ImageConfig(
                         aspect_ratio="9:16",
-                        image_size="2K"
+                        image_size="2k"  # lowercase per API requirements
                     )
                 )
             )
