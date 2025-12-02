@@ -29,13 +29,13 @@ class GeminiClient:
         use_google_search: bool = False
     ) -> bytes:
         """
-        Generates an image using Gemini 2.0 Flash Experimental model with image generation.
+        Generates an image using Gemini 3 Pro Image Preview model.
         
         Args:
             prompt: Text description of the image to generate
             reference_images: Optional list of PIL Images (up to 18) for reference
             aspect_ratio: Image aspect ratio ("1:1","2:3","3:2","3:4","4:3","4:5","5:4","9:16","16:9","21:9")
-            resolution: Image resolution ("1K", "2K", "4K")
+            resolution: Image resolution ("1K", "2K", "4K") - must be uppercase
             use_google_search: Whether to use Google Search for grounding (real-time data)
         
         Returns:
@@ -46,24 +46,32 @@ class GeminiClient:
             contents = [prompt]
             
             if reference_images:
-                # Gemini supports up to 14-18 reference images
+                # Gemini 3 Pro supports up to 14-18 reference images
                 for img in reference_images[:18]:
                     if isinstance(img, Image.Image):
                         contents.append(img)
             
+            # Normalize resolution to uppercase (API expects "1K", "2K", "4K")
+            resolution_normalized = resolution.upper()
+            if resolution_normalized not in ["1K", "2K", "4K"]:
+                resolution_normalized = "2K"  # Default
+            
             # Build config with image settings
             config_kwargs = {
                 "response_modalities": ['TEXT', 'IMAGE'],  # Must include both per docs
+                "image_config": types.ImageConfig(
+                    aspect_ratio=aspect_ratio,
+                    image_size=resolution_normalized  # Must be uppercase: "1K", "2K", "4K"
+                )
             }
             
             # Add Google Search tool if requested (for real-time data grounding)
             if use_google_search:
                 config_kwargs["tools"] = [{"google_search": {}}]
             
-            # Try gemini-2.0-flash-exp first (stable image generation)
-            model_to_use = 'gemini-2.0-flash-exp'
+            model_to_use = 'gemini-3-pro-image-preview'
             
-            print(f"  🎨 Using model {model_to_use} for image generation...")
+            print(f"  🎨 Using model {model_to_use} for image generation (aspect_ratio={aspect_ratio}, size={resolution_normalized})...")
             
             response = self.client.models.generate_content(
                 model=model_to_use,
@@ -79,7 +87,7 @@ class GeminiClient:
             text_content = []
             
             for part in response.parts:
-                # Skip thought parts (intermediate images)
+                # Skip thought parts (intermediate/thinking images)
                 if hasattr(part, 'thought') and part.thought:
                     continue
                 
@@ -91,10 +99,18 @@ class GeminiClient:
                 if hasattr(part, 'inline_data') and part.inline_data:
                     if part.inline_data.mime_type and 'image' in part.inline_data.mime_type:
                         print(f"  ✅ Found inline_data image with mime_type: {part.inline_data.mime_type}")
-                        image_bytes = base64.b64decode(part.inline_data.data)
+                        # inline_data.data can be bytes directly or base64 encoded string
+                        data = part.inline_data.data
+                        if isinstance(data, bytes):
+                            image_bytes = data
+                        elif isinstance(data, str):
+                            # Base64 encoded string
+                            image_bytes = base64.b64decode(data)
+                        else:
+                            print(f"  ⚠️ Unknown data type: {type(data)}")
                         break
                 
-                # Alternative: use as_image() helper
+                # Alternative: use as_image() helper (preferred method)
                 try:
                     image = part.as_image()
                     if image:
@@ -109,15 +125,21 @@ class GeminiClient:
                     pass
             
             # Fallback: check candidates structure
-            if not image_bytes and response.candidates and response.candidates[0].content.parts:
-                for part in response.candidates[0].content.parts:
-                    if hasattr(part, 'thought') and part.thought:
-                        continue
-                    if hasattr(part, 'inline_data') and part.inline_data:
-                        if hasattr(part.inline_data, 'mime_type') and part.inline_data.mime_type and 'image' in part.inline_data.mime_type:
-                            print(f"  ✅ Found image in candidates structure")
-                            image_bytes = base64.b64decode(part.inline_data.data)
-                            break
+            if not image_bytes and response.candidates and len(response.candidates) > 0:
+                candidate = response.candidates[0]
+                if hasattr(candidate, 'content') and candidate.content and hasattr(candidate.content, 'parts'):
+                    for part in candidate.content.parts:
+                        if hasattr(part, 'thought') and part.thought:
+                            continue
+                        if hasattr(part, 'inline_data') and part.inline_data:
+                            if hasattr(part.inline_data, 'mime_type') and part.inline_data.mime_type and 'image' in part.inline_data.mime_type:
+                                print(f"  ✅ Found image in candidates structure")
+                                data = part.inline_data.data
+                                if isinstance(data, bytes):
+                                    image_bytes = data
+                                elif isinstance(data, str):
+                                    image_bytes = base64.b64decode(data)
+                                break
             
             if not image_bytes:
                 print(f"  ⚠️ No image found in Gemini response")
@@ -128,8 +150,8 @@ class GeminiClient:
             # Validate the image bytes
             try:
                 test_image = Image.open(BytesIO(image_bytes))
-                test_image.verify()  # Verify it's a valid image
-                print(f"  ✅ Image validated: {test_image.format} {test_image.size if hasattr(test_image, 'size') else 'unknown size'}")
+                test_image.load()  # Force load to verify it's valid
+                print(f"  ✅ Image validated: {test_image.format}, size={test_image.size}")
             except Exception as validate_err:
                 print(f"  ❌ Image validation failed: {validate_err}")
                 print(f"  📊 Received {len(image_bytes)} bytes, first 50: {image_bytes[:50]}")
@@ -138,7 +160,7 @@ class GeminiClient:
             return image_bytes
             
         except Exception as e:
-            print(f"  ❌ Error generating image: {e}")
+            print(f"  ❌ Error generating image with gemini-3-pro-image-preview: {e}")
             import traceback
             traceback.print_exc()
             return None
@@ -162,7 +184,7 @@ class GeminiClient:
             config_kwargs["tools"] = [{"google_search": {}}]
         
         chat = self.client.chats.create(
-            model="gemini-2.0-flash-exp",
+            model="gemini-3-pro-image-preview",
             config=types.GenerateContentConfig(**config_kwargs)
         )
         
@@ -184,7 +206,7 @@ class GeminiClient:
             session_id: The chat session ID
             message: The instruction/prompt for this turn
             aspect_ratio: Desired aspect ratio for the output
-            resolution: Desired resolution ("1K", "2K", "4K")
+            resolution: Desired resolution ("1K", "2K", "4K") - must be uppercase
         
         Returns:
             Image bytes or None
@@ -193,13 +215,18 @@ class GeminiClient:
         if not chat:
             chat = self.create_image_chat(session_id)
         
+        # Normalize resolution to uppercase
+        resolution_normalized = resolution.upper()
+        if resolution_normalized not in ["1K", "2K", "4K"]:
+            resolution_normalized = "2K"
+        
         try:
             response = chat.send_message(
                 message,
                 config=types.GenerateContentConfig(
                     image_config=types.ImageConfig(
                         aspect_ratio=aspect_ratio,
-                        image_size=resolution.lower()  # e.g. "1k", "2k", "4k"
+                        image_size=resolution_normalized  # Must be uppercase: "1K", "2K", "4K"
                     ),
                 )
             )
@@ -208,6 +235,8 @@ class GeminiClient:
             for part in response.parts:
                 if hasattr(part, 'thought') and part.thought:
                     continue
+                
+                # Try as_image() first (preferred)
                 try:
                     image = part.as_image()
                     if image:
@@ -216,8 +245,15 @@ class GeminiClient:
                         return buffer.getvalue()
                 except:
                     pass
+                
+                # Fallback to inline_data
                 if hasattr(part, 'inline_data') and part.inline_data:
-                    return base64.b64decode(part.inline_data.data)
+                    if part.inline_data.mime_type and 'image' in part.inline_data.mime_type:
+                        data = part.inline_data.data
+                        if isinstance(data, bytes):
+                            return data
+                        elif isinstance(data, str):
+                            return base64.b64decode(data)
             
             return None
             
@@ -719,9 +755,9 @@ class GeminiClient:
                         image_bytes = base64.b64decode(prediction["bytesBase64Encoded"])
                         print("✅ Thumbnail generated successfully with Imagen 4.0")
             
-            # Fallback to gemini-2.0-flash-exp if Imagen fails
+            # Fallback to gemini-3-pro-image-preview if Imagen fails
             if not image_bytes:
-                print(f"⚠️ Imagen 4.0 failed (status: {response.status_code}), trying gemini-2.0-flash-exp...")
+                print(f"⚠️ Imagen 4.0 failed (status: {response.status_code}), trying gemini-3-pro-image-preview...")
                 image_bytes = self._generate_thumbnail_fallback(thumbnail_prompt)
             
             # Save thumbnail to /tmp/thumbnails/
@@ -875,15 +911,19 @@ Style: Cinematic, eye-catching, clickbait thumbnail style, designed for maximum 
     
     def _generate_thumbnail_fallback(self, prompt: str) -> bytes:
         """
-        Fallback thumbnail generation using gemini-2.0-flash-exp.
-        Uses proper API format with TEXT + IMAGE modalities.
+        Fallback thumbnail generation using gemini-3-pro-image-preview.
+        Uses proper API format with TEXT + IMAGE modalities and image config.
         """
         try:
             response = self.client.models.generate_content(
-                model='gemini-2.0-flash-exp',
+                model='gemini-3-pro-image-preview',
                 contents=prompt,
                 config=types.GenerateContentConfig(
                     response_modalities=['TEXT', 'IMAGE'],
+                    image_config=types.ImageConfig(
+                        aspect_ratio="9:16",
+                        image_size="2K"  # Uppercase as required by API
+                    )
                 )
             )
             
@@ -891,29 +931,43 @@ Style: Cinematic, eye-catching, clickbait thumbnail style, designed for maximum 
             for part in response.parts:
                 if hasattr(part, 'thought') and part.thought:
                     continue
+                
+                # Try as_image() first (preferred)
                 try:
                     image = part.as_image()
                     if image:
                         buffer = BytesIO()
                         image.save(buffer, format='PNG')
-                        print("✅ Thumbnail generated with fallback model (gemini-2.0-flash-exp)")
+                        print("✅ Thumbnail generated with gemini-3-pro-image-preview")
                         return buffer.getvalue()
                 except:
                     pass
+                
+                # Fallback to inline_data
                 if hasattr(part, 'inline_data') and part.inline_data:
                     if hasattr(part.inline_data, 'mime_type') and 'image' in str(part.inline_data.mime_type):
-                        print("✅ Thumbnail generated with fallback model (gemini-2.0-flash-exp)")
-                        return base64.b64decode(part.inline_data.data)
+                        print("✅ Thumbnail generated with gemini-3-pro-image-preview")
+                        data = part.inline_data.data
+                        if isinstance(data, bytes):
+                            return data
+                        elif isinstance(data, str):
+                            return base64.b64decode(data)
             
             # Fallback check candidates structure
-            if response.candidates and response.candidates[0].content.parts:
-                for part in response.candidates[0].content.parts:
-                    if hasattr(part, 'thought') and part.thought:
-                        continue
-                    if hasattr(part, 'inline_data') and part.inline_data:
-                        if hasattr(part.inline_data, 'mime_type') and 'image' in str(part.inline_data.mime_type):
-                            print("✅ Thumbnail generated with fallback model (gemini-2.0-flash-exp)")
-                            return base64.b64decode(part.inline_data.data)
+            if response.candidates and len(response.candidates) > 0:
+                candidate = response.candidates[0]
+                if hasattr(candidate, 'content') and candidate.content and hasattr(candidate.content, 'parts'):
+                    for part in candidate.content.parts:
+                        if hasattr(part, 'thought') and part.thought:
+                            continue
+                        if hasattr(part, 'inline_data') and part.inline_data:
+                            if hasattr(part.inline_data, 'mime_type') and 'image' in str(part.inline_data.mime_type):
+                                print("✅ Thumbnail generated with gemini-3-pro-image-preview")
+                                data = part.inline_data.data
+                                if isinstance(data, bytes):
+                                    return data
+                                elif isinstance(data, str):
+                                    return base64.b64decode(data)
             
             print("⚠️ No image found in fallback thumbnail response")
             return None

@@ -40,7 +40,7 @@
 *   **Aspect Ratio**: 16:9 or 9:16 (vertical for TikTok/Shorts).
 *   **Resolution**: 720p (default) or 1080p (only for 8s clips).
 *   **Reference Images**: Up to 3 images for style/content guidance.
-*   **Image Generation**: Uses gemini-2.0-flash-exp for high-quality images with native image generation support.
+*   **Image Generation**: Uses gemini-3-pro-image-preview for high-quality images with native image generation support.
 *   **Prompt Enrichment**: All prompts are automatically enriched before generation for professional quality.
 
 **Design Requirements**:
