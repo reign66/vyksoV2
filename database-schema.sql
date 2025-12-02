@@ -359,71 +359,87 @@ CREATE POLICY "Service role full access notifications"
     USING (auth.jwt() ->> 'role' = 'service_role');
 
 -- ============================================
--- PRICING STRUCTURE - COMPLETE MAPPING
+-- TIER SYSTEM - BASED ON PLAN NAME
 -- ============================================
+-- 
+-- IMPORTANT: The tier is determined by the plan name suffix:
+-- 
+-- CREATOR TIER (9:16 VERTICAL - TikTok/YouTube Shorts):
+--   - Plans WITHOUT "_pro" suffix: free, starter, premium, pro, max
+--   - Yearly variants: starter_yearly, pro_yearly, max_yearly
+--   - Legacy naming: creator_basic, creator_pro, creator_max
+--   - Fixed duration: 8s (VEO) or 10s (Sora)
+--   - Aspect ratio: 9:16 VERTICAL
+--   - Prompts: Viral, attention-grabbing, TikTok optimized
+-- 
+-- PROFESSIONAL TIER (16:9 HORIZONTAL - Ads/Commercials):
+--   - Plans WITH "_pro" suffix: premium_pro, pro_pro, max_pro, starter_pro
+--   - Variable duration: 6-60s
+--   - Aspect ratio: 16:9 HORIZONTAL (widescreen)
+--   - Prompts: Professional, brand-safe, conversion-focused
+-- 
+-- Example tier detection:
+--   plan = "max"      → CREATOR (9:16 vertical)
+--   plan = "max_pro"  → PROFESSIONAL (16:9 horizontal)
+--   plan = "pro"      → CREATOR (9:16 vertical) 
+--   plan = "pro_pro"  → PROFESSIONAL (16:9 horizontal)
+-- 
 
 -- ============================================
--- PROFESSIONAL TIER (for ads/commercials)
--- Variable duration (6-60s), multiple sequences, ad-optimized prompts
+-- CREATOR TIER PRICING (9:16 vertical)
 -- ============================================
-
--- Professionnel Premium (starter):
---   Monthly: 199,00 €/mois → STRIPE_PRICE_STARTER
---   Annual: 179,00 €/mois (2 148,00 €/an total) → STRIPE_PRICE_STARTER_ANNUAL
---   Credits: 600 crédits = 10 minutes
-
--- Professionnel Pro:
---   Monthly: 589,00 €/mois → STRIPE_PRICE_PRO
---   Annual: 530,00 €/mois (6 360,00 €/an total) → STRIPE_PRICE_PRO_ANNUAL
---   Credits: 1200 crédits = 20 minutes
-
--- Professionnel Max:
---   Monthly: 1 199,00 €/mois → STRIPE_PRICE_MAX
---   Annual: 1 079,00 €/mois (12 948,00 €/an total) → STRIPE_PRICE_MAX_ANNUAL
---   Credits: 1800 crédits = 30 minutes
-
--- ============================================
--- CREATOR TIER (for TikTok/YouTube Shorts)
--- Fixed duration (10s Sora, 8s VEO), no duration selection, viral prompts
--- ============================================
-
--- Creator Basic:
---   Monthly: 34,99 €/mois → STRIPE_PRICE_BASIC_MONTHLY
---   Yearly: 377,89 €/an (31,49 €/mois équivalent) → STRIPE_PRICE_BASIC_YEARLY
---   Credits: 100 crédits = 10 videos de 10s
-
--- Creator Pro:
---   Monthly: 65,99 €/mois → STRIPE_PRICE_PRO_MONTHLY
---   Yearly: 712,69 €/an (59,39 €/mois équivalent) → STRIPE_PRICE_PRO_YEARLY
---   Credits: 200 crédits = 20 videos de 10s
-
--- Creator Max:
---   Monthly: 89,99 €/mois → STRIPE_PRICE_MAX_MONTHLY
---   Yearly: 971,89 €/an (80,99 €/mois équivalent) → STRIPE_PRICE_MAX_YEARLY
---   Credits: 300 crédits = 30 videos de 10s
 
 -- Free: 10 crédits par défaut (pour tester)
+
+-- Starter:
+--   Monthly: → STRIPE_PRICE_STARTER
+--   Annual: → STRIPE_PRICE_STARTER_ANNUAL
+--   Credits: Variable
+
+-- Premium:
+--   Monthly: → STRIPE_PRICE_PREMIUM
+--   Annual: → STRIPE_PRICE_PREMIUM_ANNUAL
+
+-- Pro:
+--   Monthly: → STRIPE_PRICE_PRO
+--   Annual: → STRIPE_PRICE_PRO_ANNUAL
+
+-- Max:
+--   Monthly: → STRIPE_PRICE_MAX
+--   Annual: → STRIPE_PRICE_MAX_ANNUAL
+
+-- Legacy Creator naming:
+-- Creator Basic: 34,99 €/mois → STRIPE_PRICE_BASIC_MONTHLY
+-- Creator Pro: 65,99 €/mois → STRIPE_PRICE_PRO_MONTHLY
+-- Creator Max: 89,99 €/mois → STRIPE_PRICE_MAX_MONTHLY
+
+-- ============================================
+-- PROFESSIONAL TIER PRICING (16:9 horizontal)
+-- ============================================
+
+-- Premium Pro:
+--   Monthly: 199,00 €/mois
+--   Annual: 179,00 €/mois
+--   Credits: 600 crédits
+
+-- Pro Pro:
+--   Monthly: 589,00 €/mois
+--   Annual: 530,00 €/mois
+--   Credits: 1200 crédits
+
+-- Max Pro:
+--   Monthly: 1 199,00 €/mois
+--   Annual: 1 079,00 €/mois
+--   Credits: 1800 crédits
 
 -- ============================================
 -- PLAN VALUES FOR profiles.plan COLUMN
 -- ============================================
--- Professional tier plans (monthly):
---   'free', 'starter', 'pro', 'max'
--- Professional tier plans (annual):
---   'starter_annual', 'pro_annual', 'max_annual'
--- Creator tier plans (monthly):
---   'creator_basic', 'creator_pro', 'creator_max'
--- Creator tier plans (yearly):
---   'creator_basic_yearly', 'creator_pro_yearly', 'creator_max_yearly'
-
--- ============================================
--- ENVIRONMENT VARIABLES NAMING CONVENTION
--- ============================================
--- PROFESSIONAL plans use: _ANNUAL suffix for yearly (e.g., STRIPE_PRICE_PRO_ANNUAL)
--- CREATOR plans use: _YEARLY suffix for yearly (e.g., STRIPE_PRICE_PRO_YEARLY)
--- 
--- Be careful with naming conflicts:
--- - STRIPE_PRICE_PRO = Professional Pro monthly
--- - STRIPE_PRICE_PRO_MONTHLY = Creator Pro monthly
--- - STRIPE_PRICE_MAX = Professional Max monthly
--- - STRIPE_PRICE_MAX_MONTHLY = Creator Max monthly
+-- Creator tier plans (9:16 vertical):
+--   'free', 'starter', 'premium', 'pro', 'max'
+--   'starter_yearly', 'premium_yearly', 'pro_yearly', 'max_yearly'
+--   'creator_basic', 'creator_pro', 'creator_max' (legacy)
+--
+-- Professional tier plans (16:9 horizontal):
+--   'starter_pro', 'premium_pro', 'pro_pro', 'max_pro'
+--   'starter_pro_yearly', 'premium_pro_yearly', 'pro_pro_yearly', 'max_pro_yearly'

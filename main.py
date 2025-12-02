@@ -298,23 +298,55 @@ def normalize_ai_model(value: str) -> str:
 
 
 # ============= USER TIER SYSTEM =============
-# Creator plans: optimized for TikTok/YouTube Shorts content creators
-# Professional plans: optimized for professional ads and commercials
+# IMPORTANT: Logic based on database "plan" field
+#
+# CREATOR plans (9:16 vertical, TikTok/Shorts optimized):
+#   - starter, premium, pro, max (and their yearly variants)
+#   - creator_basic, creator_pro, creator_max (legacy naming)
+#   - free
+#
+# PROFESSIONAL plans (16:9 horizontal, ads/commercials optimized):
+#   - premium_pro, pro_pro, max_pro (plans with "_pro" suffix)
+#   - starter_pro (if exists)
 
-CREATOR_PLANS = ["creator_basic", "creator_pro", "creator_max"]
-PROFESSIONAL_PLANS = ["starter", "pro", "max", "free"]  # Existing professional plans
+# Professional plans use "_pro" suffix (NOT to be confused with the "pro" plan which is Creator)
+PROFESSIONAL_PLANS = ["premium_pro", "pro_pro", "max_pro", "starter_pro"]
+
+# All other plans are Creator tier
+CREATOR_PLANS = [
+    "free", "starter", "premium", "pro", "max",  # Base plans = Creator
+    "starter_yearly", "premium_yearly", "pro_yearly", "max_yearly",  # Yearly variants
+    "starter_annual", "premium_annual", "pro_annual", "max_annual",  # Annual variants
+    "creator_basic", "creator_pro", "creator_max",  # Legacy naming
+    "creator_basic_yearly", "creator_pro_yearly", "creator_max_yearly",  # Legacy yearly
+]
 
 def get_user_tier(plan: str) -> str:
     """
     Determines user tier based on their plan.
     
+    Plans ending with "_pro" suffix = PROFESSIONAL (16:9 ads)
+    All other plans = CREATOR (9:16 TikTok/Shorts)
+    
     Returns:
-        "creator" for TikTok/Shorts focused plans
-        "professional" for ad-focused plans
+        "professional" for ad-focused plans (16:9)
+        "creator" for TikTok/Shorts focused plans (9:16)
     """
-    if plan in CREATOR_PLANS:
+    if not plan:
         return "creator"
-    return "professional"
+    
+    plan_lower = plan.lower()
+    
+    # Check for professional suffix patterns
+    if plan_lower in [p.lower() for p in PROFESSIONAL_PLANS]:
+        return "professional"
+    
+    # Check for "_pro" suffix (professional ads plans)
+    if plan_lower.endswith("_pro"):
+        return "professional"
+    
+    # All other plans are Creator tier
+    return "creator"
 
 def get_fixed_duration_for_creator(ai_model: str) -> int:
     """
@@ -329,9 +361,24 @@ def get_fixed_duration_for_creator(ai_model: str) -> int:
     else:  # VEO models
         return 8
 
+def get_aspect_ratio_for_tier(user_tier: str) -> str:
+    """
+    Returns the aspect ratio based on user tier.
+    
+    - Creator: 9:16 (vertical, TikTok/Shorts)
+    - Professional: 16:9 (horizontal, ads/commercials)
+    """
+    if user_tier == "professional":
+        return "16:9"
+    return "9:16"
+
 def is_creator_plan(plan: str) -> bool:
     """Check if a plan is a Creator tier plan."""
-    return plan in CREATOR_PLANS
+    return get_user_tier(plan) == "creator"
+
+def is_professional_plan(plan: str) -> bool:
+    """Check if a plan is a Professional tier plan."""
+    return get_user_tier(plan) == "professional"
 
 
 class VideoRequest(BaseModel):
@@ -410,8 +457,16 @@ class YouTubeUploadResponse(BaseModel):
 
 # ============= FUNCTIONS =============
 
-def generate_prompt(niche: str = None, custom_prompt: str = None, clip_index: int = None, total_clips: int = None) -> str:
-    """Génère un prompt optimisé pour Sora"""
+def generate_prompt(niche: str = None, custom_prompt: str = None, clip_index: int = None, total_clips: int = None, user_tier: str = "creator") -> str:
+    """Génère un prompt optimisé pour la génération vidéo
+    
+    Args:
+        niche: Content niche/category
+        custom_prompt: Custom user prompt
+        clip_index: Index of current clip (for multi-clip videos)
+        total_clips: Total number of clips
+        user_tier: "creator" for 9:16 vertical or "professional" for 16:9 horizontal
+    """
     
     if custom_prompt:
         base = custom_prompt
@@ -429,7 +484,13 @@ def generate_prompt(niche: str = None, custom_prompt: str = None, clip_index: in
     else:
         sequence_info = ""
     
-    return f"{base}{sequence_info}, 9:16 vertical format, TikTok optimized, high quality, cinematic"
+    # Determine format suffix based on tier
+    if user_tier == "professional":
+        format_suffix = ", 16:9 horizontal widescreen format, professional commercial quality, cinematic"
+    else:
+        format_suffix = ", 9:16 vertical format, TikTok optimized, high quality, cinematic"
+    
+    return f"{base}{sequence_info}{format_suffix}"
 
 def calculate_credits_cost(duration: int, quality: str, ai_model: str = "veo-3.1-generate-preview") -> int:
     """Calcule le coût en crédits selon la durée, la qualité et le modèle"""
@@ -572,7 +633,11 @@ async def process_video_generation(
             import asyncio
             from concurrent.futures import ThreadPoolExecutor
             
-            async def process_shot(segment_index, shot_data, user_images_list, tier=user_tier):
+            # Determine aspect ratio based on tier
+            tier_aspect_ratio = get_aspect_ratio_for_tier(user_tier)
+            print(f"📐 Aspect ratio for {user_tier.upper()} tier: {tier_aspect_ratio}")
+            
+            async def process_shot(segment_index, shot_data, user_images_list, tier=user_tier, aspect_ratio=tier_aspect_ratio):
                 """Helper to process a single shot: Image Gen -> Video Gen with Veo 3.1"""
                 shot_idx = shot_data.get("shot_index", 0)
                 img_prompt = shot_data.get("image_prompt")
@@ -581,7 +646,7 @@ async def process_video_generation(
                 shot_duration = shot_data.get("duration", 8)
                 scene_images = shot_data.get("scene_images", [])  # Additional scene variation prompts
                 
-                print(f"🎬 Processing Seg {segment_index} Shot {shot_idx} ({tier.upper()} tier)...")
+                print(f"🎬 Processing Seg {segment_index} Shot {shot_idx} ({tier.upper()} tier, {aspect_ratio})...")
                 
                 loop = asyncio.get_running_loop()
                 
@@ -611,7 +676,7 @@ async def process_video_generation(
                         return get_gemini().generate_image(
                             prompt=img_prompt,
                             reference_images=ref_images_for_generation,
-                            aspect_ratio="9:16",
+                            aspect_ratio=aspect_ratio,  # Use tier-specific aspect ratio
                             resolution="4K"  # 4K quality for both tiers
                         )
                     
@@ -630,7 +695,7 @@ async def process_video_generation(
                             print(f"⚠️ Failed to upload generated image: {e}")
 
                 # B. Generate Video with Veo 3.1 (enriched prompts already applied)
-                print(f"  🎥 Seg {segment_index} Shot {shot_idx}: Generating Video with Veo 3.1...")
+                print(f"  🎥 Seg {segment_index} Shot {shot_idx}: Generating Video with Veo 3.1 ({aspect_ratio})...")
                 
                 # Validate duration for Veo 3.1 (4, 6, or 8 seconds)
                 veo_duration = 8  # Default to 8s for best quality
@@ -641,7 +706,7 @@ async def process_video_generation(
                     None, 
                     lambda: get_veo().generate_video_and_wait(
                         prompt=vid_prompt,
-                        aspect_ratio="9:16",
+                        aspect_ratio=aspect_ratio,  # Use tier-specific aspect ratio
                         resolution="720p",
                         duration_seconds=veo_duration,
                         image=pil_image,
@@ -685,30 +750,54 @@ async def process_video_generation(
             else:
                 # Fallback to simple loop if script generation fails
                 print("⚠️ Script generation failed, falling back to simple generation.")
+                
+                # Determine aspect ratio based on tier
+                tier_aspect_ratio = get_aspect_ratio_for_tier(user_tier)
+                print(f"📐 Fallback using aspect ratio: {tier_aspect_ratio} for {user_tier.upper()} tier")
+                
                 # Generate a single 8s video with the enriched prompt
                 enriched_prompt = get_gemini().enrich_prompt(
                     custom_prompt or generate_prompt(niche),
                     segment_context="Single video generation",
-                    user_image_description=None
+                    user_image_description=None,
+                    user_tier=user_tier  # Pass user tier for proper prompt enrichment
                 )
                 
                 # Use first user image if available
                 first_image = user_pil_images[0] if user_pil_images else None
+                if first_image:
+                    print(f"  🖼️ Using first user-provided image in fallback mode")
                 
-                local_path = get_veo().generate_video_and_wait(
-                    prompt=enriched_prompt,
-                    aspect_ratio="9:16",
-                    resolution="720p",
-                    duration_seconds=8,
-                    image=first_image,
-                    download_path=f"/tmp/{job_id}_fallback.mp4",
-                    use_fast_model=use_fast_model,
-                )
+                # For longer videos (>8s), generate multiple clips even in fallback mode
+                target_clips = max(1, (duration + 7) // 8)
+                print(f"  📹 Generating {target_clips} clip(s) for {duration}s video in fallback mode")
                 
-                with open(local_path, "rb") as f:
-                    data = f.read()
-                url = get_uploader().upload_bytes(data, f"{job_id}_fallback.mp4")
-                all_clip_urls = [url]
+                fallback_clip_urls = []
+                for clip_idx in range(target_clips):
+                    clip_prompt = enriched_prompt
+                    if target_clips > 1:
+                        clip_prompt = f"{enriched_prompt}, scene {clip_idx + 1} of {target_clips}, continuous narrative flow"
+                    
+                    # Use user image only for first clip
+                    clip_image = first_image if clip_idx == 0 else None
+                    
+                    local_path = get_veo().generate_video_and_wait(
+                        prompt=clip_prompt,
+                        aspect_ratio=tier_aspect_ratio,  # Use tier-specific aspect ratio
+                        resolution="720p",
+                        duration_seconds=8,
+                        image=clip_image,
+                        download_path=f"/tmp/{job_id}_fallback_{clip_idx}.mp4",
+                        use_fast_model=use_fast_model,
+                    )
+                    
+                    with open(local_path, "rb") as f:
+                        data = f.read()
+                    url = get_uploader().upload_bytes(data, f"{job_id}_fallback_{clip_idx}.mp4")
+                    fallback_clip_urls.append(url)
+                    print(f"  ✅ Fallback clip {clip_idx + 1}/{target_clips} generated")
+                
+                all_clip_urls = fallback_clip_urls
 
             if len(all_clip_urls) == 1:
                 final_url = all_clip_urls[0]
@@ -779,7 +868,11 @@ async def process_video_generation(
             import asyncio
             from concurrent.futures import ThreadPoolExecutor
             
-            async def process_sora_shot(segment_index, shot_data, user_images_list, tier=user_tier):
+            # Determine aspect ratio based on tier for Sora
+            tier_aspect_ratio = get_aspect_ratio_for_tier(user_tier)
+            print(f"📐 Aspect ratio for {user_tier.upper()} tier (Sora): {tier_aspect_ratio}")
+            
+            async def process_sora_shot(segment_index, shot_data, user_images_list, tier=user_tier, aspect_ratio=tier_aspect_ratio):
                 """Helper to process a single shot: Image Gen -> Video Gen with Sora 2"""
                 shot_idx = shot_data.get("shot_index", 0)
                 img_prompt = shot_data.get("image_prompt")
@@ -788,7 +881,7 @@ async def process_video_generation(
                 shot_duration = shot_data.get("duration", 10)
                 scene_images = shot_data.get("scene_images", [])  # Additional scene variation prompts
                 
-                print(f"🎬 Processing Seg {segment_index} Shot {shot_idx} ({tier.upper()} tier)...")
+                print(f"🎬 Processing Seg {segment_index} Shot {shot_idx} ({tier.upper()} tier, {aspect_ratio})...")
                 
                 loop = asyncio.get_running_loop()
                 
@@ -821,7 +914,7 @@ async def process_video_generation(
                         return get_gemini().generate_image(
                             prompt=img_prompt,
                             reference_images=ref_images_for_generation,
-                            aspect_ratio="9:16",
+                            aspect_ratio=aspect_ratio,  # Use tier-specific aspect ratio
                             resolution="4K"  # 4K quality for both tiers
                         )
                     
@@ -897,35 +990,58 @@ async def process_video_generation(
                 
             else:
                 # Fallback to simple generation if script generation fails
-                print("⚠️ Script generation failed, falling back to simple generation.")
+                print("⚠️ Script generation failed, falling back to simple generation (Sora).")
+                
+                # Determine aspect ratio based on tier
+                tier_aspect_ratio = get_aspect_ratio_for_tier(user_tier)
+                print(f"📐 Fallback using aspect ratio: {tier_aspect_ratio} for {user_tier.upper()} tier (Sora)")
+                
                 # Generate a single video with the enriched prompt
                 enriched_prompt = get_gemini().enrich_prompt(
                     custom_prompt or generate_prompt(niche),
                     segment_context="Single video generation",
-                    user_image_description=None
+                    user_image_description=None,
+                    user_tier=user_tier  # Pass user tier for proper prompt enrichment
                 )
                 
                 # Use first user image if available
                 input_ref = None
                 if user_pil_images:
                     import tempfile
+                    print(f"  🖼️ Using first user-provided image in Sora fallback mode")
                     with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
                         user_pil_images[0].save(tmp.name)
                         input_ref = tmp.name
                 
-                local_path = get_sora().generate_video_and_wait(
-                    prompt=enriched_prompt,
-                    use_pro=use_pro_model,
-                    size=size,
-                    seconds=8,
-                    input_reference=input_ref,
-                    download_path=f"/tmp/{job_id}_fallback.mp4",
-                )
+                # For longer videos (>10s), generate multiple clips even in fallback mode
+                target_clips = max(1, (duration + 9) // 10)
+                print(f"  📹 Generating {target_clips} clip(s) for {duration}s video in Sora fallback mode")
                 
-                with open(local_path, "rb") as f:
-                    data = f.read()
-                url = get_uploader().upload_bytes(data, f"{job_id}_fallback.mp4")
-                all_clip_urls = [url]
+                fallback_clip_urls = []
+                for clip_idx in range(target_clips):
+                    clip_prompt = enriched_prompt
+                    if target_clips > 1:
+                        clip_prompt = f"{enriched_prompt}, scene {clip_idx + 1} of {target_clips}, continuous narrative flow"
+                    
+                    # Use user image only for first clip
+                    clip_input_ref = input_ref if clip_idx == 0 else None
+                    
+                    local_path = get_sora().generate_video_and_wait(
+                        prompt=clip_prompt,
+                        use_pro=use_pro_model,
+                        size=size,
+                        seconds=10,
+                        input_reference=clip_input_ref,
+                        download_path=f"/tmp/{job_id}_fallback_{clip_idx}.mp4",
+                    )
+                    
+                    with open(local_path, "rb") as f:
+                        data = f.read()
+                    url = get_uploader().upload_bytes(data, f"{job_id}_fallback_{clip_idx}.mp4")
+                    fallback_clip_urls.append(url)
+                    print(f"  ✅ Sora fallback clip {clip_idx + 1}/{target_clips} generated")
+                
+                all_clip_urls = fallback_clip_urls
 
             if len(all_clip_urls) == 1:
                 final_url = all_clip_urls[0]
@@ -1302,10 +1418,15 @@ async def get_user_tier_info(user_id: str, request: Request):
     """
     Get user tier information for frontend to adapt UI.
     
+    TIER LOGIC:
+    - Plans: starter, premium, pro, max (and yearly variants) → CREATOR tier (9:16 vertical)
+    - Plans: premium_pro, pro_pro, max_pro (with _pro suffix) → PROFESSIONAL tier (16:9 horizontal)
+    
     Returns:
         - plan: Current plan name
         - tier: "creator" or "professional"
         - is_creator: Boolean for quick check
+        - aspect_ratio: "9:16" for creator, "16:9" for professional
         - fixed_duration: Fixed duration if creator tier (null for professional)
         - max_images: Maximum images allowed (18 for all)
         - features: Dictionary of tier-specific features
@@ -1325,6 +1446,7 @@ async def get_user_tier_info(user_id: str, request: Request):
         credits = user.data.get("credits", 0)
         tier = get_user_tier(plan)
         is_creator = is_creator_plan(plan)
+        aspect_ratio = get_aspect_ratio_for_tier(tier)
         
         # Build tier-specific features
         if is_creator:
@@ -1332,26 +1454,31 @@ async def get_user_tier_info(user_id: str, request: Request):
                 "duration_selection": False,  # Creator tier cannot select duration
                 "fixed_duration_veo": 8,
                 "fixed_duration_sora": 10,
+                "aspect_ratio": "9:16",  # Vertical for TikTok/Shorts
+                "orientation": "vertical",
                 "prompt_style": "viral_tiktok_shorts",
                 "sequences": False,  # No complex sequences
                 "max_images_per_segment": 3,
-                "description": "Optimized for TikTok and YouTube Shorts content"
+                "description": "Optimisé pour TikTok et YouTube Shorts (9:16 vertical)"
             }
         else:
             features = {
                 "duration_selection": True,  # Professional can select duration
                 "min_duration": 6,
                 "max_duration": 60,
+                "aspect_ratio": "16:9",  # Horizontal widescreen for ads
+                "orientation": "horizontal",
                 "prompt_style": "professional_advertising",
                 "sequences": True,  # Complex multi-sequence videos
                 "max_images_per_segment": 6,
-                "description": "Optimized for professional ads and commercials"
+                "description": "Optimisé pour publicités professionnelles (16:9 horizontal)"
             }
         
         return {
             "plan": plan,
             "tier": tier,
             "is_creator": is_creator,
+            "aspect_ratio": aspect_ratio,
             "credits": credits,
             "max_images": 18,  # Both tiers support up to 18 reference images
             "features": features

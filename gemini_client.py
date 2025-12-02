@@ -222,9 +222,10 @@ class GeminiClient:
         """
         Enriches prompt for CREATOR tier - optimized for TikTok/YouTube Shorts.
         Focus on viral content, attention-grabbing visuals, trendy aesthetics.
+        Aspect ratio: 9:16 VERTICAL
         """
-        # TikTok Shorts aesthetic suffix
-        creator_suffix = ", vertical 9:16 aspect ratio, TikTok Shorts aesthetic, high contrast vibrant colors, trending social media style, viral potential, 4K quality, hook in first 3 seconds"
+        # TikTok Shorts aesthetic suffix - VERTICAL 9:16
+        creator_suffix = ", VERTICAL 9:16 aspect ratio REQUIRED, TikTok Shorts aesthetic, high contrast vibrant colors, trending social media style, viral potential, 4K quality, hook in first 3 seconds, mobile-first vertical composition"
         
         try:
             system_instruction = """
@@ -280,9 +281,10 @@ class GeminiClient:
         """
         Enriches prompt for PROFESSIONAL tier - optimized for ads, commercials, brand content.
         Focus on polished, high-end production quality, brand-safe, conversion-focused.
+        Aspect ratio: 16:9 HORIZONTAL (widescreen for professional ads)
         """
-        # Professional ad aesthetic suffix
-        professional_suffix = ", cinematic 9:16 vertical format, premium advertising quality, professional color grading, brand-safe content, high-end production value, 4K HDR quality, commercial grade"
+        # Professional ad aesthetic suffix - HORIZONTAL 16:9 WIDESCREEN
+        professional_suffix = ", HORIZONTAL 16:9 widescreen aspect ratio REQUIRED, cinematic commercial format, premium advertising quality, professional color grading, brand-safe content, high-end production value, 4K HDR quality, commercial grade, widescreen composition"
         
         try:
             system_instruction = """
@@ -429,18 +431,71 @@ class GeminiClient:
                 )
             )
             
-            script = json.loads(response.text)
+            response_text = response.text
             
-            print(f"📜 Script generated with {len(script.get('segments', []))} segments for {user_tier.upper()} tier")
+            # Try to parse the response as JSON, with fallback cleanup
+            try:
+                script = json.loads(response_text)
+            except json.JSONDecodeError as json_err:
+                print(f"⚠️ JSON parsing failed, attempting cleanup: {json_err}")
+                
+                # Common cleanup attempts
+                cleaned_text = response_text.strip()
+                
+                # Remove markdown code blocks if present
+                if cleaned_text.startswith("```"):
+                    lines = cleaned_text.split("\n")
+                    if lines[0].startswith("```"):
+                        lines = lines[1:]  # Remove first line
+                    if lines and lines[-1].strip() == "```":
+                        lines = lines[:-1]  # Remove last line
+                    cleaned_text = "\n".join(lines)
+                
+                # Try to find JSON object boundaries
+                if "{" in cleaned_text:
+                    start_idx = cleaned_text.find("{")
+                    end_idx = cleaned_text.rfind("}") + 1
+                    if start_idx >= 0 and end_idx > start_idx:
+                        cleaned_text = cleaned_text[start_idx:end_idx]
+                
+                try:
+                    script = json.loads(cleaned_text)
+                    print("✅ JSON parsing succeeded after cleanup")
+                except json.JSONDecodeError:
+                    print(f"❌ JSON parsing failed even after cleanup. Response preview: {response_text[:500]}")
+                    return None
+            
+            # Validate script structure
+            if not script or not isinstance(script, dict) or "segments" not in script:
+                print(f"❌ Invalid script structure: missing 'segments' key. Keys found: {script.keys() if isinstance(script, dict) else 'not a dict'}")
+                return None
+            
+            segments = script.get("segments", [])
+            if not segments or not isinstance(segments, list) or len(segments) == 0:
+                print(f"❌ Invalid script structure: 'segments' is empty or not a list")
+                return None
+            
+            print(f"📜 Script generated with {len(segments)} segments for {user_tier.upper()} tier")
             
             # Enrich all prompts in the script with tier-specific enrichment
-            for segment in script.get("segments", []):
+            for segment in segments:
+                if not isinstance(segment, dict):
+                    continue
+                    
                 segment_context = f"Segment {segment.get('segment_index', 1)} of {num_segments}"
-                for shot in segment.get("shots", []):
+                shots = segment.get("shots", [])
+                
+                if not shots or not isinstance(shots, list):
+                    continue
+                    
+                for shot in shots:
+                    if not isinstance(shot, dict):
+                        continue
+                        
                     # Get user image description if applicable
                     user_img_desc = None
                     user_img_idx = shot.get("use_user_image_index")
-                    if user_img_idx is not None and user_img_idx < len(image_descriptions):
+                    if user_img_idx is not None and isinstance(user_img_idx, int) and user_img_idx < len(image_descriptions):
                         user_img_desc = image_descriptions[user_img_idx]
                     
                     # Enrich both image and video prompts with tier-specific style
@@ -463,27 +518,35 @@ class GeminiClient:
             
         except Exception as e:
             print(f"Error generating script: {e}")
+            import traceback
+            traceback.print_exc()
             return None
 
     def _get_creator_script_instruction(self, segment_duration: int, num_user_images: int) -> str:
-        """Returns system instruction for CREATOR tier video scripts (TikTok/Shorts)."""
+        """Returns system instruction for CREATOR tier video scripts (TikTok/Shorts).
+        Uses 9:16 VERTICAL aspect ratio for mobile-first content."""
         return f"""
         You are an expert TikTok/YouTube Shorts video director specializing in VIRAL content.
         Create a script optimized for short-form social media that will get maximum engagement.
         
+        CRITICAL: This is a CREATOR tier video with 9:16 VERTICAL aspect ratio for mobile viewing.
+        All prompts MUST be composed for VERTICAL mobile-first viewing!
+        
         VIDEO STRUCTURE:
         - Each segment is {segment_duration} seconds
+        - ASPECT RATIO: 9:16 VERTICAL (TikTok/Shorts/Reels format)
         - For CREATOR tier: Keep it SIMPLE - 1 main shot per segment for scene changes
         - Generate 1-3 images per segment to create visual variety within the scene
         - User has provided {num_user_images} reference images that can be used
         
         CREATOR STYLE REQUIREMENTS:
+        - VERTICAL COMPOSITION: All visuals composed for 9:16 mobile portrait viewing
         - VIRAL HOOKS: First 3 seconds must be impossibly attention-grabbing
         - FAST PACING: Quick cuts, dynamic transitions, never boring
         - BOLD VISUALS: Saturated colors, high contrast, mobile-optimized
         - TRENDY: Use current TikTok trends, challenges, aesthetics
         - EMOTIONAL: Create surprise, awe, humor, or curiosity
-        - VERTICAL: Everything composed for 9:16 mobile viewing
+        - CENTERED SUBJECTS: Keep main subject centered for mobile viewing
         
         Output JSON format:
         {{
@@ -493,11 +556,11 @@ class GeminiClient:
                     "shots": [
                         {{
                             "shot_index": 1,
-                            "image_prompt": "Detailed visual for the main scene...",
-                            "video_prompt": "Dynamic motion and action description...",
+                            "image_prompt": "9:16 vertical composition, detailed visual for the main scene...",
+                            "video_prompt": "Vertical format, dynamic motion and action description...",
                             "duration": {segment_duration},
                             "use_user_image_index": null,
-                            "scene_images": ["variation 1 prompt", "variation 2 prompt"]
+                            "scene_images": ["vertical variation 1", "vertical variation 2"]
                         }}
                     ]
                 }}
@@ -506,21 +569,28 @@ class GeminiClient:
         
         Note: "use_user_image_index" can be 0-{num_user_images - 1 if num_user_images > 0 else 0} to use a user image, or null to generate.
         "scene_images" contains 1-3 additional image prompts for scene variety (scene changes within the segment).
+        ALL PROMPTS must specify vertical 9:16 composition for mobile viewing!
         """
 
     def _get_professional_script_instruction(self, segment_duration: int, num_user_images: int) -> str:
-        """Returns system instruction for PROFESSIONAL tier video scripts (ads)."""
+        """Returns system instruction for PROFESSIONAL tier video scripts (ads).
+        Uses 16:9 HORIZONTAL widescreen aspect ratio for professional commercials."""
         return f"""
         You are an elite advertising director creating a PROFESSIONAL commercial video.
         Create a script optimized for conversion, brand building, and premium production quality.
         
+        CRITICAL: This is a PROFESSIONAL tier video with 16:9 HORIZONTAL WIDESCREEN aspect ratio.
+        All prompts MUST be composed for WIDESCREEN horizontal viewing, NOT vertical!
+        
         VIDEO STRUCTURE:
         - Each segment is {segment_duration} seconds
+        - ASPECT RATIO: 16:9 HORIZONTAL WIDESCREEN (like TV commercials, YouTube ads)
         - For PROFESSIONAL tier: Multiple sequences with narrative arc
         - Multiple shots per segment for complex storytelling
         - User has provided {num_user_images} brand/product images that should be featured
         
         PROFESSIONAL AD REQUIREMENTS:
+        - WIDESCREEN COMPOSITION: All visuals composed for 16:9 horizontal viewing
         - NARRATIVE ARC: Problem → Solution → Benefit → CTA flow
         - PREMIUM QUALITY: Cinematic lighting, elegant composition, refined colors
         - BRAND SAFE: Professional, trustworthy, aspirational imagery
@@ -537,11 +607,11 @@ class GeminiClient:
                     "shots": [
                         {{
                             "shot_index": 1,
-                            "image_prompt": "Premium visual composition description...",
-                            "video_prompt": "Sophisticated camera movement and action...",
+                            "image_prompt": "16:9 widescreen horizontal composition, premium visual...",
+                            "video_prompt": "Widescreen cinematic camera movement, sophisticated action...",
                             "duration": {segment_duration},
                             "use_user_image_index": null,
-                            "scene_images": ["angle 1", "angle 2", "detail shot"]
+                            "scene_images": ["wide angle 1", "product detail", "lifestyle shot"]
                         }}
                     ]
                 }}
@@ -551,6 +621,7 @@ class GeminiClient:
         Note: "use_user_image_index" can be 0-{num_user_images - 1 if num_user_images > 0 else 0} to feature a brand image, or null to generate.
         "scene_images" contains multiple image prompts for comprehensive product/brand coverage.
         "narrative_beat" describes where this segment fits in the ad's story arc.
+        ALL PROMPTS must specify horizontal 16:9 widescreen composition!
         """
 
     def generate_thumbnail(self, title: str, description: str, original_prompt: str) -> tuple:
