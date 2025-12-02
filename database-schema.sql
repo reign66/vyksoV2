@@ -21,7 +21,8 @@ CREATE TABLE IF NOT EXISTS profiles (
     subscription_status TEXT DEFAULT 'inactive', -- active, canceled, past_due, etc.
     plan_tier TEXT,                              -- basic, pro, max, starter, etc.
     plan_interval TEXT,                          -- monthly, yearly, annual
-    plan_family TEXT DEFAULT 'professional',     -- creator or professional
+    plan_family TEXT DEFAULT 'creator',          -- 'creator' (9:16) or 'professional' (16:9)
+    preferred_aspect_ratio TEXT DEFAULT '9:16',  -- '9:16' for creator, '16:9' for professional
     current_period_end TIMESTAMP WITH TIME ZONE, -- When subscription renews
     canceled_at TIMESTAMP WITH TIME ZONE,        -- When subscription was canceled
     -- YouTube integration
@@ -30,6 +31,14 @@ CREATE TABLE IF NOT EXISTS profiles (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
+
+-- TIER LOGIC:
+-- plan_family is derived from plan name:
+--   - Plans WITHOUT '_pro' suffix → 'creator' (9:16 vertical)
+--   - Plans WITH '_pro' suffix → 'professional' (16:9 horizontal)
+-- Example:
+--   plan = 'max'     → plan_family = 'creator', preferred_aspect_ratio = '9:16'
+--   plan = 'max_pro' → plan_family = 'professional', preferred_aspect_ratio = '16:9'
 
 -- Add new columns to existing profiles table (run if table already exists)
 -- Run these ALTER statements only if the columns don't exist
@@ -57,7 +66,10 @@ BEGIN
         ALTER TABLE profiles ADD COLUMN plan_interval TEXT;
     END IF;
     IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'profiles' AND column_name = 'plan_family') THEN
-        ALTER TABLE profiles ADD COLUMN plan_family TEXT DEFAULT 'professional';
+        ALTER TABLE profiles ADD COLUMN plan_family TEXT DEFAULT 'creator';
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'profiles' AND column_name = 'preferred_aspect_ratio') THEN
+        ALTER TABLE profiles ADD COLUMN preferred_aspect_ratio TEXT DEFAULT '9:16';
     END IF;
     IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'profiles' AND column_name = 'current_period_end') THEN
         ALTER TABLE profiles ADD COLUMN current_period_end TIMESTAMP WITH TIME ZONE;
@@ -65,6 +77,10 @@ BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'profiles' AND column_name = 'canceled_at') THEN
         ALTER TABLE profiles ADD COLUMN canceled_at TIMESTAMP WITH TIME ZONE;
     END IF;
+    
+    -- Update existing plan_family default from 'professional' to 'creator'
+    -- (since most plans without _pro suffix should be creator)
+    ALTER TABLE profiles ALTER COLUMN plan_family SET DEFAULT 'creator';
 END $$;
 
 -- ============================================
