@@ -657,8 +657,8 @@ async def process_video_generation(
                     print(f"  🖼️ Using user-provided image {use_user_image_idx} for this shot")
                     pil_image = user_images_list[use_user_image_idx]
                 else:
-                    # A. Generate Image with Gemini 3 Pro using enriched prompt and reference images
-                    print(f"  📸 Seg {segment_index} Shot {shot_idx}: Generating Image with gemini-3-pro-image-preview...")
+                    # A. Generate Image with Gemini using enriched prompt and reference images
+                    print(f"  📸 Seg {segment_index} Shot {shot_idx}: Generating Image...")
                     
                     # For Creator tier: use 1-3 reference images for scene consistency
                     # For Professional tier: use up to 3 images per segment for product/brand consistency
@@ -680,19 +680,33 @@ async def process_video_generation(
                             resolution="4K"  # 4K quality for both tiers
                         )
                     
-                    image_bytes = await loop.run_in_executor(None, generate_with_refs)
-                    
-                    if image_bytes:
-                        from PIL import Image
-                        pil_image = Image.open(BytesIO(image_bytes))
-                        # Upload generated image for reference
-                        try:
-                            img_path = f"/tmp/{job_id}_seg{segment_index}_shot{shot_idx}.png"
-                            with open(img_path, "wb") as f:
-                                f.write(image_bytes)
-                            await loop.run_in_executor(None, get_uploader().upload_file, img_path, f"{job_id}_seg{segment_index}_shot{shot_idx}.png", "video-images")
-                        except Exception as e:
-                            print(f"⚠️ Failed to upload generated image: {e}")
+                    try:
+                        image_bytes = await loop.run_in_executor(None, generate_with_refs)
+                        
+                        if image_bytes:
+                            from PIL import Image
+                            try:
+                                pil_image = Image.open(BytesIO(image_bytes))
+                                # Verify it's a valid image
+                                pil_image.load()  # Force load to verify
+                                print(f"  ✅ Image generated successfully for Seg {segment_index} Shot {shot_idx}")
+                                
+                                # Upload generated image for reference
+                                try:
+                                    img_path = f"/tmp/{job_id}_seg{segment_index}_shot{shot_idx}.png"
+                                    with open(img_path, "wb") as f:
+                                        f.write(image_bytes)
+                                    await loop.run_in_executor(None, get_uploader().upload_file, img_path, f"{job_id}_seg{segment_index}_shot{shot_idx}.png", "video-images")
+                                except Exception as e:
+                                    print(f"  ⚠️ Failed to upload generated image: {e}")
+                            except Exception as pil_err:
+                                print(f"  ⚠️ Image data invalid, proceeding with text-to-video: {pil_err}")
+                                pil_image = None
+                        else:
+                            print(f"  ⚠️ Image generation returned None, proceeding with text-to-video")
+                    except Exception as img_gen_err:
+                        print(f"  ⚠️ Image generation failed, proceeding with text-to-video: {img_gen_err}")
+                        pil_image = None
 
                 # B. Generate Video with Veo 3.1 (enriched prompts already applied)
                 print(f"  🎥 Seg {segment_index} Shot {shot_idx}: Generating Video with Veo 3.1 ({aspect_ratio})...")
@@ -896,8 +910,8 @@ async def process_video_generation(
                         user_images_list[use_user_image_idx].save(tmp.name)
                         input_reference = tmp.name
                 else:
-                    # A. Generate Image with Gemini 3 Pro using enriched prompt and reference images
-                    print(f"  📸 Seg {segment_index} Shot {shot_idx}: Generating Image with gemini-3-pro-image-preview...")
+                    # A. Generate Image with Gemini using enriched prompt and reference images
+                    print(f"  📸 Seg {segment_index} Shot {shot_idx}: Generating Image...")
                     
                     # Select reference images based on tier
                     ref_images_for_generation = None
@@ -918,19 +932,36 @@ async def process_video_generation(
                             resolution="4K"  # 4K quality for both tiers
                         )
                     
-                    image_bytes = await loop.run_in_executor(None, generate_with_refs)
-                    
-                    if image_bytes:
-                        # Save generated image for Sora input
-                        import tempfile
-                        with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
-                            tmp.write(image_bytes)
-                            input_reference = tmp.name
-                        # Upload generated image for reference
-                        try:
-                            await loop.run_in_executor(None, get_uploader().upload_bytes, image_bytes, f"{job_id}_seg{segment_index}_shot{shot_idx}.png")
-                        except Exception as e:
-                            print(f"⚠️ Failed to upload generated image: {e}")
+                    try:
+                        image_bytes = await loop.run_in_executor(None, generate_with_refs)
+                        
+                        if image_bytes:
+                            # Validate and save generated image for Sora input
+                            import tempfile
+                            from PIL import Image as PILImage
+                            try:
+                                # Validate the image first
+                                test_img = PILImage.open(BytesIO(image_bytes))
+                                test_img.load()  # Force load to verify
+                                
+                                with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
+                                    tmp.write(image_bytes)
+                                    input_reference = tmp.name
+                                print(f"  ✅ Image generated successfully for Seg {segment_index} Shot {shot_idx}")
+                                
+                                # Upload generated image for reference
+                                try:
+                                    await loop.run_in_executor(None, get_uploader().upload_bytes, image_bytes, f"{job_id}_seg{segment_index}_shot{shot_idx}.png")
+                                except Exception as e:
+                                    print(f"  ⚠️ Failed to upload generated image: {e}")
+                            except Exception as pil_err:
+                                print(f"  ⚠️ Image data invalid, proceeding with text-to-video: {pil_err}")
+                                input_reference = None
+                        else:
+                            print(f"  ⚠️ Image generation returned None, proceeding with text-to-video")
+                    except Exception as img_gen_err:
+                        print(f"  ⚠️ Image generation failed, proceeding with text-to-video: {img_gen_err}")
+                        input_reference = None
 
                 # B. Generate Video with Sora 2
                 print(f"  🎥 Seg {segment_index} Shot {shot_idx}: Generating Video with Sora 2...")
