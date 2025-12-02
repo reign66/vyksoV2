@@ -1,5 +1,7 @@
 import os
 import requests
+import time
+import random
 from google import genai
 from google.genai import types
 import base64
@@ -10,6 +12,69 @@ from io import BytesIO
 
 # User tier types for differentiated prompts
 UserTier = Literal["creator", "professional"]
+
+# Retry configuration for API calls
+MAX_RETRIES = 5
+INITIAL_RETRY_DELAY = 2.0  # seconds
+MAX_RETRY_DELAY = 60.0  # seconds
+RETRY_BACKOFF_MULTIPLIER = 2.0
+
+
+def retry_with_exponential_backoff(
+    func,
+    max_retries: int = MAX_RETRIES,
+    initial_delay: float = INITIAL_RETRY_DELAY,
+    max_delay: float = MAX_RETRY_DELAY,
+    backoff_multiplier: float = RETRY_BACKOFF_MULTIPLIER,
+    retryable_exceptions: tuple = (Exception,),
+):
+    """
+    Decorator/wrapper that retries a function with exponential backoff.
+    Handles rate limiting and transient API errors gracefully.
+    """
+    def wrapper(*args, **kwargs):
+        delay = initial_delay
+        last_exception = None
+        
+        for attempt in range(max_retries + 1):
+            try:
+                return func(*args, **kwargs)
+            except retryable_exceptions as e:
+                last_exception = e
+                error_str = str(e).lower()
+                
+                # Check if it's a retryable error
+                is_rate_limit = any(x in error_str for x in [
+                    'rate limit', 'quota', '429', 'resource exhausted',
+                    'too many requests', 'overloaded', 'capacity'
+                ])
+                is_transient = any(x in error_str for x in [
+                    '500', '502', '503', '504', 'internal', 'unavailable',
+                    'timeout', 'connection', 'network'
+                ])
+                
+                if attempt == max_retries:
+                    print(f"  ❌ Final retry attempt failed: {e}")
+                    raise last_exception
+                
+                if is_rate_limit or is_transient:
+                    # Add jitter to prevent thundering herd
+                    jitter = random.uniform(0.5, 1.5)
+                    wait_time = min(delay * jitter, max_delay)
+                    
+                    print(f"  ⚠️ API error (attempt {attempt + 1}/{max_retries + 1}): {str(e)[:100]}")
+                    print(f"  ⏳ Retrying in {wait_time:.1f}s...")
+                    
+                    time.sleep(wait_time)
+                    delay *= backoff_multiplier
+                else:
+                    # Non-retryable error, raise immediately
+                    print(f"  ❌ Non-retryable error: {e}")
+                    raise
+        
+        raise last_exception
+    
+    return wrapper
 
 class GeminiClient:
     def __init__(self):
@@ -30,6 +95,7 @@ class GeminiClient:
     ) -> bytes:
         """
         Generates an image using Gemini 3 Pro Image Preview model.
+        Includes robust retry logic with exponential backoff for API errors.
         
         Args:
             prompt: Text description of the image to generate
@@ -73,11 +139,20 @@ class GeminiClient:
             
             print(f"  🎨 Using model {model_to_use} for image generation (aspect_ratio={aspect_ratio}, size={resolution_normalized})...")
             
-            response = self.client.models.generate_content(
-                model=model_to_use,
-                contents=contents,
-                config=types.GenerateContentConfig(**config_kwargs)
-            )
+            # Use retry wrapper for API call with exponential backoff
+            def make_api_call():
+                return self.client.models.generate_content(
+                    model=model_to_use,
+                    contents=contents,
+                    config=types.GenerateContentConfig(**config_kwargs)
+                )
+            
+            response = retry_with_exponential_backoff(
+                make_api_call,
+                max_retries=MAX_RETRIES,
+                initial_delay=INITIAL_RETRY_DELAY,
+                max_delay=MAX_RETRY_DELAY
+            )()
             
             # Debug: Log response structure
             print(f"  📋 Response received, checking for image data...")
@@ -334,13 +409,21 @@ class GeminiClient:
             Transform this into a VIRAL TikTok/YouTube Shorts video prompt. Make it irresistible to scroll past!
             """
             
-            response = self.client.models.generate_content(
-                model="gemini-2.0-flash-lite",
-                contents=user_content,
-                config=types.GenerateContentConfig(
-                    system_instruction=system_instruction,
+            # Use retry wrapper for API call
+            def make_enrich_call():
+                return self.client.models.generate_content(
+                    model="gemini-2.0-flash-lite",
+                    contents=user_content,
+                    config=types.GenerateContentConfig(
+                        system_instruction=system_instruction,
+                    )
                 )
-            )
+            
+            response = retry_with_exponential_backoff(
+                make_enrich_call,
+                max_retries=3,  # Fewer retries for enrichment (non-critical)
+                initial_delay=1.0
+            )()
             
             enriched = response.text.strip()
             final_prompt = f"{enriched}{creator_suffix}"
@@ -394,13 +477,21 @@ class GeminiClient:
             Transform this into a PROFESSIONAL ADVERTISING video prompt. Premium quality, conversion-focused, brand-safe.
             """
             
-            response = self.client.models.generate_content(
-                model="gemini-2.0-flash-lite",
-                contents=user_content,
-                config=types.GenerateContentConfig(
-                    system_instruction=system_instruction,
+            # Use retry wrapper for API call
+            def make_enrich_call():
+                return self.client.models.generate_content(
+                    model="gemini-2.0-flash-lite",
+                    contents=user_content,
+                    config=types.GenerateContentConfig(
+                        system_instruction=system_instruction,
+                    )
                 )
-            )
+            
+            response = retry_with_exponential_backoff(
+                make_enrich_call,
+                max_retries=3,  # Fewer retries for enrichment (non-critical)
+                initial_delay=1.0
+            )()
             
             enriched = response.text.strip()
             final_prompt = f"{enriched}{professional_suffix}"
@@ -414,7 +505,7 @@ class GeminiClient:
     def describe_image_from_url(self, image_url: str) -> str:
         """
         Analyzes a user-provided image and returns a description for prompt enrichment.
-        Uses gemini-2.5-flash-lite for fast text generation.
+        Uses gemini-2.0-flash-lite for fast text generation with retry logic.
         """
         try:
             # Download the image
@@ -427,13 +518,21 @@ class GeminiClient:
                 mime_type="image/png"
             )
             
-            response = self.client.models.generate_content(
-                model="gemini-2.0-flash-lite",
-                contents=[
-                    image_part,
-                    "Describe this image in detail for TikTok/Shorts video generation. Focus on: subjects, setting, colors, mood, style, key visual elements. Keep it under 200 characters."
-                ]
-            )
+            # Use retry wrapper for image description
+            def make_describe_call():
+                return self.client.models.generate_content(
+                    model="gemini-2.0-flash-lite",
+                    contents=[
+                        image_part,
+                        "Describe this image in detail for TikTok/Shorts video generation. Focus on: subjects, setting, colors, mood, style, key visual elements. Keep it under 200 characters."
+                    ]
+                )
+            
+            response = retry_with_exponential_backoff(
+                make_describe_call,
+                max_retries=2,  # Quick fallback for descriptions
+                initial_delay=1.0
+            )()
             
             return response.text.strip()
         except Exception as e:
@@ -496,14 +595,22 @@ class GeminiClient:
         """
         
         try:
-            response = self.client.models.generate_content(
-                model="gemini-2.0-flash-lite",
-                contents=user_content,
-                config=types.GenerateContentConfig(
-                    system_instruction=system_instruction,
-                    response_mime_type="application/json"
+            # Use retry wrapper for script generation API call
+            def make_script_call():
+                return self.client.models.generate_content(
+                    model="gemini-2.0-flash-lite",
+                    contents=user_content,
+                    config=types.GenerateContentConfig(
+                        system_instruction=system_instruction,
+                        response_mime_type="application/json"
+                    )
                 )
-            )
+            
+            response = retry_with_exponential_backoff(
+                make_script_call,
+                max_retries=3,  # Script generation is important
+                initial_delay=1.5
+            )()
             
             response_text = response.text
             
@@ -814,14 +921,22 @@ class GeminiClient:
             Extract keywords for a viral YouTube Shorts thumbnail.
             """
             
-            response = self.client.models.generate_content(
-                model="gemini-2.0-flash-lite",
-                contents=user_content,
-                config=types.GenerateContentConfig(
-                    system_instruction=system_instruction,
-                    response_mime_type="application/json"
+            # Use retry wrapper for keyword extraction
+            def make_keyword_call():
+                return self.client.models.generate_content(
+                    model="gemini-2.0-flash-lite",
+                    contents=user_content,
+                    config=types.GenerateContentConfig(
+                        system_instruction=system_instruction,
+                        response_mime_type="application/json"
+                    )
                 )
-            )
+            
+            response = retry_with_exponential_backoff(
+                make_keyword_call,
+                max_retries=2,  # Quick fallback for keywords
+                initial_delay=1.0
+            )()
             
             import json
             extracted = json.loads(response.text)
@@ -913,19 +1028,28 @@ Style: Cinematic, eye-catching, clickbait thumbnail style, designed for maximum 
         """
         Fallback thumbnail generation using gemini-3-pro-image-preview.
         Uses proper API format with TEXT + IMAGE modalities and image config.
+        Includes retry logic with exponential backoff.
         """
         try:
-            response = self.client.models.generate_content(
-                model='gemini-3-pro-image-preview',
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_modalities=['TEXT', 'IMAGE'],
-                    image_config=types.ImageConfig(
-                        aspect_ratio="9:16",
-                        image_size="2K"  # Uppercase as required by API
+            # Use retry wrapper for thumbnail generation
+            def make_thumbnail_call():
+                return self.client.models.generate_content(
+                    model='gemini-3-pro-image-preview',
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        response_modalities=['TEXT', 'IMAGE'],
+                        image_config=types.ImageConfig(
+                            aspect_ratio="9:16",
+                            image_size="2K"  # Uppercase as required by API
+                        )
                     )
                 )
-            )
+            
+            response = retry_with_exponential_backoff(
+                make_thumbnail_call,
+                max_retries=MAX_RETRIES,
+                initial_delay=INITIAL_RETRY_DELAY
+            )()
             
             # Extract image from response (skip thought images)
             for part in response.parts:

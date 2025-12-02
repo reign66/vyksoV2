@@ -637,6 +637,10 @@ async def process_video_generation(
             tier_aspect_ratio = get_aspect_ratio_for_tier(user_tier)
             print(f"📐 Aspect ratio for {user_tier.upper()} tier: {tier_aspect_ratio}")
             
+            # Semaphore to limit concurrent API calls (prevents rate limiting)
+            # Limit to 3 concurrent image generation calls to avoid overwhelming Gemini API
+            image_gen_semaphore = asyncio.Semaphore(3)
+            
             async def process_shot(segment_index, shot_data, user_images_list, tier=user_tier, aspect_ratio=tier_aspect_ratio):
                 """Helper to process a single shot: Image Gen -> Video Gen with Veo 3.1"""
                 shot_idx = shot_data.get("shot_index", 0)
@@ -681,7 +685,11 @@ async def process_video_generation(
                         )
                     
                     try:
-                        image_bytes = await loop.run_in_executor(None, generate_with_refs)
+                        # Use semaphore to limit concurrent image generation calls (VEO path)
+                        async with image_gen_semaphore:
+                            # Add small delay between calls to avoid rate limiting
+                            await asyncio.sleep(0.5)
+                            image_bytes = await loop.run_in_executor(None, generate_with_refs)
                         
                         if image_bytes:
                             from PIL import Image
@@ -886,6 +894,10 @@ async def process_video_generation(
             tier_aspect_ratio = get_aspect_ratio_for_tier(user_tier)
             print(f"📐 Aspect ratio for {user_tier.upper()} tier (Sora): {tier_aspect_ratio}")
             
+            # Semaphore to limit concurrent API calls for Sora path (prevents rate limiting)
+            # Limit to 3 concurrent image generation calls to avoid overwhelming Gemini API
+            sora_image_gen_semaphore = asyncio.Semaphore(3)
+            
             async def process_sora_shot(segment_index, shot_data, user_images_list, tier=user_tier, aspect_ratio=tier_aspect_ratio):
                 """Helper to process a single shot: Image Gen -> Video Gen with Sora 2"""
                 shot_idx = shot_data.get("shot_index", 0)
@@ -933,7 +945,11 @@ async def process_video_generation(
                         )
                     
                     try:
-                        image_bytes = await loop.run_in_executor(None, generate_with_refs)
+                        # Use semaphore to limit concurrent image generation calls (Sora path)
+                        async with sora_image_gen_semaphore:
+                            # Add small delay between calls to avoid rate limiting
+                            await asyncio.sleep(0.5)
+                            image_bytes = await loop.run_in_executor(None, generate_with_refs)
                         
                         if image_bytes:
                             # Validate and save generated image for Sora input
