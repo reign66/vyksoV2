@@ -739,12 +739,25 @@ async def process_video_generation(
             
             if script and "segments" in script:
                 tasks = []
+                total_segments = len(script["segments"])
+                total_shots = 0
+                
                 # Create tasks for ALL shots across ALL segments
                 for segment in script["segments"]:
                     seg_idx = segment.get("segment_index", 0)
-                    for shot in segment.get("shots", []):
+                    shots = segment.get("shots", [])
+                    total_shots += len(shots)
+                    
+                    for shot in shots:
                         tasks.append(process_shot(seg_idx, shot, user_pil_images))
                 
+                # Log detailed generation plan
+                expected_duration = total_segments * 8  # Veo uses 8s segments
+                print(f"📊 GENERATION PLAN:")
+                print(f"   - Requested duration: {duration}s")
+                print(f"   - Segments to generate: {total_segments}")
+                print(f"   - Total shots: {total_shots}")
+                print(f"   - Expected output duration: {expected_duration}s")
                 print(f"🚀 Launching {len(tasks)} parallel generation tasks with enriched prompts...")
                 # Run all tasks in parallel
                 results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -997,12 +1010,25 @@ async def process_video_generation(
             
             if script and "segments" in script:
                 tasks = []
+                total_segments = len(script["segments"])
+                total_shots = 0
+                
                 # Create tasks for ALL shots across ALL segments
                 for segment in script["segments"]:
                     seg_idx = segment.get("segment_index", 0)
-                    for shot in segment.get("shots", []):
+                    shots = segment.get("shots", [])
+                    total_shots += len(shots)
+                    
+                    for shot in shots:
                         tasks.append(process_sora_shot(seg_idx, shot, user_pil_images))
                 
+                # Log detailed generation plan
+                expected_duration = total_segments * 10  # Sora uses 10s segments
+                print(f"📊 GENERATION PLAN (Sora):")
+                print(f"   - Requested duration: {duration}s")
+                print(f"   - Segments to generate: {total_segments}")
+                print(f"   - Total shots: {total_shots}")
+                print(f"   - Expected output duration: {expected_duration}s")
                 print(f"🚀 Launching {len(tasks)} parallel generation tasks with enriched prompts...")
                 # Run all tasks in parallel
                 results = await asyncio.gather(*tasks, return_exceptions=True)

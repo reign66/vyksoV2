@@ -297,41 +297,41 @@ class GeminiClient:
         Enriches prompt for CREATOR tier - optimized for TikTok/YouTube Shorts.
         Focus on viral content, attention-grabbing visuals, trendy aesthetics.
         Aspect ratio: 9:16 VERTICAL
+        
+        IMPORTANT: Must preserve the original subject/content while enhancing visuals.
         """
         # TikTok Shorts aesthetic suffix - VERTICAL 9:16
-        creator_suffix = ", VERTICAL 9:16 aspect ratio REQUIRED, TikTok Shorts aesthetic, high contrast vibrant colors, trending social media style, viral potential, 4K quality, hook in first 3 seconds, mobile-first vertical composition"
+        creator_suffix = ", VERTICAL 9:16 aspect ratio REQUIRED, TikTok Shorts aesthetic, high contrast vibrant colors, 4K quality, mobile-first vertical composition"
         
         try:
             system_instruction = """
-            You are an expert TikTok/YouTube Shorts content creator and viral video specialist.
-            Your task is to enrich video/image generation prompts to produce VIRAL, engaging short-form content.
+            You are an expert at enhancing video prompts for TikTok/YouTube Shorts.
             
-            CREATOR STYLE RULES:
-            1. Keep the original intent but make it MORE EXCITING and attention-grabbing
-            2. Add dynamic camera movements (quick zooms, sweeping shots, dramatic reveals)
-            3. Use bold, saturated colors that POP on mobile screens
-            4. Include trendy visual effects (glitch effects, speed ramps, transitions)
-            5. Create INSTANT HOOKS - the first frame must grab attention
-            6. Use high energy, fast-paced visual storytelling
-            7. Incorporate current social media trends and aesthetics
-            8. If a user image is mentioned, make it the star of a viral moment
-            9. Keep the prompt under 400 characters
-            10. Output ONLY the enriched prompt, nothing else
+            CRITICAL RULE - PRESERVE THE ORIGINAL CONTENT:
+            - You MUST keep the EXACT SAME subject, topic, and core idea from the original prompt
+            - If the original says "a cat eating pizza", your output MUST still be about a cat eating pizza
+            - If the original says "a car driving through mountains", keep that exact subject
+            - DO NOT replace or change the main subject/topic
+            - DO NOT add unrelated elements that change the video's meaning
             
-            VIRAL ELEMENTS TO INCLUDE:
-            - Dramatic lighting changes
-            - Unexpected visual twists
-            - Satisfying visual moments
-            - Relatable/shareable content hooks
-            - Mobile-optimized composition (centered subjects)
+            YOUR JOB IS ONLY TO:
+            1. Add visual enhancement details (lighting, camera angles, colors)
+            2. Add production quality descriptors (cinematic, dramatic, smooth)
+            3. Add TikTok-style visual flair (bold colors, dynamic composition)
+            4. Keep prompts concise (under 350 characters)
+            
+            WRONG: Original "cat eating pizza" → Output "dog running in park" (changed subject!)
+            RIGHT: Original "cat eating pizza" → Output "adorable cat eating delicious pizza slice, close-up, dramatic lighting, satisfying moment, bold colors"
+            
+            Output ONLY the enriched prompt, nothing else.
             """
             
             user_content = f"""
-            Original prompt: {base_prompt}
+            Original prompt (KEEP THIS SUBJECT): {base_prompt}
             {f'Scene context: {segment_context}' if segment_context else ''}
-            {f'User provided image to feature: {user_image_description}' if user_image_description else ''}
+            {f'User image to feature: {user_image_description}' if user_image_description else ''}
             
-            Transform this into a VIRAL TikTok/YouTube Shorts video prompt. Make it irresistible to scroll past!
+            Enhance this prompt visually while KEEPING THE SAME SUBJECT AND TOPIC.
             """
             
             response = self.client.models.generate_content(
@@ -344,7 +344,7 @@ class GeminiClient:
             
             enriched = response.text.strip()
             final_prompt = f"{enriched}{creator_suffix}"
-            print(f"📝 [CREATOR] Enriched prompt: {final_prompt[:100]}...")
+            print(f"📝 [CREATOR] Enriched: {final_prompt[:100]}...")
             return final_prompt
             
         except Exception as e:
@@ -356,42 +356,41 @@ class GeminiClient:
         Enriches prompt for PROFESSIONAL tier - optimized for ads, commercials, brand content.
         Focus on polished, high-end production quality, brand-safe, conversion-focused.
         Aspect ratio: 16:9 HORIZONTAL (widescreen for professional ads)
+        
+        IMPORTANT: Must preserve the original subject/content while enhancing production value.
         """
         # Professional ad aesthetic suffix - HORIZONTAL 16:9 WIDESCREEN
-        professional_suffix = ", HORIZONTAL 16:9 widescreen aspect ratio REQUIRED, cinematic commercial format, premium advertising quality, professional color grading, brand-safe content, high-end production value, 4K HDR quality, commercial grade, widescreen composition"
+        professional_suffix = ", HORIZONTAL 16:9 widescreen aspect ratio REQUIRED, cinematic commercial format, premium advertising quality, professional color grading, 4K HDR quality, widescreen composition"
         
         try:
             system_instruction = """
-            You are an elite advertising director and commercial cinematographer.
-            Your task is to enrich video/image generation prompts for PROFESSIONAL ADVERTISING content.
+            You are an expert at enhancing video prompts for professional advertising.
             
-            PROFESSIONAL AD STYLE RULES:
-            1. Maintain brand-safe, polished, premium aesthetics
-            2. Use sophisticated camera work (smooth tracking shots, elegant reveals, product showcases)
-            3. Apply refined, professional color grading (not oversaturated - elegant and clean)
-            4. Create aspirational, lifestyle-driven narratives
-            5. Focus on product/service benefits and emotional connection
-            6. Use professional lighting setups (3-point lighting, soft fills, dramatic key lights)
-            7. Include subtle but effective call-to-action moments
-            8. If a user image is mentioned, integrate it as a premium product/brand showcase
-            9. Keep the prompt under 400 characters
-            10. Output ONLY the enriched prompt, nothing else
+            CRITICAL RULE - PRESERVE THE ORIGINAL CONTENT:
+            - You MUST keep the EXACT SAME product, brand, subject, and core message from the original prompt
+            - If the original says "luxury watch on marble table", keep that exact subject
+            - If the original says "coffee brand commercial", keep that exact product focus
+            - DO NOT replace or change the main subject/product/topic
+            - DO NOT add unrelated elements that change the ad's message
             
-            ADVERTISING ELEMENTS TO INCLUDE:
-            - Clean, uncluttered compositions
-            - Professional model/product positioning
-            - Aspirational lifestyle imagery
-            - Trust-building visual elements
-            - Conversion-focused storytelling arcs
-            - Multi-sequence narrative potential (for longer ads)
+            YOUR JOB IS ONLY TO:
+            1. Add professional production details (lighting, camera angles, composition)
+            2. Add premium quality descriptors (cinematic, elegant, refined)
+            3. Add advertising-grade visual elements (smooth movements, product focus)
+            4. Keep prompts concise (under 350 characters)
+            
+            WRONG: Original "luxury watch commercial" → Output "smartphone ad" (changed product!)
+            RIGHT: Original "luxury watch commercial" → Output "luxury watch elegantly displayed, cinematic lighting, macro detail shot, premium feel, aspirational lifestyle"
+            
+            Output ONLY the enriched prompt, nothing else.
             """
             
             user_content = f"""
-            Original prompt: {base_prompt}
+            Original prompt (KEEP THIS SUBJECT/PRODUCT): {base_prompt}
             {f'Sequence context: {segment_context}' if segment_context else ''}
-            {f'Brand/product image to feature: {user_image_description}' if user_image_description else ''}
+            {f'Brand/product image: {user_image_description}' if user_image_description else ''}
             
-            Transform this into a PROFESSIONAL ADVERTISING video prompt. Premium quality, conversion-focused, brand-safe.
+            Enhance this prompt professionally while KEEPING THE SAME SUBJECT AND PRODUCT.
             """
             
             response = self.client.models.generate_content(
@@ -404,7 +403,7 @@ class GeminiClient:
             
             enriched = response.text.strip()
             final_prompt = f"{enriched}{professional_suffix}"
-            print(f"📝 [PROFESSIONAL] Enriched prompt: {final_prompt[:100]}...")
+            print(f"📝 [PROFESSIONAL] Enriched: {final_prompt[:100]}...")
             return final_prompt
             
         except Exception as e:
@@ -549,7 +548,33 @@ class GeminiClient:
                 print(f"❌ Invalid script structure: 'segments' is empty or not a list")
                 return None
             
-            print(f"📜 Script generated with {len(segments)} segments for {user_tier.upper()} tier")
+            # CRITICAL: Validate we have the correct number of segments
+            actual_segments = len(segments)
+            print(f"📜 Script generated with {actual_segments}/{num_segments} segments for {user_tier.upper()} tier")
+            
+            if actual_segments < num_segments:
+                print(f"⚠️ WARNING: Got {actual_segments} segments but requested {num_segments}!")
+                print(f"⚠️ This will result in a shorter video than expected ({actual_segments * segment_duration}s instead of {duration}s)")
+                
+                # Try to fill in missing segments by duplicating/extending
+                while len(segments) < num_segments:
+                    # Clone the last segment with incremented index
+                    last_segment = segments[-1].copy()
+                    last_segment["segment_index"] = len(segments) + 1
+                    
+                    # Update shot prompts to indicate continuation
+                    if "shots" in last_segment:
+                        for shot in last_segment["shots"]:
+                            if "video_prompt" in shot:
+                                shot["video_prompt"] = f"Continuation: {shot['video_prompt']}"
+                            if "image_prompt" in shot:
+                                shot["image_prompt"] = f"Continuation: {shot['image_prompt']}"
+                    
+                    segments.append(last_segment)
+                    print(f"➕ Added filler segment {len(segments)} (cloned from previous)")
+                
+                script["segments"] = segments
+                print(f"✅ Segments extended to {len(segments)}")
             
             # Enrich all prompts in the script with tier-specific enrichment
             for segment in segments:
@@ -603,26 +628,29 @@ class GeminiClient:
         You are an expert TikTok/YouTube Shorts video director specializing in VIRAL content.
         Create a script optimized for short-form social media that will get maximum engagement.
         
-        CRITICAL: This is a CREATOR tier video with 9:16 VERTICAL aspect ratio for mobile viewing.
-        All prompts MUST be composed for VERTICAL mobile-first viewing!
+        CRITICAL REQUIREMENTS:
+        1. You MUST create EXACTLY the number of segments requested (see "Number of Segments" in the input)
+        2. Each segment is {segment_duration} seconds long
+        3. NEVER skip segments or create fewer than requested
+        4. ASPECT RATIO: 9:16 VERTICAL (TikTok/Shorts/Reels format)
         
-        VIDEO STRUCTURE:
-        - Each segment is {segment_duration} seconds
-        - ASPECT RATIO: 9:16 VERTICAL (TikTok/Shorts/Reels format)
-        - For CREATOR tier: Keep it SIMPLE - 1 main shot per segment for scene changes
-        - Generate 1-3 images per segment to create visual variety within the scene
-        - User has provided {num_user_images} reference images that can be used
+        IMPORTANT - FAITHFULNESS TO ORIGINAL PROMPT:
+        - You MUST stay TRUE to the user's original prompt/topic
+        - DO NOT change the subject matter, theme, or core idea
+        - Enhance the VISUAL execution but keep the SAME content/story
+        - If user asks for "a cat eating pizza", the video MUST show a cat eating pizza, not something else
         
-        CREATOR STYLE REQUIREMENTS:
+        CREATOR STYLE (while staying faithful to topic):
         - VERTICAL COMPOSITION: All visuals composed for 9:16 mobile portrait viewing
-        - VIRAL HOOKS: First 3 seconds must be impossibly attention-grabbing
-        - FAST PACING: Quick cuts, dynamic transitions, never boring
+        - VIRAL HOOKS: First 3 seconds must be attention-grabbing
         - BOLD VISUALS: Saturated colors, high contrast, mobile-optimized
-        - TRENDY: Use current TikTok trends, challenges, aesthetics
-        - EMOTIONAL: Create surprise, awe, humor, or curiosity
         - CENTERED SUBJECTS: Keep main subject centered for mobile viewing
         
-        Output JSON format:
+        STRUCTURE:
+        - Each segment = 1 main shot with optional scene variations
+        - User has provided {num_user_images} reference images
+        
+        Output JSON format (MUST include ALL requested segments):
         {{
             "segments": [
                 {{
@@ -630,20 +658,19 @@ class GeminiClient:
                     "shots": [
                         {{
                             "shot_index": 1,
-                            "image_prompt": "9:16 vertical composition, detailed visual for the main scene...",
-                            "video_prompt": "Vertical format, dynamic motion and action description...",
+                            "image_prompt": "9:16 vertical, [EXACT subject from user prompt], detailed visual...",
+                            "video_prompt": "Vertical format, [EXACT action from user prompt], motion...",
                             "duration": {segment_duration},
-                            "use_user_image_index": null,
-                            "scene_images": ["vertical variation 1", "vertical variation 2"]
+                            "use_user_image_index": null
                         }}
                     ]
-                }}
+                }},
+                // CONTINUE for ALL segments requested!
             ]
         }}
         
         Note: "use_user_image_index" can be 0-{num_user_images - 1 if num_user_images > 0 else 0} to use a user image, or null to generate.
-        "scene_images" contains 1-3 additional image prompts for scene variety (scene changes within the segment).
-        ALL PROMPTS must specify vertical 9:16 composition for mobile viewing!
+        CRITICAL: Create the EXACT number of segments requested. Do NOT create fewer!
         """
 
     def _get_professional_script_instruction(self, segment_duration: int, num_user_images: int) -> str:
@@ -653,26 +680,29 @@ class GeminiClient:
         You are an elite advertising director creating a PROFESSIONAL commercial video.
         Create a script optimized for conversion, brand building, and premium production quality.
         
-        CRITICAL: This is a PROFESSIONAL tier video with 16:9 HORIZONTAL WIDESCREEN aspect ratio.
-        All prompts MUST be composed for WIDESCREEN horizontal viewing, NOT vertical!
+        CRITICAL REQUIREMENTS:
+        1. You MUST create EXACTLY the number of segments requested (see "Number of Segments" in the input)
+        2. Each segment is {segment_duration} seconds long
+        3. NEVER skip segments or create fewer than requested
+        4. ASPECT RATIO: 16:9 HORIZONTAL WIDESCREEN
         
-        VIDEO STRUCTURE:
-        - Each segment is {segment_duration} seconds
-        - ASPECT RATIO: 16:9 HORIZONTAL WIDESCREEN (like TV commercials, YouTube ads)
-        - For PROFESSIONAL tier: Multiple sequences with narrative arc
-        - Multiple shots per segment for complex storytelling
-        - User has provided {num_user_images} brand/product images that should be featured
+        IMPORTANT - FAITHFULNESS TO ORIGINAL PROMPT:
+        - You MUST stay TRUE to the user's original prompt/topic/product
+        - DO NOT change the subject matter, brand, or core message
+        - Enhance the PRODUCTION QUALITY but keep the SAME content/story
+        - If user asks for "a luxury watch commercial", the video MUST show that product
         
-        PROFESSIONAL AD REQUIREMENTS:
+        PROFESSIONAL STYLE (while staying faithful to topic):
         - WIDESCREEN COMPOSITION: All visuals composed for 16:9 horizontal viewing
         - NARRATIVE ARC: Problem → Solution → Benefit → CTA flow
-        - PREMIUM QUALITY: Cinematic lighting, elegant composition, refined colors
-        - BRAND SAFE: Professional, trustworthy, aspirational imagery
-        - PRODUCT FOCUS: Clear product/service showcase moments
-        - CONVERSION: Build desire and urgency, clear value proposition
-        - MULTI-SEQUENCE: Create coherent story across segments
+        - PREMIUM QUALITY: Cinematic lighting, elegant composition
+        - BRAND SAFE: Professional, trustworthy imagery
         
-        Output JSON format:
+        STRUCTURE:
+        - Each segment = multiple shots for storytelling
+        - User has provided {num_user_images} brand images
+        
+        Output JSON format (MUST include ALL requested segments):
         {{
             "segments": [
                 {{
@@ -681,21 +711,19 @@ class GeminiClient:
                     "shots": [
                         {{
                             "shot_index": 1,
-                            "image_prompt": "16:9 widescreen horizontal composition, premium visual...",
-                            "video_prompt": "Widescreen cinematic camera movement, sophisticated action...",
+                            "image_prompt": "16:9 widescreen, [EXACT product/subject from user prompt]...",
+                            "video_prompt": "Widescreen cinematic, [EXACT action from user prompt]...",
                             "duration": {segment_duration},
-                            "use_user_image_index": null,
-                            "scene_images": ["wide angle 1", "product detail", "lifestyle shot"]
+                            "use_user_image_index": null
                         }}
                     ]
-                }}
+                }},
+                // CONTINUE for ALL segments requested!
             ]
         }}
         
         Note: "use_user_image_index" can be 0-{num_user_images - 1 if num_user_images > 0 else 0} to feature a brand image, or null to generate.
-        "scene_images" contains multiple image prompts for comprehensive product/brand coverage.
-        "narrative_beat" describes where this segment fits in the ad's story arc.
-        ALL PROMPTS must specify horizontal 16:9 widescreen composition!
+        CRITICAL: Create the EXACT number of segments requested. Do NOT create fewer!
         """
 
     def generate_thumbnail(self, title: str, description: str, original_prompt: str) -> tuple:
