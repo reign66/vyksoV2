@@ -53,11 +53,35 @@ class VeoAIClient:
         model_name = self.MODEL_FAST if use_fast_model else self.MODEL_NORMAL
         print(f"🎥 Using Veo 3.1 model: {model_name}")
 
+        # Validate and normalize duration for Veo 3.1 (must be 4, 6, or 8 seconds)
+        # Veo 3.1 only supports these specific durations
+        valid_durations = [4, 6, 8]
+        if duration_seconds not in valid_durations:
+            # Round to nearest valid duration
+            if duration_seconds < 5:
+                duration_seconds = 4
+            elif duration_seconds < 7:
+                duration_seconds = 6
+            else:
+                duration_seconds = 8
+        
+        print(f"⏱️ Video duration: {duration_seconds}s")
+        
         # Build config using types.GenerateVideosConfig (required by Veo 3.1 API)
+        # IMPORTANT: Use camelCase for API parameters (durationSeconds, not duration_seconds)
         config_kwargs = {
             "aspect_ratio": aspect_ratio,
             "number_of_videos": 1,
+            "duration_seconds": duration_seconds,  # SDK converts snake_case to camelCase
         }
+        
+        # Add resolution if specified (720p or 1080p)
+        # Note: 1080p only supports 8s duration
+        if resolution:
+            if resolution == "1080p" and duration_seconds != 8:
+                print(f"⚠️ 1080p resolution only supports 8s duration, adjusting...")
+                config_kwargs["duration_seconds"] = 8
+            config_kwargs["resolution"] = resolution
         
         # Person generation based on whether we have an image
         if image:
@@ -70,6 +94,7 @@ class VeoAIClient:
 
         # Create GenerateVideosConfig object
         config = types.GenerateVideosConfig(**config_kwargs)
+        print(f"📋 Veo 3.1 config: duration={duration_seconds}s, aspect_ratio={aspect_ratio}, resolution={resolution}")
 
         # Build kwargs for generate_videos
         kwargs = {
