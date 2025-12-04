@@ -439,42 +439,44 @@ class GeminiClient:
         Enriches prompt for PROFESSIONAL tier - optimized for ads, commercials, brand content.
         Focus on polished, high-end production quality, brand-safe, conversion-focused.
         Aspect ratio: 16:9 HORIZONTAL (widescreen for professional ads)
+        
+        IMPORTANT: This method ENHANCES the original prompt, it does NOT replace it.
+        The user's original content, brand names, and products MUST be preserved.
         """
         # Professional ad aesthetic suffix - HORIZONTAL 16:9 WIDESCREEN
-        professional_suffix = ", HORIZONTAL 16:9 widescreen aspect ratio REQUIRED, cinematic commercial format, premium advertising quality, professional color grading, brand-safe content, high-end production value, 4K HDR quality, commercial grade, widescreen composition"
+        professional_suffix = ", HORIZONTAL 16:9 widescreen aspect ratio, cinematic commercial format, premium advertising quality, professional color grading, 4K HDR quality"
         
         try:
             system_instruction = """
-            You are an elite advertising director and commercial cinematographer.
-            Your task is to enrich video/image generation prompts for PROFESSIONAL ADVERTISING content.
+            You are an expert at enhancing video prompts for professional quality output.
             
-            PROFESSIONAL AD STYLE RULES:
-            1. Maintain brand-safe, polished, premium aesthetics
-            2. Use sophisticated camera work (smooth tracking shots, elegant reveals, product showcases)
-            3. Apply refined, professional color grading (not oversaturated - elegant and clean)
-            4. Create aspirational, lifestyle-driven narratives
-            5. Focus on product/service benefits and emotional connection
-            6. Use professional lighting setups (3-point lighting, soft fills, dramatic key lights)
-            7. Include subtle but effective call-to-action moments
-            8. If a user image is mentioned, integrate it as a premium product/brand showcase
-            9. Keep the prompt under 400 characters
-            10. Output ONLY the enriched prompt, nothing else
+            CRITICAL RULES - MUST FOLLOW:
+            1. PRESERVE the user's original content, brand names, product names, and specific requests EXACTLY
+            2. DO NOT invent new scenes, products, or storylines - only enhance what the user asked for
+            3. DO NOT replace the user's request with generic advertising content
+            4. Keep the SAME subject matter, just add technical/cinematic details
             
-            ADVERTISING ELEMENTS TO INCLUDE:
-            - Clean, uncluttered compositions
-            - Professional model/product positioning
-            - Aspirational lifestyle imagery
-            - Trust-building visual elements
-            - Conversion-focused storytelling arcs
-            - Multi-sequence narrative potential (for longer ads)
+            YOUR ONLY JOB is to ADD these technical details to the original prompt:
+            - Camera movement suggestions (smooth tracking, slow zoom, etc.)
+            - Lighting details (soft lighting, golden hour, etc.)
+            - Composition tips (rule of thirds, centered subject, etc.)
+            - Professional quality indicators (4K, cinematic, etc.)
+            
+            EXAMPLE:
+            - Input: "Show my product XYZ on a table"
+            - Good output: "Show my product XYZ on a table, smooth tracking shot, soft studio lighting, shallow depth of field, 4K cinematic quality"
+            - BAD output: "Elegant seaside scene with luxury product..." (THIS IS WRONG - you changed the scene!)
+            
+            Keep the prompt under 400 characters.
+            Output ONLY the enhanced prompt, nothing else.
             """
             
             user_content = f"""
-            Original prompt: {base_prompt}
-            {f'Sequence context: {segment_context}' if segment_context else ''}
-            {f'Brand/product image to feature: {user_image_description}' if user_image_description else ''}
+            Original prompt (KEEP THIS CONTENT): {base_prompt}
+            {f'Context: {segment_context}' if segment_context else ''}
+            {f'Reference image shows: {user_image_description}' if user_image_description else ''}
             
-            Transform this into a PROFESSIONAL ADVERTISING video prompt. Premium quality, conversion-focused, brand-safe.
+            Add ONLY technical/cinematic enhancement details. DO NOT change the subject matter or scene.
             """
             
             # Use retry wrapper for API call
