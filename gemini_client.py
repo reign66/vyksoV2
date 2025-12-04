@@ -757,54 +757,62 @@ class GeminiClient:
 
     def _get_professional_script_instruction(self, segment_duration: int, num_user_images: int) -> str:
         """Returns system instruction for PROFESSIONAL tier video scripts (ads).
-        Uses 16:9 HORIZONTAL widescreen aspect ratio for professional commercials."""
+        Uses 16:9 HORIZONTAL widescreen aspect ratio for professional commercials.
+        
+        CRITICAL: This method must PRESERVE the user's original prompt content.
+        """
         return f"""
-        You are an elite advertising director creating a PROFESSIONAL commercial video.
-        Create a script optimized for conversion, brand building, and premium production quality.
+        You are a professional video director. Your job is to break down the user's video request into segments.
         
-        CRITICAL: This is a PROFESSIONAL tier video with 16:9 HORIZONTAL WIDESCREEN aspect ratio.
-        All prompts MUST be composed for WIDESCREEN horizontal viewing, NOT vertical!
+        CRITICAL RULES - YOU MUST FOLLOW THESE:
+        1. PRESERVE the user's original content, brand names, product names, and specific requests EXACTLY
+        2. DO NOT invent new scenes or storylines - only break down what the user asked for
+        3. DO NOT replace the user's request with generic advertising content
+        4. Each segment should show a DIFFERENT PART of what the user requested
+        5. If the user asks for a video about "Product X on a beach", ALL segments must be about "Product X on a beach"
         
-        VIDEO STRUCTURE:
-        - Each segment is {segment_duration} seconds
-        - ASPECT RATIO: 16:9 HORIZONTAL WIDESCREEN (like TV commercials, YouTube ads)
-        - For PROFESSIONAL tier: Multiple sequences with narrative arc
-        - Multiple shots per segment for complex storytelling
-        - User has provided {num_user_images} brand/product images that should be featured
+        TECHNICAL REQUIREMENTS:
+        - Each segment is {segment_duration} seconds long
+        - Aspect ratio: 16:9 HORIZONTAL WIDESCREEN
+        - You MUST create exactly the number of segments requested to fill the total duration
+        - User has provided {num_user_images} reference images that can be used
         
-        PROFESSIONAL AD REQUIREMENTS:
-        - WIDESCREEN COMPOSITION: All visuals composed for 16:9 horizontal viewing
-        - NARRATIVE ARC: Problem → Solution → Benefit → CTA flow
-        - PREMIUM QUALITY: Cinematic lighting, elegant composition, refined colors
-        - BRAND SAFE: Professional, trustworthy, aspirational imagery
-        - PRODUCT FOCUS: Clear product/service showcase moments
-        - CONVERSION: Build desire and urgency, clear value proposition
-        - MULTI-SEQUENCE: Create coherent story across segments
+        YOUR ONLY JOB:
+        - Take the user's EXACT request
+        - Break it into {segment_duration}-second segments
+        - Add ONLY technical details (camera angles, lighting, composition)
+        - Keep the SAME subject matter in every segment
+        
+        EXAMPLE:
+        - User request: "Video of my product Vareuse on a beach at sunset"
+        - Segment 1: "Vareuse product displayed on sandy beach, golden sunset lighting, 16:9 widescreen, slow pan"
+        - Segment 2: "Close-up of Vareuse details, beach waves in background, warm sunset colors, 16:9"
+        - Segment 3: "Wide shot of Vareuse with ocean horizon, dramatic sunset sky, cinematic 16:9"
+        
+        BAD EXAMPLE (DO NOT DO THIS):
+        - User request: "Video of my product Vareuse on a beach"
+        - Segment 1: "Elegant woman on yacht..." (WRONG - user didn't ask for yacht or woman!)
         
         Output JSON format:
         {{
             "segments": [
                 {{
                     "segment_index": 1,
-                    "narrative_beat": "introduction/problem/solution/benefit/cta",
                     "shots": [
                         {{
                             "shot_index": 1,
-                            "image_prompt": "16:9 widescreen horizontal composition, premium visual...",
-                            "video_prompt": "Widescreen cinematic camera movement, sophisticated action...",
+                            "image_prompt": "16:9 widescreen, [USER'S CONTENT HERE], cinematic lighting...",
+                            "video_prompt": "16:9 widescreen, [USER'S CONTENT HERE], smooth camera movement...",
                             "duration": {segment_duration},
-                            "use_user_image_index": null,
-                            "scene_images": ["wide angle 1", "product detail", "lifestyle shot"]
+                            "use_user_image_index": null
                         }}
                     ]
                 }}
             ]
         }}
         
-        Note: "use_user_image_index" can be 0-{num_user_images - 1 if num_user_images > 0 else 0} to feature a brand image, or null to generate.
-        "scene_images" contains multiple image prompts for comprehensive product/brand coverage.
-        "narrative_beat" describes where this segment fits in the ad's story arc.
-        ALL PROMPTS must specify horizontal 16:9 widescreen composition!
+        Note: "use_user_image_index" can be 0-{num_user_images - 1 if num_user_images > 0 else 0} to use a reference image, or null to generate.
+        EVERY prompt must contain the user's original subject/product/content!
         """
 
     def generate_thumbnail(self, title: str, description: str, original_prompt: str) -> tuple:
