@@ -64,3 +64,45 @@ class SupabaseVideoUploader:
         public_url = self.supabase.storage.from_(self.bucket).get_public_url(filename)
         print(f"✅ Uploaded successfully: {public_url}")
         return public_url
+
+    def upload_file(self, local_path: str, filename: str, bucket: str = None) -> str:
+        """
+        Upload a local file to Supabase Storage.
+        
+        Args:
+            local_path: Path to the local file
+            filename: Destination filename in storage
+            bucket: Optional bucket name (defaults to self.bucket)
+        
+        Returns:
+            Public URL of the uploaded file
+        """
+        target_bucket = bucket or self.bucket
+        
+        # Determine content type based on file extension
+        if filename.endswith('.png'):
+            content_type = "image/png"
+        elif filename.endswith('.jpg') or filename.endswith('.jpeg'):
+            content_type = "image/jpeg"
+        elif filename.endswith('.mp4'):
+            content_type = "video/mp4"
+        else:
+            content_type = "application/octet-stream"
+        
+        print(f"📤 Uploading file to Supabase Storage: {filename} (bucket: {target_bucket})")
+        
+        with open(local_path, "rb") as f:
+            file_data = f.read()
+        
+        self.supabase.storage.from_(target_bucket).upload(
+            filename,
+            file_data,
+            {
+                "content-type": content_type,
+                "cache-control": "public, max-age=31536000",
+            },
+        )
+        
+        public_url = self.supabase.storage.from_(target_bucket).get_public_url(filename)
+        print(f"✅ Uploaded successfully: {public_url}")
+        return public_url
