@@ -1,5 +1,7 @@
 import os
 import requests
+import time
+import random
 from google import genai
 from google.genai import types
 import base64
@@ -10,6 +12,69 @@ from io import BytesIO
 
 # User tier types for differentiated prompts
 UserTier = Literal["creator", "professional"]
+
+# Retry configuration for API calls
+MAX_RETRIES = 5
+INITIAL_RETRY_DELAY = 2.0  # seconds
+MAX_RETRY_DELAY = 60.0  # seconds
+RETRY_BACKOFF_MULTIPLIER = 2.0
+
+
+def retry_with_exponential_backoff(
+    func,
+    max_retries: int = MAX_RETRIES,
+    initial_delay: float = INITIAL_RETRY_DELAY,
+    max_delay: float = MAX_RETRY_DELAY,
+    backoff_multiplier: float = RETRY_BACKOFF_MULTIPLIER,
+    retryable_exceptions: tuple = (Exception,),
+):
+    """
+    Decorator/wrapper that retries a function with exponential backoff.
+    Handles rate limiting and transient API errors gracefully.
+    """
+    def wrapper(*args, **kwargs):
+        delay = initial_delay
+        last_exception = None
+        
+        for attempt in range(max_retries + 1):
+            try:
+                return func(*args, **kwargs)
+            except retryable_exceptions as e:
+                last_exception = e
+                error_str = str(e).lower()
+                
+                # Check if it's a retryable error
+                is_rate_limit = any(x in error_str for x in [
+                    'rate limit', 'quota', '429', 'resource exhausted',
+                    'too many requests', 'overloaded', 'capacity'
+                ])
+                is_transient = any(x in error_str for x in [
+                    '500', '502', '503', '504', 'internal', 'unavailable',
+                    'timeout', 'connection', 'network'
+                ])
+                
+                if attempt == max_retries:
+                    print(f"  ❌ Final retry attempt failed: {e}")
+                    raise last_exception
+                
+                if is_rate_limit or is_transient:
+                    # Add jitter to prevent thundering herd
+                    jitter = random.uniform(0.5, 1.5)
+                    wait_time = min(delay * jitter, max_delay)
+                    
+                    print(f"  ⚠️ API error (attempt {attempt + 1}/{max_retries + 1}): {str(e)[:100]}")
+                    print(f"  ⏳ Retrying in {wait_time:.1f}s...")
+                    
+                    time.sleep(wait_time)
+                    delay *= backoff_multiplier
+                else:
+                    # Non-retryable error, raise immediately
+                    print(f"  ❌ Non-retryable error: {e}")
+                    raise
+        
+        raise last_exception
+    
+    return wrapper
 
 class GeminiClient:
     def __init__(self):
@@ -30,6 +95,7 @@ class GeminiClient:
     ) -> bytes:
         """
         Generates an image using Gemini 3 Pro Image Preview model.
+        Includes robust retry logic with exponential backoff for API errors.
         
         Args:
             prompt: Text description of the image to generate
@@ -73,11 +139,20 @@ class GeminiClient:
             
             print(f"  🎨 Using model {model_to_use} for image generation (aspect_ratio={aspect_ratio}, size={resolution_normalized})...")
             
-            response = self.client.models.generate_content(
-                model=model_to_use,
-                contents=contents,
-                config=types.GenerateContentConfig(**config_kwargs)
-            )
+            # Use retry wrapper for API call with exponential backoff
+            def make_api_call():
+                return self.client.models.generate_content(
+                    model=model_to_use,
+                    contents=contents,
+                    config=types.GenerateContentConfig(**config_kwargs)
+                )
+            
+            response = retry_with_exponential_backoff(
+                make_api_call,
+                max_retries=MAX_RETRIES,
+                initial_delay=INITIAL_RETRY_DELAY,
+                max_delay=MAX_RETRY_DELAY
+            )()
             
             # Debug: Log response structure
             print(f"  📋 Response received, checking for image data...")
@@ -334,13 +409,21 @@ class GeminiClient:
             Transform this into a VIRAL TikTok/YouTube Shorts video prompt. Make it irresistible to scroll past!
             """
             
-            response = self.client.models.generate_content(
-                model="gemini-2.0-flash-lite",
-                contents=user_content,
-                config=types.GenerateContentConfig(
-                    system_instruction=system_instruction,
+            # Use retry wrapper for API call
+            def make_enrich_call():
+                return self.client.models.generate_content(
+                    model="gemini-2.0-flash-lite",
+                    contents=user_content,
+                    config=types.GenerateContentConfig(
+                        system_instruction=system_instruction,
+                    )
                 )
-            )
+            
+            response = retry_with_exponential_backoff(
+                make_enrich_call,
+                max_retries=3,  # Fewer retries for enrichment (non-critical)
+                initial_delay=1.0
+            )()
             
             enriched = response.text.strip()
             final_prompt = f"{enriched}{creator_suffix}"
@@ -356,51 +439,61 @@ class GeminiClient:
         Enriches prompt for PROFESSIONAL tier - optimized for ads, commercials, brand content.
         Focus on polished, high-end production quality, brand-safe, conversion-focused.
         Aspect ratio: 16:9 HORIZONTAL (widescreen for professional ads)
+        
+        IMPORTANT: This method ENHANCES the original prompt, it does NOT replace it.
+        The user's original content, brand names, and products MUST be preserved.
         """
         # Professional ad aesthetic suffix - HORIZONTAL 16:9 WIDESCREEN
-        professional_suffix = ", HORIZONTAL 16:9 widescreen aspect ratio REQUIRED, cinematic commercial format, premium advertising quality, professional color grading, brand-safe content, high-end production value, 4K HDR quality, commercial grade, widescreen composition"
+        professional_suffix = ", HORIZONTAL 16:9 widescreen aspect ratio, cinematic commercial format, premium advertising quality, professional color grading, 4K HDR quality"
         
         try:
             system_instruction = """
-            You are an elite advertising director and commercial cinematographer.
-            Your task is to enrich video/image generation prompts for PROFESSIONAL ADVERTISING content.
+            You are an expert at enhancing video prompts for professional quality output.
             
-            PROFESSIONAL AD STYLE RULES:
-            1. Maintain brand-safe, polished, premium aesthetics
-            2. Use sophisticated camera work (smooth tracking shots, elegant reveals, product showcases)
-            3. Apply refined, professional color grading (not oversaturated - elegant and clean)
-            4. Create aspirational, lifestyle-driven narratives
-            5. Focus on product/service benefits and emotional connection
-            6. Use professional lighting setups (3-point lighting, soft fills, dramatic key lights)
-            7. Include subtle but effective call-to-action moments
-            8. If a user image is mentioned, integrate it as a premium product/brand showcase
-            9. Keep the prompt under 400 characters
-            10. Output ONLY the enriched prompt, nothing else
+            CRITICAL RULES - MUST FOLLOW:
+            1. PRESERVE the user's original content, brand names, product names, and specific requests EXACTLY
+            2. DO NOT invent new scenes, products, or storylines - only enhance what the user asked for
+            3. DO NOT replace the user's request with generic advertising content
+            4. Keep the SAME subject matter, just add technical/cinematic details
             
-            ADVERTISING ELEMENTS TO INCLUDE:
-            - Clean, uncluttered compositions
-            - Professional model/product positioning
-            - Aspirational lifestyle imagery
-            - Trust-building visual elements
-            - Conversion-focused storytelling arcs
-            - Multi-sequence narrative potential (for longer ads)
+            YOUR ONLY JOB is to ADD these technical details to the original prompt:
+            - Camera movement suggestions (smooth tracking, slow zoom, etc.)
+            - Lighting details (soft lighting, golden hour, etc.)
+            - Composition tips (rule of thirds, centered subject, etc.)
+            - Professional quality indicators (4K, cinematic, etc.)
+            
+            EXAMPLE:
+            - Input: "Show my product XYZ on a table"
+            - Good output: "Show my product XYZ on a table, smooth tracking shot, soft studio lighting, shallow depth of field, 4K cinematic quality"
+            - BAD output: "Elegant seaside scene with luxury product..." (THIS IS WRONG - you changed the scene!)
+            
+            Keep the prompt under 400 characters.
+            Output ONLY the enhanced prompt, nothing else.
             """
             
             user_content = f"""
-            Original prompt: {base_prompt}
-            {f'Sequence context: {segment_context}' if segment_context else ''}
-            {f'Brand/product image to feature: {user_image_description}' if user_image_description else ''}
+            Original prompt (KEEP THIS CONTENT): {base_prompt}
+            {f'Context: {segment_context}' if segment_context else ''}
+            {f'Reference image shows: {user_image_description}' if user_image_description else ''}
             
-            Transform this into a PROFESSIONAL ADVERTISING video prompt. Premium quality, conversion-focused, brand-safe.
+            Add ONLY technical/cinematic enhancement details. DO NOT change the subject matter or scene.
             """
             
-            response = self.client.models.generate_content(
-                model="gemini-2.0-flash-lite",
-                contents=user_content,
-                config=types.GenerateContentConfig(
-                    system_instruction=system_instruction,
+            # Use retry wrapper for API call
+            def make_enrich_call():
+                return self.client.models.generate_content(
+                    model="gemini-2.0-flash-lite",
+                    contents=user_content,
+                    config=types.GenerateContentConfig(
+                        system_instruction=system_instruction,
+                    )
                 )
-            )
+            
+            response = retry_with_exponential_backoff(
+                make_enrich_call,
+                max_retries=3,  # Fewer retries for enrichment (non-critical)
+                initial_delay=1.0
+            )()
             
             enriched = response.text.strip()
             final_prompt = f"{enriched}{professional_suffix}"
@@ -414,7 +507,7 @@ class GeminiClient:
     def describe_image_from_url(self, image_url: str) -> str:
         """
         Analyzes a user-provided image and returns a description for prompt enrichment.
-        Uses gemini-2.5-flash-lite for fast text generation.
+        Uses gemini-2.0-flash-lite for fast text generation with retry logic.
         """
         try:
             # Download the image
@@ -427,13 +520,21 @@ class GeminiClient:
                 mime_type="image/png"
             )
             
-            response = self.client.models.generate_content(
-                model="gemini-2.0-flash-lite",
-                contents=[
-                    image_part,
-                    "Describe this image in detail for TikTok/Shorts video generation. Focus on: subjects, setting, colors, mood, style, key visual elements. Keep it under 200 characters."
-                ]
-            )
+            # Use retry wrapper for image description
+            def make_describe_call():
+                return self.client.models.generate_content(
+                    model="gemini-2.0-flash-lite",
+                    contents=[
+                        image_part,
+                        "Describe this image in detail for TikTok/Shorts video generation. Focus on: subjects, setting, colors, mood, style, key visual elements. Keep it under 200 characters."
+                    ]
+                )
+            
+            response = retry_with_exponential_backoff(
+                make_describe_call,
+                max_retries=2,  # Quick fallback for descriptions
+                initial_delay=1.0
+            )()
             
             return response.text.strip()
         except Exception as e:
@@ -496,14 +597,22 @@ class GeminiClient:
         """
         
         try:
-            response = self.client.models.generate_content(
-                model="gemini-2.0-flash-lite",
-                contents=user_content,
-                config=types.GenerateContentConfig(
-                    system_instruction=system_instruction,
-                    response_mime_type="application/json"
+            # Use retry wrapper for script generation API call
+            def make_script_call():
+                return self.client.models.generate_content(
+                    model="gemini-2.0-flash-lite",
+                    contents=user_content,
+                    config=types.GenerateContentConfig(
+                        system_instruction=system_instruction,
+                        response_mime_type="application/json"
+                    )
                 )
-            )
+            
+            response = retry_with_exponential_backoff(
+                make_script_call,
+                max_retries=3,  # Script generation is important
+                initial_delay=1.5
+            )()
             
             response_text = response.text
             
@@ -648,54 +757,62 @@ class GeminiClient:
 
     def _get_professional_script_instruction(self, segment_duration: int, num_user_images: int) -> str:
         """Returns system instruction for PROFESSIONAL tier video scripts (ads).
-        Uses 16:9 HORIZONTAL widescreen aspect ratio for professional commercials."""
+        Uses 16:9 HORIZONTAL widescreen aspect ratio for professional commercials.
+        
+        CRITICAL: This method must PRESERVE the user's original prompt content.
+        """
         return f"""
-        You are an elite advertising director creating a PROFESSIONAL commercial video.
-        Create a script optimized for conversion, brand building, and premium production quality.
+        You are a professional video director. Your job is to break down the user's video request into segments.
         
-        CRITICAL: This is a PROFESSIONAL tier video with 16:9 HORIZONTAL WIDESCREEN aspect ratio.
-        All prompts MUST be composed for WIDESCREEN horizontal viewing, NOT vertical!
+        CRITICAL RULES - YOU MUST FOLLOW THESE:
+        1. PRESERVE the user's original content, brand names, product names, and specific requests EXACTLY
+        2. DO NOT invent new scenes or storylines - only break down what the user asked for
+        3. DO NOT replace the user's request with generic advertising content
+        4. Each segment should show a DIFFERENT PART of what the user requested
+        5. If the user asks for a video about "Product X on a beach", ALL segments must be about "Product X on a beach"
         
-        VIDEO STRUCTURE:
-        - Each segment is {segment_duration} seconds
-        - ASPECT RATIO: 16:9 HORIZONTAL WIDESCREEN (like TV commercials, YouTube ads)
-        - For PROFESSIONAL tier: Multiple sequences with narrative arc
-        - Multiple shots per segment for complex storytelling
-        - User has provided {num_user_images} brand/product images that should be featured
+        TECHNICAL REQUIREMENTS:
+        - Each segment is {segment_duration} seconds long
+        - Aspect ratio: 16:9 HORIZONTAL WIDESCREEN
+        - You MUST create exactly the number of segments requested to fill the total duration
+        - User has provided {num_user_images} reference images that can be used
         
-        PROFESSIONAL AD REQUIREMENTS:
-        - WIDESCREEN COMPOSITION: All visuals composed for 16:9 horizontal viewing
-        - NARRATIVE ARC: Problem → Solution → Benefit → CTA flow
-        - PREMIUM QUALITY: Cinematic lighting, elegant composition, refined colors
-        - BRAND SAFE: Professional, trustworthy, aspirational imagery
-        - PRODUCT FOCUS: Clear product/service showcase moments
-        - CONVERSION: Build desire and urgency, clear value proposition
-        - MULTI-SEQUENCE: Create coherent story across segments
+        YOUR ONLY JOB:
+        - Take the user's EXACT request
+        - Break it into {segment_duration}-second segments
+        - Add ONLY technical details (camera angles, lighting, composition)
+        - Keep the SAME subject matter in every segment
+        
+        EXAMPLE:
+        - User request: "Video of my product Vareuse on a beach at sunset"
+        - Segment 1: "Vareuse product displayed on sandy beach, golden sunset lighting, 16:9 widescreen, slow pan"
+        - Segment 2: "Close-up of Vareuse details, beach waves in background, warm sunset colors, 16:9"
+        - Segment 3: "Wide shot of Vareuse with ocean horizon, dramatic sunset sky, cinematic 16:9"
+        
+        BAD EXAMPLE (DO NOT DO THIS):
+        - User request: "Video of my product Vareuse on a beach"
+        - Segment 1: "Elegant woman on yacht..." (WRONG - user didn't ask for yacht or woman!)
         
         Output JSON format:
         {{
             "segments": [
                 {{
                     "segment_index": 1,
-                    "narrative_beat": "introduction/problem/solution/benefit/cta",
                     "shots": [
                         {{
                             "shot_index": 1,
-                            "image_prompt": "16:9 widescreen horizontal composition, premium visual...",
-                            "video_prompt": "Widescreen cinematic camera movement, sophisticated action...",
+                            "image_prompt": "16:9 widescreen, [USER'S CONTENT HERE], cinematic lighting...",
+                            "video_prompt": "16:9 widescreen, [USER'S CONTENT HERE], smooth camera movement...",
                             "duration": {segment_duration},
-                            "use_user_image_index": null,
-                            "scene_images": ["wide angle 1", "product detail", "lifestyle shot"]
+                            "use_user_image_index": null
                         }}
                     ]
                 }}
             ]
         }}
         
-        Note: "use_user_image_index" can be 0-{num_user_images - 1 if num_user_images > 0 else 0} to feature a brand image, or null to generate.
-        "scene_images" contains multiple image prompts for comprehensive product/brand coverage.
-        "narrative_beat" describes where this segment fits in the ad's story arc.
-        ALL PROMPTS must specify horizontal 16:9 widescreen composition!
+        Note: "use_user_image_index" can be 0-{num_user_images - 1 if num_user_images > 0 else 0} to use a reference image, or null to generate.
+        EVERY prompt must contain the user's original subject/product/content!
         """
 
     def generate_thumbnail(self, title: str, description: str, original_prompt: str) -> tuple:
@@ -814,14 +931,22 @@ class GeminiClient:
             Extract keywords for a viral YouTube Shorts thumbnail.
             """
             
-            response = self.client.models.generate_content(
-                model="gemini-2.0-flash-lite",
-                contents=user_content,
-                config=types.GenerateContentConfig(
-                    system_instruction=system_instruction,
-                    response_mime_type="application/json"
+            # Use retry wrapper for keyword extraction
+            def make_keyword_call():
+                return self.client.models.generate_content(
+                    model="gemini-2.0-flash-lite",
+                    contents=user_content,
+                    config=types.GenerateContentConfig(
+                        system_instruction=system_instruction,
+                        response_mime_type="application/json"
+                    )
                 )
-            )
+            
+            response = retry_with_exponential_backoff(
+                make_keyword_call,
+                max_retries=2,  # Quick fallback for keywords
+                initial_delay=1.0
+            )()
             
             import json
             extracted = json.loads(response.text)
@@ -913,19 +1038,28 @@ Style: Cinematic, eye-catching, clickbait thumbnail style, designed for maximum 
         """
         Fallback thumbnail generation using gemini-3-pro-image-preview.
         Uses proper API format with TEXT + IMAGE modalities and image config.
+        Includes retry logic with exponential backoff.
         """
         try:
-            response = self.client.models.generate_content(
-                model='gemini-3-pro-image-preview',
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_modalities=['TEXT', 'IMAGE'],
-                    image_config=types.ImageConfig(
-                        aspect_ratio="9:16",
-                        image_size="2K"  # Uppercase as required by API
+            # Use retry wrapper for thumbnail generation
+            def make_thumbnail_call():
+                return self.client.models.generate_content(
+                    model='gemini-3-pro-image-preview',
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        response_modalities=['TEXT', 'IMAGE'],
+                        image_config=types.ImageConfig(
+                            aspect_ratio="9:16",
+                            image_size="2K"  # Uppercase as required by API
+                        )
                     )
                 )
-            )
+            
+            response = retry_with_exponential_backoff(
+                make_thumbnail_call,
+                max_retries=MAX_RETRIES,
+                initial_delay=INITIAL_RETRY_DELAY
+            )()
             
             # Extract image from response (skip thought images)
             for part in response.parts:
