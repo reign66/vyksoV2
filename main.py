@@ -3,6 +3,7 @@ import json
 import uuid
 import stripe
 import httpx
+import logging
 from fastapi.responses import StreamingResponse
 from typing import Optional, List, Dict, Literal
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, UploadFile, File
@@ -21,6 +22,22 @@ from io import BytesIO
 from starlette.requests import Request as StarletteRequest
 from starlette.responses import StreamingResponse as StarletteStreamingResponse
 from urllib.parse import urlparse
+
+# ========= LOGGING FILTER FOR 401 ERRORS =========
+# Filter out 401 Unauthorized from uvicorn access logs to reduce noise
+# These are expected when frontend polls with expired tokens
+class Filter401Responses(logging.Filter):
+    """Filter to suppress 401 Unauthorized responses from access logs."""
+    def filter(self, record: logging.LogRecord) -> bool:
+        # Check if the log message contains 401 status code
+        message = record.getMessage()
+        if "401" in message and ("/status" in message or "Unauthorized" in message):
+            return False  # Don't log this message
+        return True  # Log everything else
+
+# Apply filter to uvicorn access logger
+uvicorn_access_logger = logging.getLogger("uvicorn.access")
+uvicorn_access_logger.addFilter(Filter401Responses())
 
 # Import new Stripe configuration and routes
 from config.stripe_config import get_stripe_config, get_plan_type
