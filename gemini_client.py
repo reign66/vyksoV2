@@ -1216,17 +1216,19 @@ Style: Cinematic, eye-catching, clickbait thumbnail style, designed for maximum 
         # Enhance the prompt for cinematic keyframe generation
         enhanced_prompt = f"""{keyframe_prompt}
 
-Professional cinematography, film-quality, 4K details, natural colors, 
+Professional cinematography, film-quality, natural colors, 
 cinematic depth of field, proper rule-of-thirds composition, 
-photorealistic, high dynamic range, subtle film grain."""
+photorealistic, high dynamic range."""
         
         print(f"  🎬 Generating {position} keyframe ({aspect_ratio})...")
         
+        # Use 2K resolution for faster generation while maintaining good quality
+        # 4K was causing slow generation times without significant quality benefit for Veo input
         image_bytes = self.generate_image(
             prompt=enhanced_prompt,
             reference_images=reference_images,
             aspect_ratio=aspect_ratio,
-            resolution="4K"
+            resolution="2K"
         )
         
         if image_bytes:

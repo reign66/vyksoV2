@@ -65,6 +65,41 @@ class SupabaseVideoUploader:
         print(f"✅ Uploaded successfully: {public_url}")
         return public_url
 
+    def upload_image_bytes(self, image_bytes: bytes, filename: str) -> str:
+        """Upload image bytes to the video-images bucket and return the public URL.
+        
+        Args:
+            image_bytes: Raw image bytes (JPEG or PNG)
+            filename: Name for the file (e.g., job_id_kf_start.jpg)
+        
+        Returns:
+            Public URL of the uploaded image
+        """
+        images_bucket = "video-images"
+        print(f"📤 Uploading image to Supabase Storage: {filename} -> {images_bucket}")
+        
+        # Determine content type from filename
+        if filename.endswith(".png"):
+            content_type = "image/png"
+        elif filename.endswith((".jpg", ".jpeg")):
+            content_type = "image/jpeg"
+        elif filename.endswith(".webp"):
+            content_type = "image/webp"
+        else:
+            content_type = "image/jpeg"  # Default to JPEG
+        
+        self.supabase.storage.from_(images_bucket).upload(
+            filename,
+            image_bytes,
+            {
+                "content-type": content_type,
+                "cache-control": "public, max-age=31536000",
+            },
+        )
+        public_url = self.supabase.storage.from_(images_bucket).get_public_url(filename)
+        print(f"✅ Image uploaded successfully: {public_url}")
+        return public_url
+
     def upload_file(self, file_path: str, filename: str, bucket: str = "vykso-videos") -> str:
         """Upload a file from local path to Supabase Storage.
         
