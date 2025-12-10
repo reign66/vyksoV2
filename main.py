@@ -730,11 +730,9 @@ async def process_video_generation(
                 print(f"🎬 SEQUENCE {seq_num}/{len(sequences)}")
                 print(f"{'='*50}")
                 
-                # Update progress in database
+                # Log progress (no database update - progress column may not exist)
                 progress = int((seq_idx / len(sequences)) * 100)
-                get_supabase().table("video_jobs").update({
-                    "progress": progress
-                }).eq("id", job_id).execute()
+                print(f"📊 Progress: {progress}%")
                 
                 # Get keyframe prompts from script
                 kf_start_prompt = sequence.get("keyframe_start", "")
@@ -933,7 +931,6 @@ async def process_video_generation(
             get_supabase().table("video_jobs").update({
                 "status": "completed",
                 "video_url": final_url,
-                "progress": 100,
                 "completed_at": "now()",
             }).eq("id", job_id).execute()
             
