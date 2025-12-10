@@ -1004,3 +1004,234 @@ Style: Cinematic, eye-catching, clickbait thumbnail style, designed for maximum 
             import traceback
             traceback.print_exc()
             return None
+
+    def generate_cinematic_script(
+        self, 
+        user_prompt: str, 
+        duration: int, 
+        user_images: list = None, 
+        user_tier: UserTier = "professional",
+        num_keyframes_per_sequence: int = 3
+    ) -> dict:
+        """
+        Generates a cinematic script with keyframe structure for Veo 3.1 video generation.
+        
+        This is the NEW architecture that generates:
+        - A structured script divided into sequences (8s each)
+        - For each sequence: 3 keyframe prompts (START, MIDDLE, END)
+        - A Veo prompt for the video motion/action
+        - Transitions between sequences
+        
+        Args:
+            user_prompt: The user's original prompt/concept
+            duration: Total video duration in seconds
+            user_images: Optional list of user-provided image URLs
+            user_tier: "creator" for TikTok/Shorts, "professional" for ads
+            num_keyframes_per_sequence: Number of keyframes per sequence (2 for starter, 3 for pro/max)
+        
+        Returns:
+            JSON object with sequences, each containing keyframe prompts and video prompt
+        """
+        import json
+        
+        # Calculate number of sequences (8 seconds each for Veo 3.1)
+        num_sequences = max(1, (duration + 7) // 8)
+        
+        # Analyze user images if provided
+        image_descriptions = []
+        if user_images:
+            for img_url in user_images[:5]:  # Analyze first 5 images
+                desc = self.describe_image_from_url(img_url)
+                if desc:
+                    image_descriptions.append(desc)
+        
+        # Determine aspect ratio
+        aspect_ratio = "16:9" if user_tier == "professional" else "9:16"
+        orientation = "horizontal widescreen" if user_tier == "professional" else "vertical portrait"
+        
+        system_instruction = f"""
+        You are an elite cinematographer and film director.
+        Create a detailed cinematic script for a {duration}-second video.
+        
+        CRITICAL REQUIREMENTS:
+        1. Create EXACTLY {num_sequences} sequences of 8 seconds each
+        2. Aspect ratio: {aspect_ratio} ({orientation})
+        3. For each sequence, provide {num_keyframes_per_sequence} keyframe descriptions
+        4. Maintain VISUAL CONTINUITY between sequences
+        
+        KEYFRAME SYSTEM:
+        Each sequence has {num_keyframes_per_sequence} keyframes representing visual states:
+        - keyframe_start (0%): The opening frame of the sequence
+        - keyframe_middle (50%): The midpoint visual state{"" if num_keyframes_per_sequence < 3 else ""}
+        - keyframe_end (100%): The closing frame (MUST visually connect to next sequence's start)
+        
+        CONTINUITY RULES:
+        - keyframe_end of sequence N should visually match keyframe_start of sequence N+1
+        - Use consistent lighting, colors, and visual elements across the whole video
+        - Build a clear narrative progression from start to end
+        
+        KEYFRAME PROMPT STRUCTURE:
+        Each keyframe prompt should include:
+        - Position indicator: "START of sequence", "MIDDLE of sequence", or "END of sequence"
+        - Scene description with specific visual elements
+        - Camera position/angle
+        - Lighting description
+        - Mood/atmosphere
+        
+        VIDEO PROMPT STRUCTURE (for Veo):
+        - Describe the MOTION and ACTION between keyframes
+        - Include camera movement (pan, zoom, dolly, etc.)
+        - Keep it concise (under 200 chars)
+        - Focus on movement, not static description
+        
+        OUTPUT FORMAT (STRICT JSON):
+        {{
+            "title": "Brief title for the video",
+            "overall_mood": "Overall mood/atmosphere description",
+            "sequences": [
+                {{
+                    "sequence_index": 1,
+                    "description": "What happens in this sequence",
+                    "keyframe_start": "Cinematic {aspect_ratio} frame. START of sequence. [detailed visual description]...",
+                    "keyframe_middle": "Cinematic {aspect_ratio} frame. MIDDLE of sequence. [detailed visual description]...",
+                    "keyframe_end": "Cinematic {aspect_ratio} frame. END of sequence. [detailed visual description, preparing transition to next]...",
+                    "veo_prompt": "Smooth [camera movement] [action description]. [lighting]. Professional cinematography.",
+                    "transition_to_next": "How this connects to the next sequence (null for last)"
+                }},
+                ...
+            ]
+        }}
+        
+        FAITHFULNESS TO ORIGINAL PROMPT:
+        - Stay TRUE to the user's original concept
+        - DO NOT change the subject or theme
+        - Enhance the visual execution while keeping the same content
+        """
+        
+        user_content = f"""
+        Create a cinematic script for this concept:
+        
+        USER PROMPT: {user_prompt}
+        
+        SPECIFICATIONS:
+        - Total Duration: {duration} seconds
+        - Number of Sequences: {num_sequences} (8 seconds each)
+        - Aspect Ratio: {aspect_ratio} ({orientation})
+        - User Tier: {user_tier.upper()}
+        - Keyframes per Sequence: {num_keyframes_per_sequence}
+        
+        {f"USER PROVIDED IMAGES (incorporate these visual elements): {image_descriptions}" if image_descriptions else "No reference images provided."}
+        
+        Generate the complete cinematic script with all {num_sequences} sequences.
+        Each sequence must have {num_keyframes_per_sequence} keyframe prompts and 1 veo_prompt.
+        """
+        
+        try:
+            response = self.client.models.generate_content(
+                model="gemini-2.0-flash-lite",
+                contents=user_content,
+                config=types.GenerateContentConfig(
+                    system_instruction=system_instruction,
+                    response_mime_type="application/json"
+                )
+            )
+            
+            response_text = response.text
+            
+            # Parse JSON response
+            try:
+                script = json.loads(response_text)
+            except json.JSONDecodeError as json_err:
+                print(f"⚠️ JSON parsing failed, attempting cleanup: {json_err}")
+                
+                # Cleanup attempts
+                cleaned_text = response_text.strip()
+                
+                if cleaned_text.startswith("```"):
+                    lines = cleaned_text.split("\n")
+                    if lines[0].startswith("```"):
+                        lines = lines[1:]
+                    if lines and lines[-1].strip() == "```":
+                        lines = lines[:-1]
+                    cleaned_text = "\n".join(lines)
+                
+                if "{" in cleaned_text:
+                    start_idx = cleaned_text.find("{")
+                    end_idx = cleaned_text.rfind("}") + 1
+                    if start_idx >= 0 and end_idx > start_idx:
+                        cleaned_text = cleaned_text[start_idx:end_idx]
+                
+                script = json.loads(cleaned_text)
+            
+            # Validate script structure
+            if not script or not isinstance(script, dict) or "sequences" not in script:
+                print(f"❌ Invalid script structure: missing 'sequences' key")
+                return None
+            
+            sequences = script.get("sequences", [])
+            if len(sequences) < num_sequences:
+                print(f"⚠️ Got {len(sequences)} sequences, expected {num_sequences}. Padding...")
+                
+                # Pad with continuation sequences
+                while len(sequences) < num_sequences:
+                    last_seq = sequences[-1].copy()
+                    last_seq["sequence_index"] = len(sequences) + 1
+                    last_seq["description"] = f"Continuation of {last_seq.get('description', 'previous scene')}"
+                    sequences.append(last_seq)
+                
+                script["sequences"] = sequences
+            
+            print(f"📜 Cinematic script generated: {len(sequences)} sequences, {num_keyframes_per_sequence} keyframes each")
+            
+            return script
+            
+        except Exception as e:
+            print(f"❌ Error generating cinematic script: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+
+    def generate_keyframe_image(
+        self,
+        keyframe_prompt: str,
+        reference_images: Optional[List[Image.Image]] = None,
+        aspect_ratio: str = "16:9",
+        position: str = "MIDDLE"
+    ) -> bytes:
+        """
+        Generate a single keyframe image for video generation.
+        
+        This is optimized for generating high-quality keyframes that Veo 3.1
+        will interpolate between.
+        
+        Args:
+            keyframe_prompt: The detailed keyframe prompt
+            reference_images: Optional reference images for style/content consistency
+            aspect_ratio: "16:9" for professional, "9:16" for creator
+            position: "START", "MIDDLE", or "END" - for logging
+            
+        Returns:
+            Image bytes (JPEG)
+        """
+        # Enhance the prompt for cinematic keyframe generation
+        enhanced_prompt = f"""{keyframe_prompt}
+
+Professional cinematography, film-quality, 4K details, natural colors, 
+cinematic depth of field, proper rule-of-thirds composition, 
+photorealistic, high dynamic range, subtle film grain."""
+        
+        print(f"  🎬 Generating {position} keyframe ({aspect_ratio})...")
+        
+        image_bytes = self.generate_image(
+            prompt=enhanced_prompt,
+            reference_images=reference_images,
+            aspect_ratio=aspect_ratio,
+            resolution="4K"
+        )
+        
+        if image_bytes:
+            print(f"  ✅ {position} keyframe generated: {len(image_bytes)} bytes")
+        else:
+            print(f"  ⚠️ {position} keyframe generation failed")
+        
+        return image_bytes
