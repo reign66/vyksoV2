@@ -1,6 +1,7 @@
 import os
 import time
 from typing import Optional, List, Literal
+from io import BytesIO
 
 from google import genai
 from google.genai import types
@@ -104,10 +105,31 @@ class VeoAIClient:
         }
         
         if image:
-            kwargs["image"] = image
+            # Convert PIL Image to bytes if needed for Veo 3.1 API
+            if hasattr(image, 'save'):  # PIL Image object
+                buffered = BytesIO()
+                # Convert to RGB if needed (handles RGBA images)
+                if hasattr(image, 'mode') and image.mode == 'RGBA':
+                    image = image.convert('RGB')
+                image.save(buffered, format="JPEG", quality=95)
+                image_bytes = buffered.getvalue()
+                # Create Image object from bytes for the SDK
+                kwargs["image"] = types.Image(image_bytes=image_bytes)
+                print(f"  📸 Converted PIL Image to bytes ({len(image_bytes)} bytes)")
+            else:
+                kwargs["image"] = image
             
         if last_frame:
-            kwargs["last_frame"] = last_frame
+            # Also convert last_frame if it's a PIL Image
+            if hasattr(last_frame, 'save'):
+                buffered = BytesIO()
+                if hasattr(last_frame, 'mode') and last_frame.mode == 'RGBA':
+                    last_frame = last_frame.convert('RGB')
+                last_frame.save(buffered, format="JPEG", quality=95)
+                last_frame_bytes = buffered.getvalue()
+                kwargs["last_frame"] = types.Image(image_bytes=last_frame_bytes)
+            else:
+                kwargs["last_frame"] = last_frame
             
         if reference_images and len(reference_images) > 0:
             # Veo 3.1 supports up to 3 reference images - create VideoGenerationReferenceImage objects
