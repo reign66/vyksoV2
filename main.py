@@ -519,6 +519,74 @@ def _validate_duration_and_model(duration: int, ai_model: str):
         # Sora uses 10s segments
         pass  # Accept any duration between 6-60
 
+
+def get_tier_config(user_tier: str, ai_model: str) -> dict:
+    """
+    Get configuration parameters based on user tier.
+    
+    Returns dict with:
+    - keyframes_per_sequence: 2 for starter, 3 for pro/max
+    - transitions: whether to add crossfade transitions
+    - transition_duration: duration of crossfade in seconds
+    - resolution: video resolution
+    - max_duration: maximum video duration in seconds
+    """
+    # Base configs by tier
+    if user_tier == "creator":
+        # Creator tier - TikTok/Shorts optimized
+        return {
+            "keyframes_per_sequence": 2,  # Simpler: just start + end
+            "transitions": False,
+            "transition_duration": 0.0,
+            "resolution": "720p",
+            "max_duration": 10,  # Single 8-10s video
+        }
+    else:
+        # Professional tier - ads/commercials
+        return {
+            "keyframes_per_sequence": 3,  # Full: start + middle + end
+            "transitions": True,
+            "transition_duration": 0.3,
+            "resolution": "1080p",
+            "max_duration": 64,  # Up to 8 sequences
+        }
+
+
+def _create_fallback_script(prompt: str, num_sequences: int, aspect_ratio: str) -> dict:
+    """
+    Create a basic fallback script when LLM script generation fails.
+    
+    This generates simple keyframe prompts based on the user's prompt.
+    """
+    sequences = []
+    
+    orientation = "horizontal widescreen" if aspect_ratio == "16:9" else "vertical portrait"
+    
+    for seq_idx in range(num_sequences):
+        seq_num = seq_idx + 1
+        
+        # Create basic keyframe prompts
+        base_desc = f"Cinematic {aspect_ratio} frame ({orientation}). {prompt}"
+        
+        sequence = {
+            "sequence_index": seq_num,
+            "description": f"Sequence {seq_num}: {prompt}",
+            "keyframe_start": f"{base_desc}. START of sequence {seq_num}. Opening shot with establishing composition. Professional cinematography.",
+            "keyframe_middle": f"{base_desc}. MIDDLE of sequence {seq_num}. Dynamic mid-sequence visual. Camera in motion. Action peak.",
+            "keyframe_end": f"{base_desc}. END of sequence {seq_num}. Closing frame preparing for {'next sequence' if seq_idx < num_sequences - 1 else 'finale'}. Smooth transition point.",
+            "veo_prompt": f"Smooth cinematic motion. {prompt}. Professional cinematography, natural movement, film quality.",
+            "transition_to_next": "Smooth visual transition" if seq_idx < num_sequences - 1 else None
+        }
+        
+        sequences.append(sequence)
+    
+    return {
+        "title": prompt[:50] + "..." if len(prompt) > 50 else prompt,
+        "overall_mood": "Cinematic and professional",
+        "sequences": sequences
+    }
+
+
 def _validate_image_urls(image_urls: Optional[List[str]], max_images: int = 18):
     """
     Validates image URLs for video generation.
@@ -563,7 +631,13 @@ async def process_video_generation(
     ai_model: str = "veo-3.1-generate-preview",
     user_tier: str = "professional"
 ):
-    """Background task : génère la vidéo (tous les modèles supportés)
+    """
+    NEW ARCHITECTURE: Sequential keyframe-based video generation.
+    
+    Generates videos with visual continuity using 3 keyframes per sequence:
+    - START keyframe: Beginning of sequence (reused from previous video's last frame for seq > 1)
+    - MIDDLE keyframe: Midpoint of sequence
+    - END keyframe: End of sequence (must connect to next sequence)
     
     Args:
         job_id: Unique job identifier
@@ -578,8 +652,12 @@ async def process_video_generation(
         ai_model: AI model to use
         user_tier: "creator" for TikTok/Shorts or "professional" for ads
     """
+    import asyncio
+    from PIL import Image
+    import httpx
+    
     try:
-        print(f"🎬 Starting generation for job {job_id}")
+        print(f"🎬 Starting KEYFRAME-BASED generation for job {job_id}")
         print(f"🤖 AI Model: {ai_model}")
         print(f"📊 Model type: {model_type}")
         print(f"👤 User tier: {user_tier.upper()}")
@@ -588,41 +666,31 @@ async def process_video_generation(
             "status": "generating"
         }).eq("id", job_id).execute()
         
+        # ===== CONFIGURATION BY TIER =====
+        tier_config = get_tier_config(user_tier, ai_model)
+        aspect_ratio = get_aspect_ratio_for_tier(user_tier)
+        num_keyframes = tier_config.get("keyframes_per_sequence", 3)
+        add_transitions = tier_config.get("transitions", False)
+        transition_duration = tier_config.get("transition_duration", 0.3)
+        resolution = tier_config.get("resolution", "720p")
+        
+        print(f"📐 Config: {aspect_ratio}, {resolution}, {num_keyframes} keyframes/seq, transitions={add_transitions}")
+        
         # ===== DÉTECTION DU MODÈLE AI =====
         if ai_model in ("veo-3.1-generate-preview", "veo-3.1-fast-generate-preview"):
-            # ===== MODE VEO 3.1 (Google GenAI) - Parallel Advanced Scripting =====
+            # ===== VEO 3.1 WITH KEYFRAME ARCHITECTURE =====
             use_fast_model = (ai_model == "veo-3.1-fast-generate-preview")
             model_variant = "FAST" if use_fast_model else "NORMAL"
-            print(f"🎥 Using Veo 3.1 API ({model_variant} mode) with Parallel Advanced Scripting")
-            print(f"🎨 User tier: {user_tier} - {'TikTok/Shorts optimized' if user_tier == 'creator' else 'Professional ads optimized'}")
-
-            # 1. Calculate Segments (8s blocks for Veo 3.1)
-            num_segments = (duration + 7) // 8
+            print(f"🎥 Using Veo 3.1 ({model_variant}) with KEYFRAME ARCHITECTURE")
             
-            # For Creator tier: simpler structure (1-3 images for scene changes, no complex sequences)
-            # For Professional tier: complex sequences with multiple shots
-            images_per_segment = 1 if user_tier == "creator" else 3
+            # 1. Calculate number of sequences
+            num_sequences = max(1, (duration + 7) // 8)
+            print(f"📊 Video: {duration}s → {num_sequences} sequences of 8s each")
             
-            # 2. Generate Script using Gemini with tier-specific prompt enrichment
-            print(f"📜 Generating {user_tier.upper()} script for {duration}s video ({num_segments} segments)...")
-            script = get_gemini().generate_video_script(
-                prompt=custom_prompt or generate_prompt(niche),
-                duration=duration,
-                num_segments=num_segments,
-                user_images=image_urls,
-                segment_duration=8,  # Veo 3.1 uses 8s segments
-                user_tier=user_tier,
-                images_per_segment=images_per_segment
-            )
-            
-            # 3. Download user images if provided (now supports up to 18 images)
+            # 2. Download user images if provided
             user_pil_images = []
             if image_urls:
-                import httpx
-                from PIL import Image
-                # VEO 3.1 supports up to 3 reference images per video, but we can distribute across segments
-                # For image generation with Gemini 3 Pro, we support up to 18 reference images
-                for img_url in image_urls[:18]:  # Support up to 18 images
+                for img_url in image_urls[:18]:
                     try:
                         print(f"📥 Downloading user image: {img_url[:50]}...")
                         resp = httpx.get(img_url, timeout=30)
@@ -630,218 +698,246 @@ async def process_video_generation(
                     except Exception as e:
                         print(f"⚠️ Failed to download image: {e}")
             
-            import asyncio
-            from concurrent.futures import ThreadPoolExecutor
+            # 3. Generate cinematic script with keyframe structure
+            print(f"📜 Generating CINEMATIC SCRIPT with {num_keyframes} keyframes per sequence...")
+            script = get_gemini().generate_cinematic_script(
+                user_prompt=custom_prompt or generate_prompt(niche, user_tier=user_tier),
+                duration=duration,
+                user_images=image_urls,
+                user_tier=user_tier,
+                num_keyframes_per_sequence=num_keyframes
+            )
             
-            # Determine aspect ratio based on tier
-            tier_aspect_ratio = get_aspect_ratio_for_tier(user_tier)
-            print(f"📐 Aspect ratio for {user_tier.upper()} tier: {tier_aspect_ratio}")
+            if not script or "sequences" not in script:
+                print("⚠️ Script generation failed, using fallback method")
+                script = _create_fallback_script(custom_prompt or generate_prompt(niche), num_sequences, aspect_ratio)
             
-            async def process_shot(segment_index, shot_data, user_images_list, tier=user_tier, aspect_ratio=tier_aspect_ratio):
-                """Helper to process a single shot: Image Gen -> Video Gen with Veo 3.1"""
-                shot_idx = shot_data.get("shot_index", 0)
-                img_prompt = shot_data.get("image_prompt")
-                vid_prompt = shot_data.get("video_prompt")
-                use_user_image_idx = shot_data.get("use_user_image_index")
-                shot_duration = shot_data.get("duration", 8)
-                scene_images = shot_data.get("scene_images", [])  # Additional scene variation prompts
+            sequences = script.get("sequences", [])
+            print(f"✅ Script ready: {len(sequences)} sequences")
+            
+            # 4. SEQUENTIAL VIDEO GENERATION WITH CONTINUITY
+            # This is the key change - we process sequences ONE BY ONE
+            # so we can use the last frame of video N as the first keyframe of video N+1
+            
+            all_video_bytes = []
+            previous_last_frame = None  # Will store the last frame of previous video
+            
+            loop = asyncio.get_running_loop()
+            
+            for seq_idx, sequence in enumerate(sequences):
+                seq_num = seq_idx + 1
+                print(f"\n{'='*50}")
+                print(f"🎬 SEQUENCE {seq_num}/{len(sequences)}")
+                print(f"{'='*50}")
                 
-                print(f"🎬 Processing Seg {segment_index} Shot {shot_idx} ({tier.upper()} tier, {aspect_ratio})...")
+                # Update progress in database
+                progress = int((seq_idx / len(sequences)) * 100)
+                get_supabase().table("video_jobs").update({
+                    "progress": progress
+                }).eq("id", job_id).execute()
                 
-                loop = asyncio.get_running_loop()
+                # Get keyframe prompts from script
+                kf_start_prompt = sequence.get("keyframe_start", "")
+                kf_middle_prompt = sequence.get("keyframe_middle", "")
+                kf_end_prompt = sequence.get("keyframe_end", "")
+                veo_prompt = sequence.get("veo_prompt", "")
                 
-                pil_image = None
+                # Generate keyframes
+                keyframes = []
                 
-                # Check if we should use a user-provided image
-                if use_user_image_idx is not None and use_user_image_idx < len(user_images_list):
-                    print(f"  🖼️ Using user-provided image {use_user_image_idx} for this shot")
-                    pil_image = user_images_list[use_user_image_idx]
+                # KEYFRAME 1 (START): Use previous video's last frame OR generate new
+                if previous_last_frame is not None:
+                    print(f"  🔗 Using previous video's last frame as START keyframe (continuity)")
+                    keyframes.append(previous_last_frame)
                 else:
-                    # A. Generate Image with Gemini using enriched prompt and reference images
-                    print(f"  📸 Seg {segment_index} Shot {shot_idx}: Generating Image...")
+                    # First sequence - generate START keyframe
+                    print(f"  🖼️ Generating START keyframe...")
                     
-                    # For Creator tier: use 1-3 reference images for scene consistency
-                    # For Professional tier: use up to 3 images per segment for product/brand consistency
-                    ref_images_for_generation = None
-                    if tier == "creator" and len(user_images_list) > 0:
-                        # Creator: use first 3 user images as style reference
-                        ref_images_for_generation = user_images_list[:3]
-                    elif tier == "professional" and len(user_images_list) > 0:
-                        # Professional: distribute images across segments for brand consistency
-                        start_idx = (segment_index - 1) * 3 % len(user_images_list)
-                        ref_images_for_generation = user_images_list[start_idx:start_idx + 3]
+                    # Use user image as reference if available
+                    ref_images = user_pil_images[:3] if user_pil_images else None
                     
-                    # Generate with reference images if available
-                    def generate_with_refs():
-                        return get_gemini().generate_image(
-                            prompt=img_prompt,
-                            reference_images=ref_images_for_generation,
-                            aspect_ratio=aspect_ratio,  # Use tier-specific aspect ratio
-                            resolution="4K"  # 4K quality for both tiers
+                    kf_start_bytes = await loop.run_in_executor(
+                        None,
+                        lambda: get_gemini().generate_keyframe_image(
+                            keyframe_prompt=kf_start_prompt,
+                            reference_images=ref_images,
+                            aspect_ratio=aspect_ratio,
+                            position="START"
                         )
+                    )
                     
+                    if kf_start_bytes:
+                        keyframes.append(kf_start_bytes)
+                        # Upload for debug/preview
+                        try:
+                            await loop.run_in_executor(
+                                None,
+                                get_uploader().upload_bytes,
+                                kf_start_bytes,
+                                f"{job_id}_seq{seq_num}_kf_start.jpg"
+                            )
+                        except Exception:
+                            pass
+                
+                # KEYFRAME 2 (MIDDLE): Always generate
+                if num_keyframes >= 2:
+                    print(f"  🖼️ Generating MIDDLE keyframe...")
+                    
+                    kf_middle_bytes = await loop.run_in_executor(
+                        None,
+                        lambda: get_gemini().generate_keyframe_image(
+                            keyframe_prompt=kf_middle_prompt,
+                            reference_images=user_pil_images[:3] if user_pil_images else None,
+                            aspect_ratio=aspect_ratio,
+                            position="MIDDLE"
+                        )
+                    )
+                    
+                    if kf_middle_bytes:
+                        keyframes.append(kf_middle_bytes)
+                        try:
+                            await loop.run_in_executor(
+                                None,
+                                get_uploader().upload_bytes,
+                                kf_middle_bytes,
+                                f"{job_id}_seq{seq_num}_kf_middle.jpg"
+                            )
+                        except Exception:
+                            pass
+                
+                # KEYFRAME 3 (END): Always generate
+                if num_keyframes >= 3:
+                    print(f"  🖼️ Generating END keyframe...")
+                    
+                    kf_end_bytes = await loop.run_in_executor(
+                        None,
+                        lambda: get_gemini().generate_keyframe_image(
+                            keyframe_prompt=kf_end_prompt,
+                            reference_images=user_pil_images[:3] if user_pil_images else None,
+                            aspect_ratio=aspect_ratio,
+                            position="END"
+                        )
+                    )
+                    
+                    if kf_end_bytes:
+                        keyframes.append(kf_end_bytes)
+                        try:
+                            await loop.run_in_executor(
+                                None,
+                                get_uploader().upload_bytes,
+                                kf_end_bytes,
+                                f"{job_id}_seq{seq_num}_kf_end.jpg"
+                            )
+                        except Exception:
+                            pass
+                
+                # Validate keyframes
+                if len(keyframes) == 0:
+                    print(f"  ⚠️ No keyframes generated, falling back to text-to-video")
+                    keyframes = None
+                else:
+                    print(f"  ✅ {len(keyframes)} keyframes ready for Veo")
+                
+                # GENERATE VIDEO WITH VEO 3.1
+                print(f"  🎥 Generating video with Veo 3.1 ({len(keyframes) if keyframes else 0} keyframes)...")
+                
+                video_path = f"/tmp/{job_id}_seq{seq_num}.mp4"
+                
+                if keyframes and len(keyframes) > 0:
+                    # Use the new keyframe-based generation method
+                    await loop.run_in_executor(
+                        None,
+                        lambda: get_veo().generate_video_with_keyframes(
+                            prompt=veo_prompt,
+                            keyframes=keyframes,
+                            aspect_ratio=aspect_ratio,
+                            resolution=resolution,
+                            duration_seconds=8,
+                            download_path=video_path,
+                            use_fast_model=use_fast_model,
+                        )
+                    )
+                else:
+                    # Fallback to standard generation without keyframes
+                    await loop.run_in_executor(
+                        None,
+                        lambda: get_veo().generate_video_and_wait(
+                            prompt=veo_prompt,
+                            aspect_ratio=aspect_ratio,
+                            resolution=resolution,
+                            duration_seconds=8,
+                            download_path=video_path,
+                            use_fast_model=use_fast_model,
+                        )
+                    )
+                
+                # Read video bytes
+                with open(video_path, "rb") as f:
+                    video_bytes = f.read()
+                
+                all_video_bytes.append(video_bytes)
+                print(f"  ✅ Sequence {seq_num} video generated: {len(video_bytes)} bytes")
+                
+                # EXTRACT LAST FRAME FOR NEXT SEQUENCE
+                if seq_idx < len(sequences) - 1:  # Not the last sequence
+                    print(f"  🔄 Extracting last frame for continuity...")
                     try:
-                        image_bytes = await loop.run_in_executor(None, generate_with_refs)
-                        
-                        if image_bytes:
-                            from PIL import Image
-                            try:
-                                pil_image = Image.open(BytesIO(image_bytes))
-                                # Verify it's a valid image
-                                pil_image.load()  # Force load to verify
-                                print(f"  ✅ Image generated successfully for Seg {segment_index} Shot {shot_idx}")
-                                
-                                # Upload generated image for reference
-                                try:
-                                    img_path = f"/tmp/{job_id}_seg{segment_index}_shot{shot_idx}.png"
-                                    with open(img_path, "wb") as f:
-                                        f.write(image_bytes)
-                                    await loop.run_in_executor(None, get_uploader().upload_file, img_path, f"{job_id}_seg{segment_index}_shot{shot_idx}.png", "video-images")
-                                except Exception as e:
-                                    print(f"  ⚠️ Failed to upload generated image: {e}")
-                            except Exception as pil_err:
-                                print(f"  ⚠️ Image data invalid, proceeding with text-to-video: {pil_err}")
-                                pil_image = None
-                        else:
-                            print(f"  ⚠️ Image generation returned None, proceeding with text-to-video")
-                    except Exception as img_gen_err:
-                        print(f"  ⚠️ Image generation failed, proceeding with text-to-video: {img_gen_err}")
-                        pil_image = None
-
-                # B. Generate Video with Veo 3.1 (enriched prompts already applied)
-                print(f"  🎥 Seg {segment_index} Shot {shot_idx}: Generating Video with Veo 3.1 ({aspect_ratio})...")
+                        previous_last_frame = await loop.run_in_executor(
+                            None,
+                            lambda: get_video_editor().extract_last_frame(video_bytes)
+                        )
+                        print(f"  ✅ Last frame extracted: {len(previous_last_frame)} bytes")
+                    except Exception as e:
+                        print(f"  ⚠️ Failed to extract last frame: {e}")
+                        previous_last_frame = None
                 
-                # Validate duration for Veo 3.1 (4, 6, or 8 seconds)
-                veo_duration = 8  # Default to 8s for best quality
-                if shot_duration in [4, 6, 8]:
-                    veo_duration = shot_duration
-                
-                local_path = await loop.run_in_executor(
-                    None, 
-                    lambda: get_veo().generate_video_and_wait(
-                        prompt=vid_prompt,
-                        aspect_ratio=aspect_ratio,  # Use tier-specific aspect ratio
-                        resolution="720p",
-                        duration_seconds=veo_duration,
-                        image=pil_image,
-                        download_path=f"/tmp/{job_id}_seg{segment_index}_shot{shot_idx}.mp4",
-                        use_fast_model=use_fast_model,
+                # Upload sequence video
+                try:
+                    await loop.run_in_executor(
+                        None,
+                        get_uploader().upload_bytes,
+                        video_bytes,
+                        f"{job_id}_seq{seq_num}.mp4"
                     )
-                )
-                
-                # Upload clip
-                with open(local_path, "rb") as f:
-                    data = f.read()
-                url = await loop.run_in_executor(None, get_uploader().upload_bytes, data, f"{job_id}_seg{segment_index}_shot{shot_idx}.mp4")
-                return (segment_index, shot_idx, url)
-
-            all_clip_urls = []
+                except Exception:
+                    pass
             
-            if script and "segments" in script:
-                tasks = []
-                total_segments = len(script["segments"])
-                total_shots = 0
-                
-                # Create tasks for ALL shots across ALL segments
-                for segment in script["segments"]:
-                    seg_idx = segment.get("segment_index", 0)
-                    shots = segment.get("shots", [])
-                    total_shots += len(shots)
-                    
-                    for shot in shots:
-                        tasks.append(process_shot(seg_idx, shot, user_pil_images))
-                
-                # Log detailed generation plan
-                expected_duration = total_segments * 8  # Veo uses 8s segments
-                print(f"📊 GENERATION PLAN:")
-                print(f"   - Requested duration: {duration}s")
-                print(f"   - Segments to generate: {total_segments}")
-                print(f"   - Total shots: {total_shots}")
-                print(f"   - Expected output duration: {expected_duration}s")
-                print(f"🚀 Launching {len(tasks)} parallel generation tasks with enriched prompts...")
-                # Run all tasks in parallel
-                results = await asyncio.gather(*tasks, return_exceptions=True)
-                
-                # Process results
-                valid_results = []
-                for res in results:
-                    if isinstance(res, Exception):
-                        print(f"❌ Task failed: {res}")
-                    else:
-                        valid_results.append(res)
-                
-                # Sort by segment then shot to ensure correct order
-                valid_results.sort(key=lambda x: (x[0], x[1]))
-                all_clip_urls = [r[2] for r in valid_results]
-                
+            # 5. CONCATENATE ALL VIDEOS
+            print(f"\n{'='*50}")
+            print(f"🎞️ MERGING {len(all_video_bytes)} sequences...")
+            print(f"{'='*50}")
+            
+            if len(all_video_bytes) == 1:
+                final_video_bytes = all_video_bytes[0]
             else:
-                # Fallback to simple loop if script generation fails
-                print("⚠️ Script generation failed, falling back to simple generation.")
-                
-                # Determine aspect ratio based on tier
-                tier_aspect_ratio = get_aspect_ratio_for_tier(user_tier)
-                print(f"📐 Fallback using aspect ratio: {tier_aspect_ratio} for {user_tier.upper()} tier")
-                
-                # Generate a single 8s video with the enriched prompt
-                enriched_prompt = get_gemini().enrich_prompt(
-                    custom_prompt or generate_prompt(niche),
-                    segment_context="Single video generation",
-                    user_image_description=None,
-                    user_tier=user_tier  # Pass user tier for proper prompt enrichment
-                )
-                
-                # Use first user image if available
-                first_image = user_pil_images[0] if user_pil_images else None
-                if first_image:
-                    print(f"  🖼️ Using first user-provided image in fallback mode")
-                
-                # For longer videos (>8s), generate multiple clips even in fallback mode
-                target_clips = max(1, (duration + 7) // 8)
-                print(f"  📹 Generating {target_clips} clip(s) for {duration}s video in fallback mode")
-                
-                fallback_clip_urls = []
-                for clip_idx in range(target_clips):
-                    clip_prompt = enriched_prompt
-                    if target_clips > 1:
-                        clip_prompt = f"{enriched_prompt}, scene {clip_idx + 1} of {target_clips}, continuous narrative flow"
-                    
-                    # Use user image only for first clip
-                    clip_image = first_image if clip_idx == 0 else None
-                    
-                    local_path = get_veo().generate_video_and_wait(
-                        prompt=clip_prompt,
-                        aspect_ratio=tier_aspect_ratio,  # Use tier-specific aspect ratio
-                        resolution="720p",
-                        duration_seconds=8,
-                        image=clip_image,
-                        download_path=f"/tmp/{job_id}_fallback_{clip_idx}.mp4",
-                        use_fast_model=use_fast_model,
+                final_video_bytes = await loop.run_in_executor(
+                    None,
+                    lambda: get_video_editor().concatenate_video_bytes(
+                        all_video_bytes,
+                        f"{job_id}_final.mp4",
+                        add_transitions=add_transitions,
+                        transition_duration=transition_duration
                     )
-                    
-                    with open(local_path, "rb") as f:
-                        data = f.read()
-                    url = get_uploader().upload_bytes(data, f"{job_id}_fallback_{clip_idx}.mp4")
-                    fallback_clip_urls.append(url)
-                    print(f"  ✅ Fallback clip {clip_idx + 1}/{target_clips} generated")
-                
-                all_clip_urls = fallback_clip_urls
-
-            if len(all_clip_urls) == 1:
-                final_url = all_clip_urls[0]
-            elif len(all_clip_urls) > 1:
-                print(f"🎞️ Concatenating {len(all_clip_urls)} clips...")
-                concatenated_data = get_video_editor().concatenate_videos(all_clip_urls, f"{job_id}.mp4")
-                final_url = get_uploader().upload_bytes(concatenated_data, f"{job_id}.mp4")
-            else:
-                raise Exception("No clips generated")
-
+                )
+            
+            # 6. UPLOAD FINAL VIDEO
+            print(f"📤 Uploading final video ({len(final_video_bytes)} bytes)...")
+            final_url = await loop.run_in_executor(
+                None,
+                get_uploader().upload_bytes,
+                final_video_bytes,
+                f"{job_id}.mp4"
+            )
+            
+            # 7. UPDATE JOB STATUS
             get_supabase().table("video_jobs").update({
                 "status": "completed",
                 "video_url": final_url,
+                "progress": 100,
                 "completed_at": "now()",
             }).eq("id", job_id).execute()
-
-            print(f"✅ Job {job_id} completed!")
+            
+            print(f"✅ Job {job_id} COMPLETED! URL: {final_url}")
         
         else:
             # ===== MODE SORA 2 (OpenAI Videos API) - Parallel Advanced Scripting =====
