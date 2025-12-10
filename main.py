@@ -768,11 +768,11 @@ async def process_video_generation(
                     
                     if kf_start_bytes:
                         keyframes.append(kf_start_bytes)
-                        # Upload for debug/preview
+                        # Upload for debug/preview to video-images bucket
                         try:
                             await loop.run_in_executor(
                                 None,
-                                get_uploader().upload_bytes,
+                                get_uploader().upload_image_bytes,
                                 kf_start_bytes,
                                 f"{job_id}_seq{seq_num}_kf_start.jpg"
                             )
@@ -795,10 +795,11 @@ async def process_video_generation(
                     
                     if kf_middle_bytes:
                         keyframes.append(kf_middle_bytes)
+                        # Upload for debug/preview to video-images bucket
                         try:
                             await loop.run_in_executor(
                                 None,
-                                get_uploader().upload_bytes,
+                                get_uploader().upload_image_bytes,
                                 kf_middle_bytes,
                                 f"{job_id}_seq{seq_num}_kf_middle.jpg"
                             )
@@ -821,10 +822,11 @@ async def process_video_generation(
                     
                     if kf_end_bytes:
                         keyframes.append(kf_end_bytes)
+                        # Upload for debug/preview to video-images bucket
                         try:
                             await loop.run_in_executor(
                                 None,
-                                get_uploader().upload_bytes,
+                                get_uploader().upload_image_bytes,
                                 kf_end_bytes,
                                 f"{job_id}_seq{seq_num}_kf_end.jpg"
                             )

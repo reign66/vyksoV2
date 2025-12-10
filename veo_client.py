@@ -172,34 +172,12 @@ class VeoAIClient:
             else:
                 kwargs["last_frame"] = last_frame
             
+        # Note: reference_images is NOT supported by current Veo models
+        # The API returns: "`referenceImages` isn't supported by this model"
+        # If reference_images are provided, we ignore them and log a warning
         if reference_images and len(reference_images) > 0:
-            # Veo 3.1 supports up to 3 reference images - create VideoGenerationReferenceImage objects
-            # CRITICAL: Images MUST be converted to types.Image with image_bytes
-            ref_images = []
-            for idx, ref_img in enumerate(reference_images[:3]):
-                try:
-                    # Convert to JPEG bytes
-                    img_bytes = self._convert_to_image_bytes(ref_img)
-                    print(f"  📸 Reference image {idx + 1}: converted to {len(img_bytes)} bytes")
-                    
-                    # Create types.Image from bytes
-                    img_obj = types.Image(image_bytes=img_bytes)
-                    
-                    # Create VideoGenerationReferenceImage with proper structure
-                    ref_images.append(types.VideoGenerationReferenceImage(
-                        image=img_obj,
-                        reference_type="asset"  # "asset" for content reference, "style" for style reference
-                    ))
-                except Exception as e:
-                    print(f"  ⚠️ Failed to process reference image {idx + 1}: {e}")
-                    continue
-            
-            if ref_images:
-                kwargs["config"] = types.GenerateVideosConfig(
-                    **config_kwargs,
-                    reference_images=ref_images
-                )
-                print(f"  ✅ Added {len(ref_images)} reference images to Veo config")
+            print(f"  ⚠️ reference_images parameter is not supported by Veo models - ignoring {len(reference_images)} images")
+            print(f"  ℹ️ Use 'image' parameter for image-to-video or 'last_frame' for video interpolation instead")
 
         print(f"🚀 Starting video generation with Veo 3.1...")
         operation = self.client.models.generate_videos(**kwargs)
@@ -229,20 +207,24 @@ class VeoAIClient:
         use_fast_model: bool = False,
     ) -> str:
         """
-        Generate video using up to 3 keyframes (START, MIDDLE, END).
+        Generate video using keyframes (START and optionally END for interpolation).
         
-        This is the preferred method for generating sequences with visual continuity.
-        Veo 3.1 will interpolate between the provided keyframes.
+        This method uses Veo 3.1's image-to-video and video interpolation features:
+        - If 1 keyframe: image-to-video (animates from the provided image)
+        - If 2+ keyframes: video interpolation (start to end frame)
+        
+        Note: The Veo API does NOT support reference_images parameter.
+        Instead, it uses 'image' for start frame and 'last_frame' for end frame.
         
         Args:
             prompt: Text description of the video motion/action
-            keyframes: List of 1-3 images (PIL Image or bytes) representing:
-                - keyframes[0]: START frame (beginning of sequence)
-                - keyframes[1]: MIDDLE frame (optional, midpoint)
-                - keyframes[2]: END frame (optional, end of sequence)
+            keyframes: List of 1-3 images (PIL Image or bytes):
+                - keyframes[0]: START frame (used as 'image' parameter)
+                - keyframes[-1]: END frame (used as 'last_frame' if 2+ keyframes)
+                - Middle keyframes are not directly supported by Veo API
             aspect_ratio: "16:9" (default) or "9:16"
             resolution: "720p" (default) or "1080p"
-            duration_seconds: 4, 6, or 8 (must be 8 for multiple keyframes)
+            duration_seconds: 4, 6, or 8 (must be 8 for interpolation)
             negative_prompt: What to exclude from the video
             download_path: Output file path
             use_fast_model: True for faster generation (lower quality)
@@ -253,32 +235,26 @@ class VeoAIClient:
         if not keyframes or len(keyframes) == 0:
             raise ValueError("At least 1 keyframe is required")
         
-        if len(keyframes) > 3:
-            print(f"⚠️ Only first 3 keyframes will be used (provided: {len(keyframes)})")
-            keyframes = keyframes[:3]
-        
-        # For reference images, duration must be 8 seconds
+        # For video interpolation (start + end frames), duration must be 8 seconds
         if len(keyframes) > 1 and duration_seconds != 8:
-            print(f"⚠️ Multiple keyframes require 8s duration, adjusting from {duration_seconds}s")
+            print(f"⚠️ Video interpolation requires 8s duration, adjusting from {duration_seconds}s")
             duration_seconds = 8
         
         model_name = self.MODEL_FAST if use_fast_model else self.MODEL_NORMAL
         print(f"🎥 Generating video with {len(keyframes)} keyframe(s) using {model_name}")
         
-        # Convert all keyframes to proper format
-        ref_images = []
-        for idx, kf in enumerate(keyframes):
-            try:
-                img_bytes = self._convert_to_image_bytes(kf)
-                img_obj = types.Image(image_bytes=img_bytes)
-                ref_images.append(types.VideoGenerationReferenceImage(
-                    image=img_obj,
-                    reference_type="asset"
-                ))
-                print(f"  ✅ Keyframe {idx + 1} ({['START', 'MIDDLE', 'END'][idx]}): {len(img_bytes)} bytes")
-            except Exception as e:
-                print(f"  ❌ Failed to process keyframe {idx + 1}: {e}")
-                raise
+        # Convert keyframes to proper format
+        # Veo API uses 'image' for start frame and 'last_frame' for end frame (NOT reference_images)
+        start_frame_bytes = self._convert_to_image_bytes(keyframes[0])
+        print(f"  ✅ START keyframe: {len(start_frame_bytes)} bytes")
+        
+        end_frame_bytes = None
+        if len(keyframes) >= 2:
+            # Use the last keyframe as the end frame for interpolation
+            end_frame_bytes = self._convert_to_image_bytes(keyframes[-1])
+            print(f"  ✅ END keyframe: {len(end_frame_bytes)} bytes")
+            if len(keyframes) > 2:
+                print(f"  ⚠️ Middle keyframes ({len(keyframes) - 2}) are not directly supported by Veo API, using only START and END")
         
         # Build config
         config_kwargs = {
@@ -297,19 +273,26 @@ class VeoAIClient:
         if negative_prompt:
             config_kwargs["negative_prompt"] = negative_prompt
         
-        config = types.GenerateVideosConfig(
-            **config_kwargs,
-            reference_images=ref_images
-        )
+        config = types.GenerateVideosConfig(**config_kwargs)
         
-        print(f"📋 Config: duration={duration_seconds}s, aspect_ratio={aspect_ratio}, keyframes={len(ref_images)}")
-        print(f"🚀 Starting keyframe-based video generation...")
+        # Build kwargs for generate_videos
+        kwargs = {
+            "model": model_name,
+            "prompt": prompt,
+            "config": config,
+            "image": types.Image(image_bytes=start_frame_bytes),  # Start frame
+        }
         
-        operation = self.client.models.generate_videos(
-            model=model_name,
-            prompt=prompt,
-            config=config,
-        )
+        # Add end frame for video interpolation if we have 2+ keyframes
+        if end_frame_bytes:
+            kwargs["last_frame"] = types.Image(image_bytes=end_frame_bytes)
+            print(f"📋 Config: duration={duration_seconds}s, aspect_ratio={aspect_ratio}, mode=interpolation (start→end)")
+        else:
+            print(f"📋 Config: duration={duration_seconds}s, aspect_ratio={aspect_ratio}, mode=image-to-video")
+        
+        print(f"🚀 Starting video generation...")
+        
+        operation = self.client.models.generate_videos(**kwargs)
         
         print(f"⏳ Waiting for video generation to complete...")
         while not operation.done:
