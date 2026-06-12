@@ -417,13 +417,19 @@ class GeminiClient:
         """
         try:
             # Download the image
-            response = httpx.get(image_url, timeout=30)
+            response = httpx.get(image_url, timeout=30, follow_redirects=True)
+            response.raise_for_status()
             image_bytes = response.content
-            
+
+            # Derive mime type from the response Content-Type header (F-09)
+            mime_type = response.headers.get("content-type", "image/png").split(";")[0].strip()
+            if not mime_type.startswith("image/"):
+                mime_type = "image/png"
+
             # Analyze with Gemini - use vision model
             image_part = types.Part.from_bytes(
                 data=image_bytes,
-                mime_type="image/png"
+                mime_type=mime_type
             )
             
             response = self.client.models.generate_content(
@@ -494,7 +500,8 @@ class GeminiClient:
         Create {num_segments} segments. {"Make it viral-worthy!" if user_tier == "creator" else "Make it premium advertising quality."}
         """
         
-        try:
+        def _call_script_llm():
+            """Single LLM call + JSON parse + structure validation. Returns script dict or None."""
             response = self.client.models.generate_content(
                 model="gemini-2.0-flash-lite",
                 contents=user_content,
@@ -503,18 +510,18 @@ class GeminiClient:
                     response_mime_type="application/json"
                 )
             )
-            
+
             response_text = response.text
-            
+
             # Try to parse the response as JSON, with fallback cleanup
             try:
                 script = json.loads(response_text)
             except json.JSONDecodeError as json_err:
                 print(f"⚠️ JSON parsing failed, attempting cleanup: {json_err}")
-                
+
                 # Common cleanup attempts
                 cleaned_text = response_text.strip()
-                
+
                 # Remove markdown code blocks if present
                 if cleaned_text.startswith("```"):
                     lines = cleaned_text.split("\n")
@@ -523,59 +530,65 @@ class GeminiClient:
                     if lines and lines[-1].strip() == "```":
                         lines = lines[:-1]  # Remove last line
                     cleaned_text = "\n".join(lines)
-                
+
                 # Try to find JSON object boundaries
                 if "{" in cleaned_text:
                     start_idx = cleaned_text.find("{")
                     end_idx = cleaned_text.rfind("}") + 1
                     if start_idx >= 0 and end_idx > start_idx:
                         cleaned_text = cleaned_text[start_idx:end_idx]
-                
+
                 try:
                     script = json.loads(cleaned_text)
                     print("✅ JSON parsing succeeded after cleanup")
                 except json.JSONDecodeError:
                     print(f"❌ JSON parsing failed even after cleanup. Response preview: {response_text[:500]}")
                     return None
-            
+
             # Validate script structure
             if not script or not isinstance(script, dict) or "segments" not in script:
                 print(f"❌ Invalid script structure: missing 'segments' key. Keys found: {script.keys() if isinstance(script, dict) else 'not a dict'}")
                 return None
-            
-            segments = script.get("segments", [])
-            if not segments or not isinstance(segments, list) or len(segments) == 0:
+
+            seg = script.get("segments", [])
+            if not seg or not isinstance(seg, list) or len(seg) == 0:
                 print(f"❌ Invalid script structure: 'segments' is empty or not a list")
                 return None
-            
+
+            return script
+
+        try:
+            script = _call_script_llm()
+            if script is None:
+                return None
+
+            segments = script["segments"]
+
             # CRITICAL: Validate we have the correct number of segments
             actual_segments = len(segments)
             print(f"📜 Script generated with {actual_segments}/{num_segments} segments for {user_tier.upper()} tier")
-            
+
+            # F-41: if the LLM returned fewer segments than requested, retry ONCE.
+            # NEVER clone segments — the user would pay for duplicated AI video.
             if actual_segments < num_segments:
-                print(f"⚠️ WARNING: Got {actual_segments} segments but requested {num_segments}!")
-                print(f"⚠️ This will result in a shorter video than expected ({actual_segments * segment_duration}s instead of {duration}s)")
-                
-                # Try to fill in missing segments by duplicating/extending
-                while len(segments) < num_segments:
-                    # Clone the last segment with incremented index
-                    last_segment = segments[-1].copy()
-                    last_segment["segment_index"] = len(segments) + 1
-                    
-                    # Update shot prompts to indicate continuation
-                    if "shots" in last_segment:
-                        for shot in last_segment["shots"]:
-                            if "video_prompt" in shot:
-                                shot["video_prompt"] = f"Continuation: {shot['video_prompt']}"
-                            if "image_prompt" in shot:
-                                shot["image_prompt"] = f"Continuation: {shot['image_prompt']}"
-                    
-                    segments.append(last_segment)
-                    print(f"➕ Added filler segment {len(segments)} (cloned from previous)")
-                
-                script["segments"] = segments
-                print(f"✅ Segments extended to {len(segments)}")
-            
+                print(f"⚠️ WARNING: Got {actual_segments} segments but requested {num_segments}! Retrying LLM once...")
+                try:
+                    retry_script = _call_script_llm()
+                except Exception as retry_err:
+                    print(f"⚠️ Script retry failed: {retry_err}")
+                    retry_script = None
+                if retry_script is not None and len(retry_script["segments"]) > actual_segments:
+                    script = retry_script
+                    segments = script["segments"]
+                    actual_segments = len(segments)
+                    print(f"✅ Retry produced {actual_segments}/{num_segments} segments")
+
+            if actual_segments < num_segments:
+                # Still short: return the segments actually produced (caller handles prorata)
+                print(f"⚠️ Still {actual_segments}/{num_segments} segments after retry — "
+                      f"returning what was produced ({actual_segments * segment_duration}s instead of {duration}s); "
+                      f"caller handles prorata. NOT cloning segments.")
+
             # Enrich all prompts in the script with tier-specific enrichment
             for segment in segments:
                 if not isinstance(segment, dict):
@@ -753,8 +766,10 @@ class GeminiClient:
             
             headers = {
                 "Content-Type": "application/json",
+                # F-10: API key in header, never in the query string (avoids key leaking in logs)
+                "x-goog-api-key": self.api_key,
             }
-            
+
             # Configuration optimisée pour YouTube Shorts (VERTICAL 9:16)
             payload = {
                 "instances": [{"prompt": thumbnail_prompt}],
@@ -764,9 +779,9 @@ class GeminiClient:
                     "personGeneration": "allow_adult"
                 }
             }
-            
+
             response = requests.post(
-                f"{endpoint}?key={self.api_key}",
+                endpoint,
                 headers=headers,
                 json=payload,
                 timeout=60
@@ -1126,7 +1141,8 @@ Style: Cinematic, eye-catching, clickbait thumbnail style, designed for maximum 
         Each sequence must have {num_keyframes_per_sequence} keyframe prompts and 1 veo_prompt.
         """
         
-        try:
+        def _call_cinematic_llm():
+            """Single LLM call + JSON parse + structure validation. Returns script dict or None."""
             response = self.client.models.generate_content(
                 model="gemini-2.0-flash-lite",
                 contents=user_content,
@@ -1135,18 +1151,18 @@ Style: Cinematic, eye-catching, clickbait thumbnail style, designed for maximum 
                     response_mime_type="application/json"
                 )
             )
-            
+
             response_text = response.text
-            
+
             # Parse JSON response
             try:
                 script = json.loads(response_text)
             except json.JSONDecodeError as json_err:
                 print(f"⚠️ JSON parsing failed, attempting cleanup: {json_err}")
-                
+
                 # Cleanup attempts
                 cleaned_text = response_text.strip()
-                
+
                 if cleaned_text.startswith("```"):
                     lines = cleaned_text.split("\n")
                     if lines[0].startswith("```"):
@@ -1154,35 +1170,50 @@ Style: Cinematic, eye-catching, clickbait thumbnail style, designed for maximum 
                     if lines and lines[-1].strip() == "```":
                         lines = lines[:-1]
                     cleaned_text = "\n".join(lines)
-                
+
                 if "{" in cleaned_text:
                     start_idx = cleaned_text.find("{")
                     end_idx = cleaned_text.rfind("}") + 1
                     if start_idx >= 0 and end_idx > start_idx:
                         cleaned_text = cleaned_text[start_idx:end_idx]
-                
+
                 script = json.loads(cleaned_text)
-            
+
             # Validate script structure
             if not script or not isinstance(script, dict) or "sequences" not in script:
                 print(f"❌ Invalid script structure: missing 'sequences' key")
                 return None
-            
+
+            return script
+
+        try:
+            script = _call_cinematic_llm()
+            if script is None:
+                return None
+
             sequences = script.get("sequences", [])
+
+            # F-41: if the LLM returned fewer sequences than requested, retry ONCE.
+            # NEVER pad/clone — the user would pay for duplicated AI video.
             if len(sequences) < num_sequences:
-                print(f"⚠️ Got {len(sequences)} sequences, expected {num_sequences}. Padding...")
-                
-                # Pad with continuation sequences
-                while len(sequences) < num_sequences:
-                    last_seq = sequences[-1].copy()
-                    last_seq["sequence_index"] = len(sequences) + 1
-                    last_seq["description"] = f"Continuation of {last_seq.get('description', 'previous scene')}"
-                    sequences.append(last_seq)
-                
-                script["sequences"] = sequences
-            
+                print(f"⚠️ Got {len(sequences)} sequences, expected {num_sequences}. Retrying LLM once...")
+                try:
+                    retry_script = _call_cinematic_llm()
+                except Exception as retry_err:
+                    print(f"⚠️ Cinematic script retry failed: {retry_err}")
+                    retry_script = None
+                if retry_script is not None and len(retry_script.get("sequences", [])) > len(sequences):
+                    script = retry_script
+                    sequences = script.get("sequences", [])
+                    print(f"✅ Retry produced {len(sequences)}/{num_sequences} sequences")
+
+            if len(sequences) < num_sequences:
+                # Still short: return the sequences actually produced (caller handles prorata)
+                print(f"⚠️ Still {len(sequences)}/{num_sequences} sequences after retry — "
+                      f"returning what was produced; caller handles prorata. NOT cloning sequences.")
+
             print(f"📜 Cinematic script generated: {len(sequences)} sequences, {num_keyframes_per_sequence} keyframes each")
-            
+
             return script
             
         except Exception as e:

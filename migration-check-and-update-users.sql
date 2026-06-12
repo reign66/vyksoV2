@@ -58,7 +58,7 @@ ORDER BY user_count DESC;
 -- Replace 'USER_ID_HERE' with the actual user UUID
 -- ============================================
 
--- Example: Upgrade user "Nicolas Reig" (id: e4719ae5-029c-4b0a-b57e-966aa3bcdcc8) to max_pro
+-- Example: Upgrade user "Nicolas Reig" (id: <USER_UUID>) to max_pro
 -- This will give them 16:9 horizontal format for professional ads
 
 -- UPDATE profiles
@@ -67,7 +67,7 @@ ORDER BY user_count DESC;
 --     plan_family = 'professional',
 --     preferred_aspect_ratio = '16:9',
 --     updated_at = NOW()
--- WHERE id = 'e4719ae5-029c-4b0a-b57e-966aa3bcdcc8';
+-- WHERE id = '<USER_UUID>';
 
 -- ============================================
 -- QUERY 4: Batch update - Convert all "max" users to "max_pro" (professional)
@@ -83,18 +83,19 @@ ORDER BY user_count DESC;
 -- WHERE plan = 'max';
 
 -- ============================================
--- QUERY 5: Specific update for user Nicolas Reig (based on your screenshot)
--- This converts from 'max' (creator/9:16) to 'max_pro' (professional/16:9)
+-- QUERY 5: Specific update for a single user
+-- COMMENTED OUT: live UPDATE on a hardcoded UUID — do NOT run as-is.
+-- Replace '<USER_UUID>' with the actual user UUID and uncomment deliberately.
 -- ============================================
 
-UPDATE profiles
-SET 
-    plan = 'max_pro',
-    plan_family = 'professional',
-    preferred_aspect_ratio = '16:9',
-    updated_at = NOW()
-WHERE id = 'e4719ae5-029c-4b0a-b57e-966aa3bcdcc8'
-RETURNING id, full_name, plan, plan_family, preferred_aspect_ratio, credits;
+-- UPDATE profiles
+-- SET
+--     plan = 'max_pro',
+--     plan_family = 'professional',
+--     preferred_aspect_ratio = '16:9',
+--     updated_at = NOW()
+-- WHERE id = '<USER_UUID>'
+-- RETURNING id, full_name, plan, plan_family, preferred_aspect_ratio, credits;
 
 -- ============================================
 -- QUERY 6: Verify the update
@@ -108,7 +109,7 @@ SELECT
     preferred_aspect_ratio,
     credits
 FROM profiles
-WHERE id = 'e4719ae5-029c-4b0a-b57e-966aa3bcdcc8';
+WHERE id = '<USER_UUID>';
 
 -- ============================================
 -- PLAN CONVERSION REFERENCE
