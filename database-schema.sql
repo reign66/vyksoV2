@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS profiles (
     preferred_aspect_ratio TEXT DEFAULT '9:16',  -- '9:16' for creator, '16:9' for professional
     current_period_end TIMESTAMP WITH TIME ZONE, -- When subscription renews
     canceled_at TIMESTAMP WITH TIME ZONE,        -- When subscription was canceled
+    cancel_at_period_end BOOLEAN DEFAULT FALSE,  -- Scheduled cancellation (Stripe)
     -- YouTube integration
     youtube_tokens JSONB,
     -- Timestamps
@@ -33,12 +34,12 @@ CREATE TABLE IF NOT EXISTS profiles (
 );
 
 -- TIER LOGIC:
--- plan_family is derived from plan name:
---   - Plans WITHOUT '_pro' suffix → 'creator' (9:16 vertical)
---   - Plans WITH '_pro' suffix → 'professional' (16:9 horizontal)
+-- plan_family is derived from the plan name PREFIX:
+--   - plan LIKE 'professional_%' → 'professional' (16:9 horizontal)
+--   - everything else (incl. 'free') → 'creator' (9:16 vertical)
 -- Example:
---   plan = 'max'     → plan_family = 'creator', preferred_aspect_ratio = '9:16'
---   plan = 'max_pro' → plan_family = 'professional', preferred_aspect_ratio = '16:9'
+--   plan = 'creator_max'      → plan_family = 'creator', preferred_aspect_ratio = '9:16'
+--   plan = 'professional_max' → plan_family = 'professional', preferred_aspect_ratio = '16:9'
 
 -- Add new columns to existing profiles table (run if table already exists)
 -- Run these ALTER statements only if the columns don't exist
@@ -98,7 +99,10 @@ CREATE TABLE IF NOT EXISTS video_jobs (
     prompt TEXT,
     metadata JSONB,
     error TEXT,
+    progress INTEGER DEFAULT 0,   -- 0-100, mis à jour par le backend pendant la génération
+    credits_cost INTEGER,         -- coût en crédits débité à la création (utilisé pour le remboursement)
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),  -- bump à chaque update (trigger) ; base du watchdog
     completed_at TIMESTAMP WITH TIME ZONE
 );
 
@@ -152,7 +156,9 @@ CREATE INDEX IF NOT EXISTS idx_profiles_plan ON profiles(plan);
 CREATE INDEX IF NOT EXISTS idx_profiles_plan_family ON profiles(plan_family);
 CREATE INDEX IF NOT EXISTS idx_credit_transactions_user_id ON credit_transactions(user_id);
 CREATE INDEX IF NOT EXISTS idx_webhook_logs_event_type ON webhook_logs(event_type);
-CREATE INDEX IF NOT EXISTS idx_webhook_logs_event_id ON webhook_logs(event_id);
+-- UNIQUE: garantit l'idempotence des webhooks Stripe (le backend insère
+-- event_id AVANT traitement ; un conflit = événement déjà traité)
+CREATE UNIQUE INDEX IF NOT EXISTS uq_webhook_logs_event_id ON webhook_logs(event_id);
 CREATE INDEX IF NOT EXISTS idx_notifications_user_id ON notifications(user_id);
 CREATE INDEX IF NOT EXISTS idx_notifications_read ON notifications(user_id, read);
 
@@ -236,83 +242,89 @@ CREATE POLICY "Service role full access credit_transactions"
 -- ============================================
 -- FUNCTION: decrement_credits
 -- 1 crédit = 1 seconde de vidéo
+-- ATOMIQUE : un seul UPDATE conditionnel (pas de SELECT préalable),
+-- donc pas de race TOCTOU ni de solde négatif possible.
+-- Retourne le solde restant en INTEGER (0 est une valeur légitime —
+-- le code appelant teste `is None`, pas la falsiness).
 -- ============================================
 CREATE OR REPLACE FUNCTION decrement_credits(p_user_id UUID, p_amount INTEGER)
 RETURNS INTEGER AS $$
 DECLARE
-    current_credits INTEGER;
+    v_remaining INTEGER;
 BEGIN
-    SELECT credits INTO current_credits FROM profiles WHERE id = p_user_id;
-    
-    IF current_credits IS NULL THEN
-        RAISE EXCEPTION 'User not found';
-    END IF;
-    
-    IF current_credits < p_amount THEN
-        RAISE EXCEPTION 'Insufficient credits';
-    END IF;
-    
-    UPDATE profiles 
+    UPDATE profiles
     SET credits = credits - p_amount,
         updated_at = NOW()
-    WHERE id = p_user_id;
-    
-    -- Enregistrer la transaction (optionnel)
+    WHERE id = p_user_id
+      AND credits >= p_amount
+    RETURNING credits INTO v_remaining;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'INSUFFICIENT_CREDITS';
+    END IF;
+
     INSERT INTO credit_transactions (user_id, amount, type, description)
     VALUES (p_user_id, -p_amount, 'debit', 'Video generation');
-    
-    RETURN current_credits - p_amount;
+
+    RETURN v_remaining;
 END;
-$$ LANGUAGE plpgsql SECURITY DEFINER;
+$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public;
 
 -- ============================================
--- FUNCTION: refund_credits
+-- FUNCTION: refund_credits (atomique, type='refund')
 -- ============================================
 CREATE OR REPLACE FUNCTION refund_credits(p_user_id UUID, p_amount INTEGER)
 RETURNS INTEGER AS $$
 DECLARE
-    current_credits INTEGER;
+    v_remaining INTEGER;
 BEGIN
-    UPDATE profiles 
+    UPDATE profiles
     SET credits = credits + p_amount,
         updated_at = NOW()
     WHERE id = p_user_id
-    RETURNING credits INTO current_credits;
-    
-    -- Enregistrer la transaction (optionnel)
+    RETURNING credits INTO v_remaining;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'USER_NOT_FOUND';
+    END IF;
+
     INSERT INTO credit_transactions (user_id, amount, type, description)
     VALUES (p_user_id, p_amount, 'refund', 'Video generation refund');
-    
-    RETURN current_credits;
+
+    RETURN v_remaining;
 END;
-$$ LANGUAGE plpgsql SECURITY DEFINER;
+$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public;
 
 -- ============================================
--- FUNCTION: add_credits (pour achats et abonnements)
+-- FUNCTION: add_credits (atomique, type='purchase' par défaut,
+-- 'subscription' si passé explicitement)
 -- ============================================
-CREATE OR REPLACE FUNCTION add_credits(p_user_id UUID, p_amount INTEGER, p_type TEXT DEFAULT 'credit')
+CREATE OR REPLACE FUNCTION add_credits(p_user_id UUID, p_amount INTEGER, p_type TEXT DEFAULT 'purchase')
 RETURNS INTEGER AS $$
 DECLARE
-    current_credits INTEGER;
+    v_remaining INTEGER;
 BEGIN
-    UPDATE profiles 
+    UPDATE profiles
     SET credits = credits + p_amount,
         updated_at = NOW()
     WHERE id = p_user_id
-    RETURNING credits INTO current_credits;
-    
-    -- Enregistrer la transaction
+    RETURNING credits INTO v_remaining;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'USER_NOT_FOUND';
+    END IF;
+
     INSERT INTO credit_transactions (user_id, amount, type, description)
-    VALUES (p_user_id, p_amount, p_type, 
-        CASE 
+    VALUES (p_user_id, p_amount, p_type,
+        CASE
             WHEN p_type = 'subscription' THEN 'Monthly subscription credits'
             ELSE 'Credit purchase'
         END
     );
-    
-    RETURN current_credits;
+
+    RETURN v_remaining;
 END;
-$$ LANGUAGE plpgsql SECURITY DEFINER;
+$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public;
 
 -- ============================================
 -- FUNCTION: auto-update updated_at
@@ -331,6 +343,54 @@ CREATE TRIGGER update_profiles_updated_at
     BEFORE UPDATE ON profiles
     FOR EACH ROW
     EXECUTE FUNCTION update_updated_at_column();
+
+-- Trigger for video_jobs (base du watchdog : updated_at = dernière activité du job)
+DROP TRIGGER IF EXISTS update_video_jobs_updated_at ON video_jobs;
+CREATE TRIGGER update_video_jobs_updated_at
+    BEFORE UPDATE ON video_jobs
+    FOR EACH ROW
+    EXECUTE FUNCTION update_updated_at_column();
+
+-- ============================================
+-- TIER: plan_family dérivé du PRÉFIXE du plan
+-- plan LIKE 'professional_%' → 'professional' (16:9), sinon 'creator' (9:16)
+-- ============================================
+CREATE OR REPLACE FUNCTION get_tier_from_plan(plan_name TEXT)
+RETURNS TEXT AS $$
+BEGIN
+    IF plan_name IS NOT NULL AND plan_name LIKE 'professional\_%' ESCAPE '\' THEN
+        RETURN 'professional';
+    END IF;
+    RETURN 'creator';
+END;
+$$ LANGUAGE plpgsql IMMUTABLE;
+
+CREATE OR REPLACE FUNCTION get_aspect_ratio_from_tier(tier_name TEXT)
+RETURNS TEXT AS $$
+BEGIN
+    IF tier_name = 'professional' THEN
+        RETURN '16:9';  -- horizontal (pubs / commercials)
+    ELSE
+        RETURN '9:16';  -- vertical (TikTok / Shorts)
+    END IF;
+END;
+$$ LANGUAGE plpgsql IMMUTABLE;
+
+CREATE OR REPLACE FUNCTION update_tier_on_plan_change()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.plan_family := get_tier_from_plan(NEW.plan);
+    NEW.preferred_aspect_ratio := get_aspect_ratio_from_tier(NEW.plan_family);
+    NEW.updated_at := NOW();
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trigger_update_tier_on_plan_change ON profiles;
+CREATE TRIGGER trigger_update_tier_on_plan_change
+    BEFORE INSERT OR UPDATE OF plan ON profiles
+    FOR EACH ROW
+    EXECUTE FUNCTION update_tier_on_plan_change();
 
 -- ============================================
 -- STORAGE BUCKETS
@@ -375,87 +435,39 @@ CREATE POLICY "Service role full access notifications"
     USING (auth.jwt() ->> 'role' = 'service_role');
 
 -- ============================================
--- TIER SYSTEM - BASED ON PLAN NAME
+-- TIER SYSTEM - BASED ON PLAN NAME PREFIX
 -- ============================================
--- 
--- IMPORTANT: The tier is determined by the plan name suffix:
--- 
--- CREATOR TIER (9:16 VERTICAL - TikTok/YouTube Shorts):
---   - Plans WITHOUT "_pro" suffix: free, starter, premium, pro, max
---   - Yearly variants: starter_yearly, pro_yearly, max_yearly
---   - Legacy naming: creator_basic, creator_pro, creator_max
---   - Fixed duration: 8s (VEO) or 10s (Sora)
---   - Aspect ratio: 9:16 VERTICAL
---   - Prompts: Viral, attention-grabbing, TikTok optimized
--- 
--- PROFESSIONAL TIER (16:9 HORIZONTAL - Ads/Commercials):
---   - Plans WITH "_pro" suffix: premium_pro, pro_pro, max_pro, starter_pro
---   - Variable duration: 6-60s
---   - Aspect ratio: 16:9 HORIZONTAL (widescreen)
---   - Prompts: Professional, brand-safe, conversion-focused
--- 
--- Example tier detection:
---   plan = "max"      → CREATOR (9:16 vertical)
---   plan = "max_pro"  → PROFESSIONAL (16:9 horizontal)
---   plan = "pro"      → CREATOR (9:16 vertical) 
---   plan = "pro_pro"  → PROFESSIONAL (16:9 horizontal)
--- 
-
--- ============================================
--- CREATOR TIER PRICING (9:16 vertical)
--- ============================================
-
--- Free: 10 crédits par défaut (pour tester)
-
--- Starter:
---   Monthly: → STRIPE_PRICE_STARTER
---   Annual: → STRIPE_PRICE_STARTER_ANNUAL
---   Credits: Variable
-
--- Premium:
---   Monthly: → STRIPE_PRICE_PREMIUM
---   Annual: → STRIPE_PRICE_PREMIUM_ANNUAL
-
--- Pro:
---   Monthly: → STRIPE_PRICE_PRO
---   Annual: → STRIPE_PRICE_PRO_ANNUAL
-
--- Max:
---   Monthly: → STRIPE_PRICE_MAX
---   Annual: → STRIPE_PRICE_MAX_ANNUAL
-
--- Legacy Creator naming:
--- Creator Basic: 34,99 €/mois → STRIPE_PRICE_BASIC_MONTHLY
--- Creator Pro: 65,99 €/mois → STRIPE_PRICE_PRO_MONTHLY
--- Creator Max: 89,99 €/mois → STRIPE_PRICE_MAX_MONTHLY
-
--- ============================================
--- PROFESSIONAL TIER PRICING (16:9 horizontal)
--- ============================================
-
--- Premium Pro:
---   Monthly: 199,00 €/mois
---   Annual: 179,00 €/mois
---   Credits: 600 crédits
-
--- Pro Pro:
---   Monthly: 589,00 €/mois
---   Annual: 530,00 €/mois
---   Credits: 1200 crédits
-
--- Max Pro:
---   Monthly: 1 199,00 €/mois
---   Annual: 1 079,00 €/mois
---   Credits: 1800 crédits
-
--- ============================================
--- PLAN VALUES FOR profiles.plan COLUMN
--- ============================================
--- Creator tier plans (9:16 vertical):
---   'free', 'starter', 'premium', 'pro', 'max'
---   'starter_yearly', 'premium_yearly', 'pro_yearly', 'max_yearly'
---   'creator_basic', 'creator_pro', 'creator_max' (legacy)
 --
--- Professional tier plans (16:9 horizontal):
---   'starter_pro', 'premium_pro', 'pro_pro', 'max_pro'
---   'starter_pro_yearly', 'premium_pro_yearly', 'pro_pro_yearly', 'max_pro_yearly'
+-- IMPORTANT: plan_family is derived from the plan name PREFIX:
+--   plan LIKE 'professional_%' → 'professional' (16:9 horizontal)
+--   everything else (incl. 'free') → 'creator' (9:16 vertical)
+--
+-- CREATOR TIER (9:16 VERTICAL - TikTok/YouTube Shorts):
+--   - Plans: free, creator_basic, creator_pro, creator_max
+--   - Fixed duration: 8s (VEO) or 10s (Sora)
+--   - Prompts: Viral, attention-grabbing, TikTok optimized
+--
+-- PROFESSIONAL TIER (16:9 HORIZONTAL - Ads/Commercials):
+--   - Plans: professional_starter, professional_pro, professional_max
+--   - Variable duration: 6-60s
+--   - Prompts: Professional, brand-safe, conversion-focused
+--
+-- Example tier detection:
+--   plan = "creator_max"      → CREATOR (9:16 vertical)
+--   plan = "professional_max" → PROFESSIONAL (16:9 horizontal)
+--
+
+-- ============================================
+-- PLAN VALUES FOR profiles.plan COLUMN + CREDITS
+-- (1 credit = 1 second of video)
+-- ============================================
+-- Creator tier (9:16 vertical):
+--   'free'          → 10 crédits initiaux (pour tester)
+--   'creator_basic' → 100 crédits/mois
+--   'creator_pro'   → 200 crédits/mois
+--   'creator_max'   → 300 crédits/mois
+--
+-- Professional tier (16:9 horizontal):
+--   'professional_starter' → 600 crédits/mois
+--   'professional_pro'     → 1200 crédits/mois
+--   'professional_max'     → 1800 crédits/mois

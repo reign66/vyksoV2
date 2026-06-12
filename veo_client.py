@@ -9,6 +9,14 @@ from google import genai
 from google.genai import types
 
 
+def _poll_timeout_seconds() -> float:
+    """Timeout global de polling (env VIDEO_POLL_TIMEOUT_SECONDS, défaut 900s = 15 min)."""
+    try:
+        return float(os.getenv("VIDEO_POLL_TIMEOUT_SECONDS", "900"))
+    except (TypeError, ValueError):
+        return 900.0
+
+
 class VeoAIClient:
     """Client pour Veo 3.1 via l'API Gemini (Google GenAI)."""
 
@@ -60,6 +68,53 @@ class VeoAIClient:
             
         else:
             raise ValueError(f"Unsupported image type: {type(img)}")
+
+    def _start_generation(self, gen_kwargs: dict, config_kwargs: dict):
+        """Start generate_videos, retrying once with person_generation='allow_adult'
+        if the API rejects 'allow_all' (400 in some regions — F-12)."""
+        try:
+            return self.client.models.generate_videos(**gen_kwargs)
+        except Exception as e:
+            msg = str(e).lower()
+            if config_kwargs.get("person_generation") == "allow_all" and (
+                "person_generation" in msg or "persongeneration" in msg
+                or "allow_all" in msg or "allowall" in msg
+            ):
+                print("⚠️ person_generation='allow_all' rejected by API, retrying with 'allow_adult'...")
+                config_kwargs["person_generation"] = "allow_adult"
+                gen_kwargs["config"] = types.GenerateVideosConfig(**config_kwargs)
+                return self.client.models.generate_videos(**gen_kwargs)
+            raise
+
+    def _wait_and_validate(self, operation):
+        """Poll the operation with a hard deadline (F-14), then validate the
+        result (F-05). Returns the first generated video."""
+        timeout = _poll_timeout_seconds()
+        deadline = time.monotonic() + timeout
+        while not operation.done:
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"Veo video generation timed out after {timeout:.0f}s "
+                    f"(VIDEO_POLL_TIMEOUT_SECONDS)"
+                )
+            time.sleep(10)
+            operation = self.client.operations.get(operation)
+
+        # F-05: validate the completed operation
+        op_error = getattr(operation, "error", None)
+        if op_error:
+            raise RuntimeError(f"Veo video generation failed: {op_error}")
+
+        response = getattr(operation, "response", None)
+        generated_videos = getattr(response, "generated_videos", None) if response else None
+        if not generated_videos:
+            rai_reasons = getattr(response, "rai_media_filtered_reasons", None) if response else None
+            detail = f" RAI filter reasons: {rai_reasons}" if rai_reasons else ""
+            raise RuntimeError(
+                "Veo returned no generated video — the request was likely blocked by "
+                "RAI/safety filtering (prompt or image rejected)." + detail
+            )
+        return generated_videos[0]
 
     def generate_video_and_wait(
         self,
@@ -134,6 +189,19 @@ class VeoAIClient:
         if negative_prompt:
             config_kwargs["negative_prompt"] = negative_prompt
 
+        # F-04: last_frame is a field of GenerateVideosConfig, NOT a kwarg of
+        # generate_videos() — it must be set in the config object.
+        if last_frame:
+            if hasattr(last_frame, 'save'):  # PIL Image
+                buffered = BytesIO()
+                if hasattr(last_frame, 'mode') and last_frame.mode == 'RGBA':
+                    last_frame = last_frame.convert('RGB')
+                last_frame.save(buffered, format="JPEG", quality=95)
+                last_frame_bytes = buffered.getvalue()
+                config_kwargs["last_frame"] = types.Image(image_bytes=last_frame_bytes)
+            else:
+                config_kwargs["last_frame"] = last_frame
+
         # Create GenerateVideosConfig object
         config = types.GenerateVideosConfig(**config_kwargs)
         print(f"📋 Veo 3.1 config: duration={duration_seconds}s, aspect_ratio={aspect_ratio}, resolution={resolution}")
@@ -144,7 +212,7 @@ class VeoAIClient:
             "prompt": prompt,
             "config": config,
         }
-        
+
         if image:
             # Convert PIL Image to bytes if needed for Veo 3.1 API
             if hasattr(image, 'save'):  # PIL Image object
@@ -159,19 +227,7 @@ class VeoAIClient:
                 print(f"  📸 Converted PIL Image to bytes ({len(image_bytes)} bytes)")
             else:
                 kwargs["image"] = image
-            
-        if last_frame:
-            # Also convert last_frame if it's a PIL Image
-            if hasattr(last_frame, 'save'):
-                buffered = BytesIO()
-                if hasattr(last_frame, 'mode') and last_frame.mode == 'RGBA':
-                    last_frame = last_frame.convert('RGB')
-                last_frame.save(buffered, format="JPEG", quality=95)
-                last_frame_bytes = buffered.getvalue()
-                kwargs["last_frame"] = types.Image(image_bytes=last_frame_bytes)
-            else:
-                kwargs["last_frame"] = last_frame
-            
+
         # Note: reference_images is NOT supported by current Veo models
         # The API returns: "`referenceImages` isn't supported by this model"
         # If reference_images are provided, we ignore them and log a warning
@@ -180,15 +236,12 @@ class VeoAIClient:
             print(f"  ℹ️ Use 'image' parameter for image-to-video or 'last_frame' for video interpolation instead")
 
         print(f"🚀 Starting video generation with Veo 3.1...")
-        operation = self.client.models.generate_videos(**kwargs)
+        operation = self._start_generation(kwargs, config_kwargs)
 
         print(f"⏳ Waiting for video generation to complete...")
-        while not operation.done:
-            time.sleep(10)
-            operation = self.client.operations.get(operation)
+        generated_video = self._wait_and_validate(operation)
 
         print(f"✅ Video generation complete, downloading...")
-        generated_video = operation.response.generated_videos[0]
         self.client.files.download(file=generated_video.video)
         generated_video.video.save(download_path)
         print(f"💾 Video saved to: {download_path}")
@@ -272,9 +325,17 @@ class VeoAIClient:
             
         if negative_prompt:
             config_kwargs["negative_prompt"] = negative_prompt
-        
+
+        # F-04: last_frame belongs in GenerateVideosConfig, NOT as a kwarg of
+        # generate_videos() — add end frame for video interpolation if 2+ keyframes
+        if end_frame_bytes:
+            config_kwargs["last_frame"] = types.Image(image_bytes=end_frame_bytes)
+            print(f"📋 Config: duration={duration_seconds}s, aspect_ratio={aspect_ratio}, mode=interpolation (start→end)")
+        else:
+            print(f"📋 Config: duration={duration_seconds}s, aspect_ratio={aspect_ratio}, mode=image-to-video")
+
         config = types.GenerateVideosConfig(**config_kwargs)
-        
+
         # Build kwargs for generate_videos
         kwargs = {
             "model": model_name,
@@ -282,25 +343,15 @@ class VeoAIClient:
             "config": config,
             "image": types.Image(image_bytes=start_frame_bytes),  # Start frame
         }
-        
-        # Add end frame for video interpolation if we have 2+ keyframes
-        if end_frame_bytes:
-            kwargs["last_frame"] = types.Image(image_bytes=end_frame_bytes)
-            print(f"📋 Config: duration={duration_seconds}s, aspect_ratio={aspect_ratio}, mode=interpolation (start→end)")
-        else:
-            print(f"📋 Config: duration={duration_seconds}s, aspect_ratio={aspect_ratio}, mode=image-to-video")
-        
+
         print(f"🚀 Starting video generation...")
-        
-        operation = self.client.models.generate_videos(**kwargs)
-        
+
+        operation = self._start_generation(kwargs, config_kwargs)
+
         print(f"⏳ Waiting for video generation to complete...")
-        while not operation.done:
-            time.sleep(10)
-            operation = self.client.operations.get(operation)
-        
+        generated_video = self._wait_and_validate(operation)
+
         print(f"✅ Video generation complete, downloading...")
-        generated_video = operation.response.generated_videos[0]
         self.client.files.download(file=generated_video.video)
         generated_video.video.save(download_path)
         print(f"💾 Video saved to: {download_path}")

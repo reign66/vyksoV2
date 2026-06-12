@@ -7,8 +7,9 @@ def get_supabase_client() -> Client:
     Retourne un client Supabase configuré
     """
     url = os.getenv("SUPABASE_URL")
-    key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-    
+    # F-33: accept both env var names for the service key
+    key = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_SERVICE_KEY")
+
     if not url or not key:
         raise ValueError("Missing Supabase credentials in environment variables")
     

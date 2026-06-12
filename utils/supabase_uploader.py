@@ -1,4 +1,5 @@
 import os
+from typing import Optional
 from supabase import create_client
 import httpx
 
@@ -6,11 +7,14 @@ class SupabaseVideoUploader:
     """Upload vidéos vers Supabase Storage"""
     
     def __init__(self):
+        # F-33: accept both env var names for the service key
+        service_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_SERVICE_KEY")
         self.supabase = create_client(
             os.getenv("SUPABASE_URL"),
-            os.getenv("SUPABASE_SERVICE_KEY")  # Service key pour bypass RLS
+            service_key  # Service key pour bypass RLS
         )
-        self.bucket = "vykso-videos"
+        # F-29: bucket configurable via env (défaut: vykso-videos)
+        self.bucket = os.getenv("VIDEOS_BUCKET", "vykso-videos")
     
     def upload_from_url(self, video_url: str, filename: str) -> str:
         """
@@ -39,7 +43,8 @@ class SupabaseVideoUploader:
             video_data,
             {
                 "content-type": "video/mp4",
-                "cache-control": "public, max-age=31536000"
+                "cache-control": "public, max-age=31536000",
+                "upsert": "true",  # F-30: deterministic filenames must not 409 on re-run
             }
         )
         
@@ -59,6 +64,7 @@ class SupabaseVideoUploader:
             {
                 "content-type": "video/mp4",
                 "cache-control": "public, max-age=31536000",
+                "upsert": "true",  # F-30
             },
         )
         public_url = self.supabase.storage.from_(self.bucket).get_public_url(filename)
@@ -94,23 +100,25 @@ class SupabaseVideoUploader:
             {
                 "content-type": content_type,
                 "cache-control": "public, max-age=31536000",
+                "upsert": "true",  # F-30
             },
         )
         public_url = self.supabase.storage.from_(images_bucket).get_public_url(filename)
         print(f"✅ Image uploaded successfully: {public_url}")
         return public_url
 
-    def upload_file(self, file_path: str, filename: str, bucket: str = "vykso-videos") -> str:
+    def upload_file(self, file_path: str, filename: str, bucket: Optional[str] = None) -> str:
         """Upload a file from local path to Supabase Storage.
-        
+
         Args:
             file_path: Local path to the file
             filename: Name for the file in storage
-            bucket: Target bucket name (default: vykso-videos)
-        
+            bucket: Target bucket name (default: env VIDEOS_BUCKET or vykso-videos)
+
         Returns:
             Public URL of the uploaded file
         """
+        bucket = bucket or self.bucket  # F-29
         print(f"📤 Uploading file to Supabase Storage: {filename} -> {bucket}")
         
         with open(file_path, "rb") as f:
@@ -134,6 +142,7 @@ class SupabaseVideoUploader:
             {
                 "content-type": content_type,
                 "cache-control": "public, max-age=31536000",
+                "upsert": "true",  # F-30
             },
         )
         

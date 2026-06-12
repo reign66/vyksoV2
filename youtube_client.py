@@ -1,8 +1,10 @@
 import os
 import json
-import tempfile
+import hmac
+import time
+import hashlib
 from typing import Optional, List, Dict, Any
-from datetime import datetime
+from datetime import datetime, timezone
 from google_auth_oauthlib.flow import Flow
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
@@ -15,6 +17,55 @@ SCOPES = [
     'https://www.googleapis.com/auth/youtube.readonly',
     'https://www.googleapis.com/auth/youtube.force-ssl',  # Required for thumbnails
 ]
+
+# Lifetime of an OAuth state token (CSRF protection, F-34)
+OAUTH_STATE_TTL_SECONDS = 600  # 10 minutes
+
+
+def _oauth_state_secret() -> bytes:
+    """HMAC key for OAuth state signing: OAUTH_STATE_SECRET, with fallback
+    to the Supabase service key (always present in this deployment)."""
+    secret = (
+        os.getenv("OAUTH_STATE_SECRET")
+        or os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+        or os.getenv("SUPABASE_SERVICE_KEY")
+        or ""
+    )
+    return secret.encode("utf-8")
+
+
+def make_oauth_state(user_id: str) -> str:
+    """Build a signed OAuth state token: '{user_id}:{expiry_ts}:{hmac_sha256_hex}'.
+
+    The HMAC (key = OAUTH_STATE_SECRET, fallback Supabase service key) covers
+    'user_id:expiry_ts'. Expiry = now + 10 minutes. Used as the `state`
+    parameter of the OAuth flow to prevent CSRF (F-34).
+    """
+    expiry_ts = int(time.time()) + OAUTH_STATE_TTL_SECONDS
+    payload = f"{user_id}:{expiry_ts}"
+    signature = hmac.new(_oauth_state_secret(), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+    return f"{payload}:{signature}"
+
+
+def verify_oauth_state(state: str) -> Optional[str]:
+    """Verify a state token built by make_oauth_state.
+
+    Returns the user_id if the signature is valid and the token is not
+    expired, else None. Uses hmac.compare_digest (constant-time).
+    """
+    try:
+        user_id, expiry_str, signature = state.rsplit(":", 2)
+        expiry_ts = int(expiry_str)
+    except (AttributeError, ValueError):
+        return None
+
+    payload = f"{user_id}:{expiry_ts}"
+    expected = hmac.new(_oauth_state_secret(), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected, signature):
+        return None
+    if time.time() > expiry_ts:
+        return None
+    return user_id
 
 
 class YouTubeUploadResult:
@@ -59,29 +110,32 @@ class YouTubeUploadResult:
 
 class YouTubeClient:
     def __init__(self):
-        # We expect client_secrets to be loaded from env or file
-        # For Railway/Production, we usually put the JSON content in an ENV var
-        self.client_secrets_file = "/tmp/client_secrets.json"
+        # F-38: client secrets are read directly from the env var — no shared
+        # /tmp file (world-readable on multi-tenant hosts).
         self.redirect_uri = f"{os.getenv('FRONTEND_URL', 'http://localhost:3000')}/youtube-callback"
-        
-        # Write secrets to temp file if in env
-        if os.getenv("GOOGLE_CLIENT_SECRETS_JSON"):
-            with open(self.client_secrets_file, "w") as f:
-                f.write(os.getenv("GOOGLE_CLIENT_SECRETS_JSON"))
-        
+
+    def _build_flow(self, scopes: List[str]) -> Flow:
+        """Builds an OAuth Flow directly from the GOOGLE_CLIENT_SECRETS_JSON env var (F-38)."""
+        secrets_json = os.getenv("GOOGLE_CLIENT_SECRETS_JSON")
+        if not secrets_json:
+            raise ValueError("Google Client Secrets not found. Set GOOGLE_CLIENT_SECRETS_JSON env var.")
+
+        return Flow.from_client_config(
+            json.loads(secrets_json),
+            scopes=scopes,
+            redirect_uri=self.redirect_uri
+        )
+
     def get_auth_url(self, user_id: str):
         """
         Generates the OAuth 2.0 authorization URL.
-        """
-        if not os.path.exists(self.client_secrets_file):
-            raise ValueError("Google Client Secrets not found. Set GOOGLE_CLIENT_SECRETS_JSON env var.")
 
-        flow = Flow.from_client_secrets_file(
-            self.client_secrets_file,
-            scopes=SCOPES,
-            redirect_uri=self.redirect_uri
-        )
-        
+        Note: `user_id` is used as the OAuth `state` value. For CSRF protection,
+        pass a signed token built with make_oauth_state(user_id) and verify it
+        in the callback with verify_oauth_state() (F-34).
+        """
+        flow = self._build_flow(SCOPES)
+
         # Enable offline access to get a refresh token
         auth_url, _ = flow.authorization_url(
             access_type='offline',
@@ -103,14 +157,43 @@ class YouTubeClient:
             'https://www.googleapis.com/auth/userinfo.profile',
             'openid'
         ]
-        
-        flow = Flow.from_client_secrets_file(
-            self.client_secrets_file,
-            scopes=extended_scopes,
-            redirect_uri=self.redirect_uri
-        )
+
+        flow = self._build_flow(extended_scopes)
         flow.fetch_token(code=code)
         return flow.credentials
+
+    @staticmethod
+    def credentials_to_dict(creds: google.oauth2.credentials.Credentials) -> Dict[str, Any]:
+        """Serializes credentials to a dict, INCLUDING `expiry` (ISO format)
+        so proactive refresh can work (F-35)."""
+        return {
+            'token': creds.token,
+            'refresh_token': creds.refresh_token,
+            'token_uri': creds.token_uri,
+            'client_id': creds.client_id,
+            'client_secret': creds.client_secret,
+            'scopes': list(creds.scopes) if creds.scopes else SCOPES,
+            'expiry': creds.expiry.isoformat() if creds.expiry else None,
+        }
+
+    @staticmethod
+    def _credentials_from_dict(credentials_dict: Dict[str, Any]) -> google.oauth2.credentials.Credentials:
+        """Reconstructs Credentials from a dict, parsing the optional `expiry`
+        ISO string into the naive-UTC datetime google-auth expects (F-35)."""
+        cred_kwargs = {k: v for k, v in credentials_dict.items() if k != 'expiry'}
+        expiry_raw = credentials_dict.get('expiry')
+        expiry_dt = None
+        if expiry_raw:
+            try:
+                expiry_dt = datetime.fromisoformat(str(expiry_raw).replace('Z', '+00:00'))
+                if expiry_dt.tzinfo is not None:
+                    # google-auth expects a naive UTC datetime
+                    expiry_dt = expiry_dt.astimezone(timezone.utc).replace(tzinfo=None)
+            except ValueError:
+                print(f"⚠️ Could not parse credentials expiry '{expiry_raw}', treating as unknown")
+                expiry_dt = None
+
+        return google.oauth2.credentials.Credentials(expiry=expiry_dt, **cred_kwargs)
 
     def _validate_credentials_dict(self, credentials_dict: Dict[str, Any]) -> tuple[bool, str]:
         """
@@ -135,13 +218,14 @@ class YouTubeClient:
         is_valid, error_msg = self._validate_credentials_dict(credentials_dict)
         if not is_valid:
             raise ValueError(error_msg)
-        
-        creds = google.oauth2.credentials.Credentials(**credentials_dict)
-        
-        # Refresh token if needed
-        if creds.expired and creds.refresh_token:
+
+        creds = self._credentials_from_dict(credentials_dict)
+
+        # F-35: refresh proactively when the token is expired OR when the
+        # expiry is unknown (legacy dicts saved without `expiry`).
+        if creds.refresh_token and (creds.expired or creds.expiry is None):
             creds.refresh(Request())
-        
+
         return build('youtube', 'v3', credentials=creds), creds
 
     def upload_video(
@@ -367,13 +451,17 @@ class YouTubeClient:
 
     def refresh_credentials(self, credentials_dict: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """
-        Refreshes expired credentials.
-        
+        Refreshes the credentials (F-35: actually refreshes).
+
+        The access token is force-refreshed whenever a refresh_token is
+        available, and the returned dict always includes `expiry` (ISO format)
+        so callers can persist it and proactive refresh works next time.
+
         Args:
             credentials_dict: The current credentials dict
-            
+
         Returns:
-            Updated credentials dict or None if refresh failed
+            Updated credentials dict (with fresh token + expiry) or None if refresh failed
         """
         try:
             # Validate credentials first
@@ -381,23 +469,18 @@ class YouTubeClient:
             if not is_valid:
                 print(f"❌ Invalid credentials: {error_msg}")
                 return None
-            
-            creds = google.oauth2.credentials.Credentials(**credentials_dict)
-            
-            if creds.expired and creds.refresh_token:
-                creds.refresh(Request())
-                
-                return {
-                    'token': creds.token,
-                    'refresh_token': creds.refresh_token,
-                    'token_uri': creds.token_uri,
-                    'client_id': creds.client_id,
-                    'client_secret': creds.client_secret,
-                    'scopes': list(creds.scopes) if creds.scopes else SCOPES
-                }
-            
-            return credentials_dict
-            
+
+            creds = self._credentials_from_dict(credentials_dict)
+
+            if not creds.refresh_token:
+                print("❌ No refresh_token available, cannot refresh")
+                return None
+
+            # Force refresh so the caller always gets a fresh token + known expiry
+            creds.refresh(Request())
+
+            return self.credentials_to_dict(creds)
+
         except Exception as e:
             print(f"❌ Error refreshing credentials: {e}")
             return None

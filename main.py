@@ -1,23 +1,32 @@
 import os
 import json
 import uuid
-import stripe
+import asyncio
+import tempfile
 import httpx
 import logging
-from fastapi.responses import StreamingResponse
+from datetime import datetime, timezone, timedelta
+from fastapi.responses import StreamingResponse, RedirectResponse
 from typing import Optional, List, Dict, Literal
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
-from pydantic import BaseModel, field_validator
-from sora_client import SoraClient
+from pydantic import BaseModel, Field, field_validator
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
+from slowapi.util import get_remote_address
+from sora_client import SoraClient, closest_sora_size
 from veo_client import VeoAIClient
+from wan_client import WanVideoClient, wan_available
 from supabase_client import get_client
+from utils.auth import get_authenticated_user_id
+from utils.notify import notify_event
 from utils.supabase_uploader import SupabaseVideoUploader
 from utils.video_concat import VideoEditor
 from utils.content_generator import ContentGenerator, ScheduleCalculator
 from gemini_client import GeminiClient
-from youtube_client import YouTubeClient
+from youtube_client import YouTubeClient, make_oauth_state, verify_oauth_state
 from io import BytesIO
 from starlette.requests import Request as StarletteRequest
 from starlette.responses import StreamingResponse as StarletteStreamingResponse
@@ -39,15 +48,9 @@ class Filter401Responses(logging.Filter):
 uvicorn_access_logger = logging.getLogger("uvicorn.access")
 uvicorn_access_logger.addFilter(Filter401Responses())
 
-# Import new Stripe configuration and routes
-from config.stripe_config import get_stripe_config, get_plan_type
+# Stripe routes (canonical payment endpoints live in routes/)
 from routes.checkout import router as checkout_router
 from routes.webhook import router as webhook_router
-from services.supabase_service import (
-    update_user_subscription,
-    add_credits_to_user,
-    get_user_by_stripe_subscription,
-)
 
 app = FastAPI(
     title="Vykso API",
@@ -55,19 +58,28 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# CORS
+# ========= RATE LIMITING (slowapi) =========
+# Global default: 60 req/min per IP; stricter limits on generation/upload endpoints.
+limiter = Limiter(key_func=get_remote_address, default_limits=["60/minute"])
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+app.add_middleware(SlowAPIMiddleware)
+
+# CORS — explicit origins (no empty strings), methods and headers restricted
+_cors_origins = [
+    "http://localhost:3000",
+    "https://vykso.com",
+    "https://www.vykso.com",
+    os.getenv("FRONTEND_URL", "https://vykso.com"),
+]
+_cors_origins = list(dict.fromkeys(o for o in _cors_origins if o))
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "https://vykso.com",
-        "https://vykso.lovable.app",
-        "https://www.vykso.com",
-        os.getenv("FRONTEND_URL", ""),
-    ],
+    allow_origins=_cors_origins,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
 # Include Stripe routes
@@ -75,12 +87,18 @@ app.add_middleware(
 app.include_router(checkout_router)
 app.include_router(webhook_router)
 
+# Le webhook Stripe est protégé par signature, pas par IP : il doit rester hors
+# du rate-limit global (un batch de renouvellements Stripe dépasserait 60/min).
+from routes.webhook import stripe_webhook as _stripe_webhook_endpoint
+limiter.exempt(_stripe_webhook_endpoint)
+
 # Clients - Lazy initialization to prevent startup crashes
 # These will be initialized on first use, allowing the server to start
 # even if some API keys are not configured
 
 _sora = None
 _veo = None
+_wan = None
 _supabase = None
 _uploader = None
 _video_editor = None
@@ -100,6 +118,12 @@ def get_veo():
     if _veo is None:
         _veo = VeoAIClient()
     return _veo
+
+def get_wan():
+    global _wan
+    if _wan is None:
+        _wan = WanVideoClient()
+    return _wan
 
 def get_supabase():
     global _supabase
@@ -143,48 +167,14 @@ def get_schedule_calculator():
         _schedule_calculator = ScheduleCalculator()
     return _schedule_calculator
 
-# Stripe
-stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
-
 # ========= VIDEO STREAMING/PROXY HELPERS =========
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY") or os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 VIDEOS_BUCKET = os.getenv("VIDEOS_BUCKET", "vykso-videos")
-SUPABASE_ANON_OR_SERVICE_KEY = os.getenv("SUPABASE_ANON_KEY") or os.getenv("SUPABASE_SERVICE_KEY") or os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 
-async def _get_authenticated_user_id(request: Request) -> str:
-    """Validate Supabase JWT from Authorization header and return user id (sub).
-
-    This calls Supabase Auth `/auth/v1/user` which verifies the Bearer JWT.
-    Requires SUPABASE_URL and an API key (anon or service) in env.
-    """
-    auth_header = request.headers.get("Authorization", "")
-    if not auth_header.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
-    jwt_token = auth_header[len("Bearer "):].strip()
-
-    if not SUPABASE_URL or not SUPABASE_ANON_OR_SERVICE_KEY:
-        raise HTTPException(status_code=500, detail="Supabase auth not configured")
-
-    auth_user_url = f"{SUPABASE_URL}/auth/v1/user"
-    async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.get(
-            auth_user_url,
-            headers={
-                "Authorization": f"Bearer {jwt_token}",
-                "apikey": SUPABASE_ANON_OR_SERVICE_KEY,
-            },
-        )
-    if resp.status_code != 200:
-        raise HTTPException(status_code=401, detail="Invalid or expired token")
-    try:
-        data = resp.json()
-        user_id = data.get("id") or data.get("sub")
-    except Exception:
-        user_id = None
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Unable to resolve user from token")
-    return user_id
+# Auth helper now lives in utils/auth.py (shared with routes/) — re-exported
+# under the historical name used by all call sites in this file.
+_get_authenticated_user_id = get_authenticated_user_id
 
 def _extract_object_path_from_public_url(public_url: str, bucket: str) -> Optional[str]:
     """Extract the storage object path (filename) from a Supabase public URL.
@@ -289,99 +279,96 @@ AI_MODEL_ALIASES = {
     "sora-pro": "sora-2-pro",
     "sora pro": "sora-2-pro",
     "sorapro": "sora-2-pro",
+    # Wan 2.2 (self-hosted, experimental)
+    "wan-2.2": "wan-2.2",
+    "wan2.2": "wan-2.2",
+    "wan 2.2": "wan-2.2",
+    "wan": "wan-2.2",
+    "wan2gp": "wan-2.2",
+    "local": "wan-2.2",
 }
 
-VALID_AI_MODELS = ["sora-2", "sora-2-pro", "veo-3.1-generate-preview", "veo-3.1-fast-generate-preview"]
+VALID_AI_MODELS = ["sora-2", "sora-2-pro", "veo-3.1-generate-preview", "veo-3.1-fast-generate-preview", "wan-2.2"]
+
+VEO_MODELS = ("veo-3.1-generate-preview", "veo-3.1-fast-generate-preview")
+SORA_MODELS = ("sora-2", "sora-2-pro")
 
 def normalize_ai_model(value: str) -> str:
-    """Normalize AI model name to the expected format."""
+    """Normalize AI model name to the expected format.
+
+    Unknown model → HTTPException 400 (no silent default).
+    'wan-2.2' is only valid when WAN_ENDPOINT is configured.
+    """
     if not value:
-        return "veo-3.1-generate-preview"
-    
-    # Lowercase and strip for matching
-    normalized = value.lower().strip()
-    
-    # Check aliases
-    if normalized in AI_MODEL_ALIASES:
-        return AI_MODEL_ALIASES[normalized]
-    
-    # Check if it's already a valid model
-    if normalized in VALID_AI_MODELS:
-        return normalized
-    
-    # Default fallback
-    print(f"⚠️ Unknown ai_model '{value}', defaulting to veo-3.1-generate-preview")
-    return "veo-3.1-generate-preview"
+        raise HTTPException(status_code=400, detail="Modèle IA manquant (ai_model)")
+
+    normalized = str(value).lower().strip()
+
+    canonical = AI_MODEL_ALIASES.get(normalized)
+    if canonical is None and normalized in VALID_AI_MODELS:
+        canonical = normalized
+
+    if canonical is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Modèle IA inconnu: '{value}'. Modèles valides: {', '.join(VALID_AI_MODELS)}"
+        )
+
+    if canonical == "wan-2.2" and not wan_available():
+        raise HTTPException(status_code=400, detail="Modèle Wan non configuré (WAN_ENDPOINT)")
+
+    return canonical
 
 
 # ============= USER TIER SYSTEM =============
-# IMPORTANT: Logic based on database "plan" field
-#
-# CREATOR plans (9:16 vertical, TikTok/Shorts optimized):
-#   - starter, premium, pro, max (and their yearly variants)
-#   - creator_basic, creator_pro, creator_max (legacy naming)
-#   - free
-#
-# PROFESSIONAL plans (16:9 horizontal, ads/commercials optimized):
-#   - premium_pro, pro_pro, max_pro (plans with "_pro" suffix)
-#   - starter_pro (if exists)
+# Source of truth: profiles.plan_family ('creator' | 'professional').
+# Fallback: plan name prefix 'professional_' (new taxonomy:
+# free, creator_basic, creator_pro, creator_max,
+# professional_starter, professional_pro, professional_max).
 
-# Professional plans use "_pro" suffix (NOT to be confused with the "pro" plan which is Creator)
-PROFESSIONAL_PLANS = ["premium_pro", "pro_pro", "max_pro", "starter_pro"]
-
-# All other plans are Creator tier
-CREATOR_PLANS = [
-    "free", "starter", "premium", "pro", "max",  # Base plans = Creator
-    "starter_yearly", "premium_yearly", "pro_yearly", "max_yearly",  # Yearly variants
-    "starter_annual", "premium_annual", "pro_annual", "max_annual",  # Annual variants
-    "creator_basic", "creator_pro", "creator_max",  # Legacy naming
-    "creator_basic_yearly", "creator_pro_yearly", "creator_max_yearly",  # Legacy yearly
-]
-
-def get_user_tier(plan: str) -> str:
+def get_user_tier(profile) -> str:
     """
-    Determines user tier based on their plan.
-    
-    Plans ending with "_pro" suffix = PROFESSIONAL (16:9 ads)
-    All other plans = CREATOR (9:16 TikTok/Shorts)
-    
+    Determines user tier from the profile row.
+
+    Priority:
+    1. profiles.plan_family ('professional' → professional, 'creator' → creator)
+    2. Fallback: plan name prefix 'professional_'
+
+    Accepts either a profile dict or a plan string (legacy call form).
+
     Returns:
         "professional" for ad-focused plans (16:9)
         "creator" for TikTok/Shorts focused plans (9:16)
     """
-    if not plan:
-        return "creator"
-    
-    plan_lower = plan.lower()
-    
-    # Check for professional suffix patterns
-    if plan_lower in [p.lower() for p in PROFESSIONAL_PLANS]:
+    plan = ""
+    if isinstance(profile, dict):
+        family = (profile.get("plan_family") or "").strip().lower()
+        if family == "professional":
+            return "professional"
+        if family == "creator":
+            return "creator"
+        plan = profile.get("plan") or ""
+    elif profile:
+        plan = str(profile)
+
+    if plan.strip().lower().startswith("professional_"):
         return "professional"
-    
-    # Check for "_pro" suffix (professional ads plans)
-    if plan_lower.endswith("_pro"):
-        return "professional"
-    
-    # All other plans are Creator tier
     return "creator"
 
 def get_fixed_duration_for_creator(ai_model: str) -> int:
     """
     Returns fixed duration for Creator tier users.
     Creator users cannot change duration - it's fixed based on model.
-    
-    - Sora models: 10 seconds
-    - VEO models: 8 seconds
+
+    All models (Veo, Sora, Wan) now use 8-second segments
+    (F-07: 10s is not a valid Sora duration — valid values are 4/8/12).
     """
-    if ai_model in ("sora-2", "sora-2-pro"):
-        return 10
-    else:  # VEO models
-        return 8
+    return 8
 
 def get_aspect_ratio_for_tier(user_tier: str) -> str:
     """
     Returns the aspect ratio based on user tier.
-    
+
     - Creator: 9:16 (vertical, TikTok/Shorts)
     - Professional: 16:9 (horizontal, ads/commercials)
     """
@@ -389,23 +376,15 @@ def get_aspect_ratio_for_tier(user_tier: str) -> str:
         return "16:9"
     return "9:16"
 
-def is_creator_plan(plan: str) -> bool:
-    """Check if a plan is a Creator tier plan."""
-    return get_user_tier(plan) == "creator"
-
-def is_professional_plan(plan: str) -> bool:
-    """Check if a plan is a Professional tier plan."""
-    return get_user_tier(plan) == "professional"
-
 
 class VideoRequest(BaseModel):
     user_id: str  # Ignored server-side; derived from JWT
     niche: Optional[str] = None
-    duration: int
-    quality: str = "basic"
+    duration: int = Field(ge=4, le=64)
+    quality: Literal["basic", "pro_720p", "pro_1080p"] = "basic"
     custom_prompt: Optional[str] = None
     ai_model: str = "veo-3.1-generate-preview"
-    
+
     @field_validator('ai_model', mode='before')
     @classmethod
     def normalize_model(cls, v):
@@ -418,32 +397,23 @@ class VideoResponse(BaseModel):
     num_clips: int
     total_credits: int
 
-class CheckoutRequest(BaseModel):
-    plan: str
-    user_id: str
-
-class BuyCreditsRequest(BaseModel):
-    user_id: str
-    credits: int
-    amount: int
-
 class StoryboardShot(BaseModel):
     Scene: str
     duration: float
 
 class VideoRequestAdvanced(BaseModel):
     model_config = {"protected_namespaces": ()}
-    
+
     user_id: str  # Ignored server-side; derived from JWT
     niche: Optional[str] = None
-    duration: int = 10
-    quality: str = "basic"
+    duration: int = Field(default=8, ge=4, le=64)
+    quality: Literal["basic", "pro_720p", "pro_1080p"] = "basic"
     custom_prompt: Optional[str] = None
     image_urls: Optional[List[str]] = None
     shots: Optional[List[StoryboardShot]] = None
     model_type: Literal["text-to-video", "image-to-video", "storyboard"] = "text-to-video"
     ai_model: str = "veo-3.1-generate-preview"
-    
+
     @field_validator('ai_model', mode='before')
     @classmethod
     def normalize_model(cls, v):
@@ -509,63 +479,70 @@ def generate_prompt(niche: str = None, custom_prompt: str = None, clip_index: in
     
     return f"{base}{sequence_info}{format_suffix}"
 
+# All providers (Veo, Sora, Wan) generate and bill 8-second segments,
+# so billed == generated (F-07).
+SEGMENT_SECONDS = 8
+
+# Maximum total video duration (professional tier) — 64s everywhere (8 segments)
+MAX_VIDEO_DURATION = 64
+MIN_VIDEO_DURATION = 4
+
+def per_segment_credits(quality: str, ai_model: str = "veo-3.1-generate-preview") -> int:
+    """Coût en crédits d'UN segment généré (8s) selon la qualité et le modèle."""
+    if ai_model == "wan-2.2":
+        return 1  # Wan (expérimental, auto-hébergé) est facturé au tarif 'basic'
+    return {"basic": 1, "pro_720p": 3, "pro_1080p": 5}.get(quality, 1)
+
+def num_segments_for_duration(duration: int) -> int:
+    """Nombre de segments de 8s nécessaires pour couvrir la durée demandée."""
+    return max(1, (int(duration) + SEGMENT_SECONDS - 1) // SEGMENT_SECONDS)
+
 def calculate_credits_cost(duration: int, quality: str, ai_model: str = "veo-3.1-generate-preview") -> int:
-    """Calcule le coût en crédits selon la durée, la qualité et le modèle"""
-    # Veo 3.1 (normal et fast) uses 8s segments, Sora uses 10s segments
-    if ai_model in ("veo-3.1-generate-preview", "veo-3.1-fast-generate-preview"):
-        num_clips = (duration + 7) // 8
-    else:
-        num_clips = (duration + 9) // 10
-    
-    if quality == "basic":
-        return num_clips * 1
-    elif quality == "pro_720p":
-        return num_clips * 3
-    elif quality == "pro_1080p":
-        return num_clips * 5
-    else:
-        return num_clips
+    """Calcule le coût en crédits : segments générés × coût par segment.
+
+    Tous les modèles utilisent des segments de 8s (veo=8, sora=8, wan=8),
+    donc le nombre de segments facturés == le nombre de segments générés.
+    """
+    return num_segments_for_duration(duration) * per_segment_credits(quality, ai_model)
 
 def _validate_duration_and_model(duration: int, ai_model: str):
-    if duration < 6 or duration > 60:
-        raise HTTPException(status_code=400, detail="Duration must be between 6 and 60 seconds")
-    if ai_model in ("veo-3.1-generate-preview", "veo-3.1-fast-generate-preview"):
-        # Veo 3.1 (normal et fast) supports flexible durations
-        pass  # Accept any duration between 6-60
-    else:
-        # Sora uses 10s segments
-        pass  # Accept any duration between 6-60
+    if duration < MIN_VIDEO_DURATION or duration > MAX_VIDEO_DURATION:
+        raise HTTPException(
+            status_code=400,
+            detail=f"La durée doit être comprise entre {MIN_VIDEO_DURATION} et {MAX_VIDEO_DURATION} secondes"
+        )
 
 
 def get_tier_config(user_tier: str, ai_model: str) -> dict:
     """
     Get configuration parameters based on user tier.
-    
+
     Returns dict with:
-    - keyframes_per_sequence: 2 for starter, 3 for pro/max
+    - keyframes_per_sequence: 2 (START + END only — F-06: MIDDLE keyframes
+      were generated then discarded, they are skipped entirely now)
     - transitions: whether to add crossfade transitions
     - transition_duration: duration of crossfade in seconds
     - resolution: video resolution
-    - max_duration: maximum video duration in seconds
+    - max_duration: maximum video duration in seconds (64s for professional)
     """
     # Base configs by tier
     if user_tier == "creator":
         # Creator tier - TikTok/Shorts optimized
         return {
-            "keyframes_per_sequence": 2,  # Simpler: just start + end
+            "keyframes_per_sequence": 2,  # START + END only
             "transitions": False,
             "transition_duration": 0.0,
             "resolution": "720p",
-            "max_duration": 10,  # Single 8-10s video
+            "max_duration": SEGMENT_SECONDS,  # Single fixed 8s video
         }
     else:
         # Professional tier - ads/commercials
         return {
-            "keyframes_per_sequence": 3,  # Full: start + middle + end
+            "keyframes_per_sequence": 2,  # START + END only (F-06)
             "transitions": True,
             "transition_duration": 0.3,
             "resolution": "1080p",
-            "max_duration": 64,  # Up to 8 sequences
+            "max_duration": MAX_VIDEO_DURATION,  # Up to 8 sequences (64s)
         }
 
 
@@ -635,12 +612,144 @@ def _validate_image_urls(image_urls: Optional[List[str]], max_images: int = 18):
         if "/storage/v1/object/public/video-images/" not in url:
             raise HTTPException(status_code=400, detail="Image URL not in allowed bucket 'video-images'")
 
+# ============= JOB / CREDITS HELPERS =============
+
+_video_semaphore: Optional[asyncio.Semaphore] = None
+
+def get_video_semaphore() -> asyncio.Semaphore:
+    """Global semaphore limiting concurrent shot/segment generations (per process)."""
+    global _video_semaphore
+    if _video_semaphore is None:
+        _video_semaphore = asyncio.Semaphore(int(os.getenv("VIDEO_MAX_CONCURRENT_SHOTS", "3")))
+    return _video_semaphore
+
+
+def _parse_job_metadata(raw) -> dict:
+    """Parse video_jobs.metadata, tolerant des deux formats (dict nouveau / string JSON legacy)."""
+    if isinstance(raw, dict):
+        return dict(raw)
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+    return {}
+
+
+def _refund_credits(user_id: str, amount: int) -> bool:
+    """Rembourse des crédits via la RPC atomique. Ne lève jamais — retourne True/False."""
+    if not user_id or amount <= 0:
+        return False
+    try:
+        get_supabase().rpc("refund_credits", {
+            "p_user_id": user_id,
+            "p_amount": amount,
+        }).execute()
+        print(f"💰 Refunded {amount} credits to user {user_id}")
+        return True
+    except Exception as e:
+        print(f"❌ Error refunding credits to {user_id}: {e}")
+        return False
+
+
+def _fail_job_and_refund(job_id: str, error_message: str, notify_label: str = "Job vidéo échoué"):
+    """Marque un job en échec et rembourse le credits_cost STOCKÉ (pas recalculé).
+
+    Garde anti-double-remboursement :
+    - ne rembourse que si metadata.refunded n'est pas déjà true ;
+    - déduit les crédits déjà remboursés au prorata (metadata.refunded_credits) ;
+    - écrit metadata.refunded=true dans le MÊME update qui passe le job en failed.
+    """
+    row = None
+    try:
+        res = get_supabase().table("video_jobs").select(
+            "user_id, credits_cost, metadata"
+        ).eq("id", job_id).maybe_single().execute()
+        row = res.data if res else None
+    except Exception as e:
+        print(f"❌ Failure handler: unable to load job {job_id}: {e}")
+
+    metadata = _parse_job_metadata(row.get("metadata")) if row else {}
+    user_id = row.get("user_id") if row else None
+    refunded_now = 0
+
+    if row and not metadata.get("refunded"):
+        stored_cost = int(row.get("credits_cost") or 0)
+        already_refunded = int(metadata.get("refunded_credits") or 0)
+        amount = max(0, stored_cost - already_refunded)
+        if amount > 0 and _refund_credits(user_id, amount):
+            refunded_now = amount
+            metadata["refunded_credits"] = already_refunded + amount
+
+    update_payload = {
+        "status": "failed",
+        "error": error_message,
+    }
+    if row is not None:
+        # N'écraser la metadata que si on a pu la charger (sinon on perdrait
+        # les infos existantes et on bloquerait un futur remboursement légitime)
+        metadata["refunded"] = True
+        update_payload["metadata"] = metadata
+    try:
+        get_supabase().table("video_jobs").update(update_payload).eq("id", job_id).execute()
+    except Exception as e:
+        print(f"❌ Unable to mark job {job_id} as failed: {e}")
+
+    # Best-effort notification (notify_event ne lève jamais)
+    notify_event(notify_label, {
+        "job_id": job_id,
+        "user_id": user_id or "inconnu",
+        "erreur": (error_message or "")[:300],
+        "crédits remboursés": refunded_now,
+    })
+
+
+def _pil_to_png_bytes(pil_image) -> bytes:
+    """Sérialise une image PIL en bytes PNG (conversion de mode si nécessaire)."""
+    img = pil_image
+    if img.mode not in ("RGB", "RGBA"):
+        img = img.convert("RGB")
+    buf = BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _merge_segment_prompts(segment: dict, fallback_prompt: str) -> dict:
+    """F-39 : fusionne les shots d'un segment de script en UNE seule génération.
+
+    Les video_prompts des shots sont joints par ' Then ' ; l'image du premier
+    shot sert de référence. Garantit 1 appel vidéo max par segment.
+    """
+    seg_shots = segment.get("shots") or []
+    video_prompts = [s.get("video_prompt") for s in seg_shots if s.get("video_prompt")]
+    merged_prompt = " Then ".join(video_prompts) if video_prompts else fallback_prompt
+    first_shot = seg_shots[0] if seg_shots else {}
+    return {
+        "segment_index": segment.get("segment_index") or 0,
+        "video_prompt": merged_prompt,
+        "image_prompt": first_shot.get("image_prompt"),
+        "use_user_image_index": first_shot.get("use_user_image_index"),
+    }
+
+
+def _update_job_progress(job_id: str, progress: int):
+    """Met à jour video_jobs.progress (best-effort)."""
+    try:
+        get_supabase().table("video_jobs").update({
+            "progress": max(0, min(100, int(progress)))
+        }).eq("id", job_id).execute()
+    except Exception as e:
+        print(f"⚠️ Unable to update progress for job {job_id}: {e}")
+
+
 async def process_video_generation(
-    job_id: str, 
-    niche: str, 
-    duration: int, 
-    quality: str, 
-    user_id: str, 
+    job_id: str,
+    niche: str,
+    duration: int,
+    quality: str,
+    user_id: str,
     custom_prompt: str = None,
     image_urls: List[str] = None,
     shots: List[dict] = None,
@@ -649,617 +758,530 @@ async def process_video_generation(
     user_tier: str = "professional"
 ):
     """
-    NEW ARCHITECTURE: Sequential keyframe-based video generation.
-    
-    Generates videos with visual continuity using 3 keyframes per sequence:
-    - START keyframe: Beginning of sequence (reused from previous video's last frame for seq > 1)
-    - MIDDLE keyframe: Midpoint of sequence
-    - END keyframe: End of sequence (must connect to next sequence)
-    
-    Args:
-        job_id: Unique job identifier
-        niche: Content niche/category
-        duration: Video duration in seconds
-        quality: Video quality setting
-        user_id: User identifier
-        custom_prompt: Optional custom prompt
-        image_urls: List of reference image URLs (up to 18)
-        shots: List of storyboard shots
-        model_type: Type of generation (text-to-video, image-to-video, storyboard)
-        ai_model: AI model to use
-        user_tier: "creator" for TikTok/Shorts or "professional" for ads
+    Génération vidéo par segments de 8s avec continuité visuelle.
+
+    Trois providers :
+    - Veo 3.1 (normal/fast) : keyframes START+END (F-06), séquentiel avec continuité
+    - Sora 2 / Sora 2 Pro : 1 génération par segment (F-39), parallèle (sémaphore)
+    - Wan 2.2 (auto-hébergé, expérimental) : séquentiel, continuité par dernière frame
+
+    Crédits : le coût est stocké dans video_jobs.credits_cost à la création.
+    - segments manquants/échoués → remboursement prorata (metadata.partial)
+    - zéro clip → exception → remboursement intégral via _fail_job_and_refund
+    Tous les fichiers temporaires vivent dans un TemporaryDirectory par job (F-18).
     """
-    import asyncio
     from PIL import Image
-    import httpx
-    
+
+    loop = asyncio.get_running_loop()
+    semaphore = get_video_semaphore()
+    per_seg_cost = per_segment_credits(quality, ai_model)
+    billed_segments = num_segments_for_duration(duration)
+    base_prompt = custom_prompt or generate_prompt(niche, user_tier=user_tier)
+
     try:
-        print(f"🎬 Starting KEYFRAME-BASED generation for job {job_id}")
-        print(f"🤖 AI Model: {ai_model}")
-        print(f"📊 Model type: {model_type}")
-        print(f"👤 User tier: {user_tier.upper()}")
-        
-        get_supabase().table("video_jobs").update({
-            "status": "generating"
-        }).eq("id", job_id).execute()
-        
-        # ===== CONFIGURATION BY TIER =====
-        tier_config = get_tier_config(user_tier, ai_model)
-        aspect_ratio = get_aspect_ratio_for_tier(user_tier)
-        num_keyframes = tier_config.get("keyframes_per_sequence", 3)
-        add_transitions = tier_config.get("transitions", False)
-        transition_duration = tier_config.get("transition_duration", 0.3)
-        resolution = tier_config.get("resolution", "720p")
-        
-        print(f"📐 Config: {aspect_ratio}, {resolution}, {num_keyframes} keyframes/seq, transitions={add_transitions}")
-        
-        # ===== DÉTECTION DU MODÈLE AI =====
-        if ai_model in ("veo-3.1-generate-preview", "veo-3.1-fast-generate-preview"):
-            # ===== VEO 3.1 WITH KEYFRAME ARCHITECTURE =====
-            use_fast_model = (ai_model == "veo-3.1-fast-generate-preview")
-            model_variant = "FAST" if use_fast_model else "NORMAL"
-            print(f"🎥 Using Veo 3.1 ({model_variant}) with KEYFRAME ARCHITECTURE")
-            
-            # 1. Calculate number of sequences
-            num_sequences = max(1, (duration + 7) // 8)
-            print(f"📊 Video: {duration}s → {num_sequences} sequences of 8s each")
-            
-            # 2. Download user images if provided
+        # F-18 : répertoire temporaire par job, nettoyé succès OU échec
+        with tempfile.TemporaryDirectory(prefix=f"vykso_{job_id}_") as job_tmpdir:
+            print(f"🎬 Starting generation for job {job_id}")
+            print(f"🤖 AI Model: {ai_model} | type: {model_type} | tier: {user_tier.upper()}")
+
+            get_supabase().table("video_jobs").update({
+                "status": "generating"
+            }).eq("id", job_id).execute()
+
+            # ===== CONFIGURATION BY TIER =====
+            tier_config = get_tier_config(user_tier, ai_model)
+            aspect_ratio = get_aspect_ratio_for_tier(user_tier)
+            add_transitions = tier_config.get("transitions", False)
+            transition_duration = tier_config.get("transition_duration", 0.3)
+            resolution = tier_config.get("resolution", "720p")
+            print(f"📐 Config: {aspect_ratio}, {resolution}, transitions={add_transitions}, "
+                  f"{billed_segments} segment(s) of {SEGMENT_SECONDS}s")
+
+            # ===== DOWNLOAD USER IMAGES (async, F-17) =====
             user_pil_images = []
             if image_urls:
-                for img_url in image_urls[:18]:
+                async with httpx.AsyncClient(timeout=30) as http_client:
+                    for img_url in image_urls[:18]:
+                        try:
+                            print(f"📥 Downloading user image: {img_url[:50]}...")
+                            resp = await http_client.get(img_url)
+                            resp.raise_for_status()
+                            img = Image.open(BytesIO(resp.content))
+                            img.load()
+                            user_pil_images.append(img)
+                        except Exception as e:
+                            print(f"⚠️ Failed to download image: {e}")
+
+            final_url = None
+            ok_segments = 0
+
+            # =========================================================
+            # BRANCHE 1 : VEO 3.1 (keyframes START + END, séquentiel)
+            # =========================================================
+            if ai_model in VEO_MODELS:
+                use_fast_model = (ai_model == "veo-3.1-fast-generate-preview")
+                print(f"🎥 Veo 3.1 ({'FAST' if use_fast_model else 'NORMAL'}) — keyframe architecture (START+END)")
+
+                # Script cinématique (le générateur peut retourner MOINS de séquences — prorata géré plus bas)
+                script = await loop.run_in_executor(None, lambda: get_gemini().generate_cinematic_script(
+                    user_prompt=base_prompt,
+                    duration=duration,
+                    user_images=image_urls,
+                    user_tier=user_tier,
+                    num_keyframes_per_sequence=2,  # F-06 : START + END uniquement
+                ))
+                if not script or "sequences" not in script:
+                    print("⚠️ Script generation failed, using fallback method")
+                    script = _create_fallback_script(base_prompt, billed_segments, aspect_ratio)
+
+                sequences = (script.get("sequences") or [])[:billed_segments]
+                print(f"✅ Script ready: {len(sequences)} sequence(s)")
+
+                all_video_bytes = []
+                previous_last_frame = None  # dernière frame de la vidéo précédente (continuité)
+
+                for seq_idx, sequence in enumerate(sequences):
+                    seq_num = seq_idx + 1
+                    print(f"\n🎬 SEQUENCE {seq_num}/{len(sequences)}")
+                    _update_job_progress(job_id, int((seq_idx / max(1, len(sequences))) * 100))
+
+                    kf_start_prompt = sequence.get("keyframe_start", "")
+                    kf_end_prompt = sequence.get("keyframe_end", "")
+                    veo_prompt = sequence.get("veo_prompt", "") or base_prompt
+
                     try:
-                        print(f"📥 Downloading user image: {img_url[:50]}...")
-                        resp = httpx.get(img_url, timeout=30)
-                        user_pil_images.append(Image.open(BytesIO(resp.content)))
-                    except Exception as e:
-                        print(f"⚠️ Failed to download image: {e}")
-            
-            # 3. Generate cinematic script with keyframe structure
-            print(f"📜 Generating CINEMATIC SCRIPT with {num_keyframes} keyframes per sequence...")
-            script = get_gemini().generate_cinematic_script(
-                user_prompt=custom_prompt or generate_prompt(niche, user_tier=user_tier),
-                duration=duration,
-                user_images=image_urls,
-                user_tier=user_tier,
-                num_keyframes_per_sequence=num_keyframes
-            )
-            
-            if not script or "sequences" not in script:
-                print("⚠️ Script generation failed, using fallback method")
-                script = _create_fallback_script(custom_prompt or generate_prompt(niche), num_sequences, aspect_ratio)
-            
-            sequences = script.get("sequences", [])
-            print(f"✅ Script ready: {len(sequences)} sequences")
-            
-            # 4. SEQUENTIAL VIDEO GENERATION WITH CONTINUITY
-            # This is the key change - we process sequences ONE BY ONE
-            # so we can use the last frame of video N as the first keyframe of video N+1
-            
-            all_video_bytes = []
-            previous_last_frame = None  # Will store the last frame of previous video
-            
-            loop = asyncio.get_running_loop()
-            
-            for seq_idx, sequence in enumerate(sequences):
-                seq_num = seq_idx + 1
-                print(f"\n{'='*50}")
-                print(f"🎬 SEQUENCE {seq_num}/{len(sequences)}")
-                print(f"{'='*50}")
-                
-                # Update progress in database
-                progress = int((seq_idx / len(sequences)) * 100)
-                get_supabase().table("video_jobs").update({
-                    "progress": progress
-                }).eq("id", job_id).execute()
-                
-                # Get keyframe prompts from script
-                kf_start_prompt = sequence.get("keyframe_start", "")
-                kf_middle_prompt = sequence.get("keyframe_middle", "")
-                kf_end_prompt = sequence.get("keyframe_end", "")
-                veo_prompt = sequence.get("veo_prompt", "")
-                
-                # Generate keyframes
-                keyframes = []
-                
-                # KEYFRAME 1 (START): Use previous video's last frame OR generate new
-                if previous_last_frame is not None:
-                    print(f"  🔗 Using previous video's last frame as START keyframe (continuity)")
-                    keyframes.append(previous_last_frame)
-                else:
-                    # First sequence - generate START keyframe
-                    print(f"  🖼️ Generating START keyframe...")
-                    
-                    # Use user image as reference if available
-                    ref_images = user_pil_images[:3] if user_pil_images else None
-                    
-                    kf_start_bytes = await loop.run_in_executor(
-                        None,
-                        lambda: get_gemini().generate_keyframe_image(
-                            keyframe_prompt=kf_start_prompt,
-                            reference_images=ref_images,
-                            aspect_ratio=aspect_ratio,
-                            position="START"
-                        )
-                    )
-                    
-                    if kf_start_bytes:
-                        keyframes.append(kf_start_bytes)
-                        # Upload for debug/preview to video-images bucket
-                        try:
-                            await loop.run_in_executor(
+                        async with semaphore:
+                            keyframes = []
+
+                            # KEYFRAME START : frame précédente (continuité) OU génération
+                            if previous_last_frame is not None:
+                                print("  🔗 Using previous video's last frame as START keyframe")
+                                keyframes.append(previous_last_frame)
+                            else:
+                                print("  🖼️ Generating START keyframe...")
+                                ref_images = user_pil_images[:3] if user_pil_images else None
+                                kf_start_bytes = await loop.run_in_executor(
+                                    None,
+                                    lambda p=kf_start_prompt, r=ref_images: get_gemini().generate_keyframe_image(
+                                        keyframe_prompt=p,
+                                        reference_images=r,
+                                        aspect_ratio=aspect_ratio,
+                                        position="START"
+                                    )
+                                )
+                                if kf_start_bytes:
+                                    keyframes.append(kf_start_bytes)
+
+                            # KEYFRAME END (F-06 : pas de MIDDLE, il était jeté de toute façon)
+                            print("  🖼️ Generating END keyframe...")
+                            kf_end_bytes = await loop.run_in_executor(
                                 None,
-                                get_uploader().upload_image_bytes,
-                                kf_start_bytes,
-                                f"{job_id}_seq{seq_num}_kf_start.jpg"
+                                lambda p=kf_end_prompt: get_gemini().generate_keyframe_image(
+                                    keyframe_prompt=p,
+                                    reference_images=user_pil_images[:3] if user_pil_images else None,
+                                    aspect_ratio=aspect_ratio,
+                                    position="END"
+                                )
                             )
-                        except Exception:
-                            pass
-                
-                # KEYFRAME 2 (MIDDLE): Always generate
-                if num_keyframes >= 2:
-                    print(f"  🖼️ Generating MIDDLE keyframe...")
-                    
-                    kf_middle_bytes = await loop.run_in_executor(
-                        None,
-                        lambda: get_gemini().generate_keyframe_image(
-                            keyframe_prompt=kf_middle_prompt,
-                            reference_images=user_pil_images[:3] if user_pil_images else None,
-                            aspect_ratio=aspect_ratio,
-                            position="MIDDLE"
-                        )
-                    )
-                    
-                    if kf_middle_bytes:
-                        keyframes.append(kf_middle_bytes)
-                        # Upload for debug/preview to video-images bucket
-                        try:
-                            await loop.run_in_executor(
-                                None,
-                                get_uploader().upload_image_bytes,
-                                kf_middle_bytes,
-                                f"{job_id}_seq{seq_num}_kf_middle.jpg"
-                            )
-                        except Exception:
-                            pass
-                
-                # KEYFRAME 3 (END): Always generate
-                if num_keyframes >= 3:
-                    print(f"  🖼️ Generating END keyframe...")
-                    
-                    kf_end_bytes = await loop.run_in_executor(
-                        None,
-                        lambda: get_gemini().generate_keyframe_image(
-                            keyframe_prompt=kf_end_prompt,
-                            reference_images=user_pil_images[:3] if user_pil_images else None,
-                            aspect_ratio=aspect_ratio,
-                            position="END"
-                        )
-                    )
-                    
-                    if kf_end_bytes:
-                        keyframes.append(kf_end_bytes)
-                        # Upload for debug/preview to video-images bucket
-                        try:
-                            await loop.run_in_executor(
-                                None,
-                                get_uploader().upload_image_bytes,
-                                kf_end_bytes,
-                                f"{job_id}_seq{seq_num}_kf_end.jpg"
-                            )
-                        except Exception:
-                            pass
-                
-                # Validate keyframes
-                if len(keyframes) == 0:
-                    print(f"  ⚠️ No keyframes generated, falling back to text-to-video")
-                    keyframes = None
-                else:
-                    print(f"  ✅ {len(keyframes)} keyframes ready for Veo")
-                
-                # GENERATE VIDEO WITH VEO 3.1
-                print(f"  🎥 Generating video with Veo 3.1 ({len(keyframes) if keyframes else 0} keyframes)...")
-                
-                video_path = f"/tmp/{job_id}_seq{seq_num}.mp4"
-                
-                if keyframes and len(keyframes) > 0:
-                    # Use the new keyframe-based generation method
-                    await loop.run_in_executor(
-                        None,
-                        lambda: get_veo().generate_video_with_keyframes(
-                            prompt=veo_prompt,
-                            keyframes=keyframes,
-                            aspect_ratio=aspect_ratio,
-                            resolution=resolution,
-                            duration_seconds=8,
-                            download_path=video_path,
-                            use_fast_model=use_fast_model,
-                        )
-                    )
-                else:
-                    # Fallback to standard generation without keyframes
-                    await loop.run_in_executor(
-                        None,
-                        lambda: get_veo().generate_video_and_wait(
-                            prompt=veo_prompt,
-                            aspect_ratio=aspect_ratio,
-                            resolution=resolution,
-                            duration_seconds=8,
-                            download_path=video_path,
-                            use_fast_model=use_fast_model,
-                        )
-                    )
-                
-                # Read video bytes
-                with open(video_path, "rb") as f:
-                    video_bytes = f.read()
-                
-                all_video_bytes.append(video_bytes)
-                print(f"  ✅ Sequence {seq_num} video generated: {len(video_bytes)} bytes")
-                
-                # EXTRACT LAST FRAME FOR NEXT SEQUENCE
-                if seq_idx < len(sequences) - 1:  # Not the last sequence
-                    print(f"  🔄 Extracting last frame for continuity...")
-                    try:
-                        previous_last_frame = await loop.run_in_executor(
-                            None,
-                            lambda: get_video_editor().extract_last_frame(video_bytes)
-                        )
-                        print(f"  ✅ Last frame extracted: {len(previous_last_frame)} bytes")
-                    except Exception as e:
-                        print(f"  ⚠️ Failed to extract last frame: {e}")
+                            if kf_end_bytes:
+                                keyframes.append(kf_end_bytes)
+
+                            if not keyframes:
+                                print("  ⚠️ No keyframes generated, falling back to text-to-video")
+
+                            video_path = os.path.join(job_tmpdir, f"seq{seq_num}.mp4")
+
+                            if keyframes:
+                                await loop.run_in_executor(
+                                    None,
+                                    lambda kf=list(keyframes), vp=video_path, p=veo_prompt: get_veo().generate_video_with_keyframes(
+                                        prompt=p,
+                                        keyframes=kf,
+                                        aspect_ratio=aspect_ratio,
+                                        resolution=resolution,
+                                        duration_seconds=SEGMENT_SECONDS,
+                                        download_path=vp,
+                                        use_fast_model=use_fast_model,
+                                    )
+                                )
+                            else:
+                                await loop.run_in_executor(
+                                    None,
+                                    lambda vp=video_path, p=veo_prompt: get_veo().generate_video_and_wait(
+                                        prompt=p,
+                                        aspect_ratio=aspect_ratio,
+                                        resolution=resolution,
+                                        duration_seconds=SEGMENT_SECONDS,
+                                        download_path=vp,
+                                        use_fast_model=use_fast_model,
+                                    )
+                                )
+
+                            with open(video_path, "rb") as f:
+                                video_bytes = f.read()
+
+                        all_video_bytes.append(video_bytes)
+                        print(f"  ✅ Sequence {seq_num} generated: {len(video_bytes)} bytes")
+
+                        # Continuité : extraire la dernière frame pour la séquence suivante
+                        if seq_idx < len(sequences) - 1:
+                            try:
+                                previous_last_frame = await loop.run_in_executor(
+                                    None,
+                                    lambda vb=video_bytes: get_video_editor().extract_last_frame(vb)
+                                )
+                            except Exception as e:
+                                print(f"  ⚠️ Failed to extract last frame: {e}")
+                                previous_last_frame = None
+
+                    except Exception as seq_err:
+                        print(f"  ❌ Sequence {seq_num} failed: {seq_err}")
                         previous_last_frame = None
-                
-                # Upload sequence video
-                try:
-                    await loop.run_in_executor(
+
+                ok_segments = len(all_video_bytes)
+                if ok_segments == 0:
+                    raise RuntimeError("Aucun clip n'a pu être généré (Veo)")
+
+                if ok_segments == 1:
+                    final_video_bytes = all_video_bytes[0]
+                else:
+                    print(f"🎞️ MERGING {ok_segments} sequences...")
+                    final_video_bytes = await loop.run_in_executor(
                         None,
-                        get_uploader().upload_bytes,
-                        video_bytes,
-                        f"{job_id}_seq{seq_num}.mp4"
+                        lambda: get_video_editor().concatenate_video_bytes(
+                            all_video_bytes,
+                            f"{job_id}_final.mp4",
+                            add_transitions=add_transitions,
+                            transition_duration=transition_duration
+                        )
                     )
-                except Exception:
-                    pass
-            
-            # 5. CONCATENATE ALL VIDEOS
-            print(f"\n{'='*50}")
-            print(f"🎞️ MERGING {len(all_video_bytes)} sequences...")
-            print(f"{'='*50}")
-            
-            if len(all_video_bytes) == 1:
-                final_video_bytes = all_video_bytes[0]
-            else:
-                final_video_bytes = await loop.run_in_executor(
+
+                print(f"📤 Uploading final video ({len(final_video_bytes)} bytes)...")
+                final_url = await loop.run_in_executor(
                     None,
-                    lambda: get_video_editor().concatenate_video_bytes(
-                        all_video_bytes,
-                        f"{job_id}_final.mp4",
-                        add_transitions=add_transitions,
-                        transition_duration=transition_duration
-                    )
+                    get_uploader().upload_bytes,
+                    final_video_bytes,
+                    f"{job_id}.mp4"
                 )
-            
-            # 6. UPLOAD FINAL VIDEO
-            print(f"📤 Uploading final video ({len(final_video_bytes)} bytes)...")
-            final_url = await loop.run_in_executor(
-                None,
-                get_uploader().upload_bytes,
-                final_video_bytes,
-                f"{job_id}.mp4"
-            )
-            
-            # 7. UPDATE JOB STATUS
-            get_supabase().table("video_jobs").update({
+
+            # =========================================================
+            # BRANCHE 2 : WAN 2.2 (auto-hébergé, expérimental, séquentiel)
+            # =========================================================
+            elif ai_model == "wan-2.2":
+                print("🎥 Wan 2.2 (self-hosted) — sequential 8s segments with last-frame continuity")
+                # Taille selon le tier : vertical creator / horizontal professional
+                wan_size = "720x1280" if user_tier == "creator" else "1280x720"
+
+                script = await loop.run_in_executor(None, lambda: get_gemini().generate_video_script(
+                    prompt=base_prompt,
+                    duration=duration,
+                    num_segments=billed_segments,
+                    user_images=image_urls,
+                    segment_duration=SEGMENT_SECONDS,
+                    user_tier=user_tier,
+                    images_per_segment=1
+                ))
+
+                segment_specs = []
+                if script and "segments" in script:
+                    for segment in (script.get("segments") or [])[:billed_segments]:
+                        segment_specs.append(_merge_segment_prompts(segment, base_prompt))
+                if not segment_specs:
+                    print("⚠️ Script generation failed, falling back to simple prompts (Wan)")
+                    for i in range(billed_segments):
+                        suffix = f", scene {i + 1} of {billed_segments}, continuous narrative flow" if billed_segments > 1 else ""
+                        segment_specs.append({
+                            "segment_index": i + 1,
+                            "video_prompt": f"{base_prompt}{suffix}",
+                        })
+
+                all_video_bytes = []
+                # Première image : image utilisateur si fournie, sinon text-to-video
+                previous_frame_bytes = _pil_to_png_bytes(user_pil_images[0]) if user_pil_images else None
+
+                for i, spec in enumerate(segment_specs):
+                    seg_num = i + 1
+                    _update_job_progress(job_id, int((i / max(1, len(segment_specs))) * 100))
+                    try:
+                        async with semaphore:
+                            seg_path = os.path.join(job_tmpdir, f"wan_seg{seg_num}.mp4")
+                            input_bytes = previous_frame_bytes
+                            await loop.run_in_executor(
+                                None,
+                                lambda p=spec["video_prompt"], ib=input_bytes, sp=seg_path: get_wan().generate_video_and_wait(
+                                    prompt=p,
+                                    input_image_bytes=ib,
+                                    seconds=SEGMENT_SECONDS,
+                                    size=wan_size,
+                                    download_path=sp,
+                                )
+                            )
+                            with open(seg_path, "rb") as f:
+                                video_bytes = f.read()
+
+                        all_video_bytes.append(video_bytes)
+                        print(f"  ✅ Wan segment {seg_num} generated: {len(video_bytes)} bytes")
+
+                        # Continuité : dernière frame du segment → image d'entrée du suivant
+                        if i < len(segment_specs) - 1:
+                            try:
+                                previous_frame_bytes = await loop.run_in_executor(
+                                    None,
+                                    lambda vb=video_bytes: get_video_editor().extract_last_frame(vb)
+                                )
+                            except Exception as e:
+                                print(f"  ⚠️ Failed to extract last frame (Wan): {e}")
+                                previous_frame_bytes = None
+
+                    except Exception as seg_err:
+                        print(f"  ❌ Wan segment {seg_num} failed: {seg_err}")
+                        previous_frame_bytes = None
+
+                ok_segments = len(all_video_bytes)
+                if ok_segments == 0:
+                    raise RuntimeError("Aucun clip n'a pu être généré (Wan)")
+
+                if ok_segments == 1:
+                    final_video_bytes = all_video_bytes[0]
+                else:
+                    print(f"🎞️ MERGING {ok_segments} Wan segments...")
+                    final_video_bytes = await loop.run_in_executor(
+                        None,
+                        lambda: get_video_editor().concatenate_video_bytes(
+                            all_video_bytes,
+                            f"{job_id}_final.mp4",
+                            add_transitions=add_transitions,
+                            transition_duration=transition_duration
+                        )
+                    )
+
+                final_url = await loop.run_in_executor(
+                    None,
+                    get_uploader().upload_bytes,
+                    final_video_bytes,
+                    f"{job_id}.mp4"
+                )
+
+            # =========================================================
+            # BRANCHE 3 : SORA 2 / SORA 2 PRO (1 génération par segment, parallèle)
+            # =========================================================
+            else:
+                use_pro_model = (ai_model == "sora-2-pro")
+                print(f"🎥 Sora 2 API ({'PRO' if use_pro_model else 'STANDARD'}) — one video per segment (F-39)")
+
+                # F-01/F-02 : taille dérivée du tier (jamais 1920x1080, orientation = tier)
+                size = closest_sora_size(aspect_ratio, quality, ai_model)
+                print(f"📐 Sora size for {user_tier.upper()} tier: {size}")
+
+                images_per_segment = 1 if user_tier == "creator" else 3
+                script = await loop.run_in_executor(None, lambda: get_gemini().generate_video_script(
+                    prompt=base_prompt,
+                    duration=duration,
+                    num_segments=billed_segments,
+                    user_images=image_urls,
+                    segment_duration=SEGMENT_SECONDS,  # F-07 : 8s (valeur valide de l'API)
+                    user_tier=user_tier,
+                    images_per_segment=images_per_segment
+                ))
+
+                # F-39 : jamais plus de billed_segments appels Sora ;
+                # les shots multiples d'un segment sont fusionnés (' Then ')
+                segment_specs = []
+                if script and "segments" in script:
+                    for segment in (script.get("segments") or [])[:billed_segments]:
+                        segment_specs.append(_merge_segment_prompts(segment, base_prompt))
+
+                if not segment_specs:
+                    print("⚠️ Script generation failed, falling back to simple generation (Sora)")
+                    enriched_prompt = await loop.run_in_executor(None, lambda: get_gemini().enrich_prompt(
+                        base_prompt,
+                        segment_context="Single video generation",
+                        user_image_description=None,
+                        user_tier=user_tier
+                    ))
+                    for i in range(billed_segments):
+                        suffix = f", scene {i + 1} of {billed_segments}, continuous narrative flow" if billed_segments > 1 else ""
+                        segment_specs.append({
+                            "segment_index": i + 1,
+                            "video_prompt": f"{enriched_prompt}{suffix}",
+                            "image_prompt": None,
+                            "use_user_image_index": 0 if (i == 0 and user_pil_images) else None,
+                        })
+
+                completed_counter = {"n": 0}
+
+                async def process_sora_segment(spec: dict):
+                    """1 segment = 1 image d'entrée (optionnelle) + 1 appel Sora (8s)."""
+                    async with semaphore:
+                        seg_idx = spec.get("segment_index") or 0
+                        print(f"🎬 Processing Sora segment {seg_idx} ({user_tier.upper()}, {size})...")
+
+                        input_reference = None
+
+                        # Image utilisateur explicite ?
+                        uui = spec.get("use_user_image_index")
+                        if isinstance(uui, int) and 0 <= uui < len(user_pil_images):
+                            print(f"  🖼️ Using user-provided image {uui}")
+                            try:
+                                # Redimensionnée à la taille EXACTE de la vidéo (F-03)
+                                input_reference = SoraClient.resize_image_to(
+                                    _pil_to_png_bytes(user_pil_images[uui]), size
+                                )
+                            except Exception as e:
+                                print(f"  ⚠️ Failed to prepare user image: {e}")
+                        elif spec.get("image_prompt"):
+                            # Génération d'image Gemini (F-43 : 2K, pas 4K)
+                            print(f"  📸 Generating input image (2K)...")
+                            try:
+                                ref_images = user_pil_images[:3] if user_pil_images else None
+                                image_bytes = await loop.run_in_executor(
+                                    None,
+                                    lambda p=spec["image_prompt"], r=ref_images: get_gemini().generate_image(
+                                        prompt=p,
+                                        reference_images=r,
+                                        aspect_ratio=aspect_ratio,
+                                        resolution="2K"
+                                    )
+                                )
+                                if image_bytes:
+                                    input_reference = SoraClient.resize_image_to(image_bytes, size)
+                                    try:
+                                        await loop.run_in_executor(
+                                            None, get_uploader().upload_bytes,
+                                            input_reference, f"{job_id}_seg{seg_idx}_input.png"
+                                        )
+                                    except Exception:
+                                        pass
+                                else:
+                                    print("  ⚠️ Image generation returned None, text-to-video")
+                            except Exception as img_err:
+                                print(f"  ⚠️ Image generation failed, text-to-video: {img_err}")
+                                input_reference = None
+
+                        local_path = os.path.join(job_tmpdir, f"seg{seg_idx}.mp4")
+                        await loop.run_in_executor(
+                            None,
+                            lambda p=spec["video_prompt"], ir=input_reference, lp=local_path: get_sora().generate_video_and_wait(
+                                prompt=p,
+                                use_pro=use_pro_model,
+                                size=size,
+                                seconds=SEGMENT_SECONDS,
+                                input_reference=ir,
+                                download_path=lp,
+                            )
+                        )
+
+                        with open(local_path, "rb") as f:
+                            data = f.read()
+                        url = await loop.run_in_executor(
+                            None, get_uploader().upload_bytes, data, f"{job_id}_seg{seg_idx}.mp4"
+                        )
+
+                        completed_counter["n"] += 1
+                        _update_job_progress(job_id, int(completed_counter["n"] / max(1, len(segment_specs)) * 90))
+                        return (seg_idx, url)
+
+                print(f"🚀 Launching {len(segment_specs)} Sora segment task(s) "
+                      f"(max {int(os.getenv('VIDEO_MAX_CONCURRENT_SHOTS', '3'))} concurrent)...")
+                results = await asyncio.gather(
+                    *(process_sora_segment(spec) for spec in segment_specs),
+                    return_exceptions=True
+                )
+
+                valid_results = []
+                for res in results:
+                    if isinstance(res, BaseException):
+                        print(f"❌ Sora segment failed: {res}")
+                    else:
+                        valid_results.append(res)
+                valid_results.sort(key=lambda x: x[0])
+                all_clip_urls = [r[1] for r in valid_results]
+
+                ok_segments = len(all_clip_urls)
+                if ok_segments == 0:
+                    raise RuntimeError("Aucun clip n'a pu être généré (Sora)")
+
+                if ok_segments == 1:
+                    final_url = all_clip_urls[0]
+                else:
+                    print(f"🎞️ Concatenating {ok_segments} Sora clips...")
+                    concatenated_data = await loop.run_in_executor(
+                        None,
+                        lambda: get_video_editor().concatenate_videos(
+                            all_clip_urls,
+                            f"{job_id}.mp4",
+                            add_transitions=add_transitions,
+                            transition_duration=transition_duration
+                        )
+                    )
+                    final_url = await loop.run_in_executor(
+                        None, get_uploader().upload_bytes, concatenated_data, f"{job_id}.mp4"
+                    )
+
+            # =========================================================
+            # FINALISATION COMMUNE : prorata + complétion
+            # =========================================================
+            if not final_url or ok_segments <= 0:
+                raise RuntimeError("Aucun clip n'a pu être généré")
+
+            # Fusionner la metadata existante (dict natif — pas de json.dumps, F-21)
+            current_meta = {}
+            try:
+                meta_res = get_supabase().table("video_jobs").select("metadata").eq("id", job_id).maybe_single().execute()
+                if meta_res and meta_res.data:
+                    current_meta = _parse_job_metadata(meta_res.data.get("metadata"))
+            except Exception:
+                pass
+
+            # F-16 : prorata — segments facturés mais non générés (échec OU script trop court).
+            # Le montant remboursé est persisté IMMÉDIATEMENT (update dédiée) : si la
+            # finalisation échoue ensuite, _fail_job_and_refund relit refunded_credits
+            # en base et ne rembourse que le reste (pas de double remboursement).
+            missing_segments = billed_segments - ok_segments
+            if missing_segments > 0:
+                refund_amount = missing_segments * per_seg_cost
+                print(f"💰 Partial failure: {missing_segments}/{billed_segments} segment(s) missing, "
+                      f"refunding {refund_amount} credit(s)...")
+                if _refund_credits(user_id, refund_amount):
+                    current_meta["refunded_credits"] = int(current_meta.get("refunded_credits") or 0) + refund_amount
+                    current_meta["partial"] = True
+                    current_meta["partial_note"] = (
+                        f"{missing_segments} segment(s) sur {billed_segments} n'ont pas pu être générés — "
+                        f"{refund_amount} crédit(s) remboursé(s)."
+                    )
+                    get_supabase().table("video_jobs").update(
+                        {"metadata": current_meta}
+                    ).eq("id", job_id).execute()
+
+            # Complétion CONDITIONNELLE : uniquement si le job est encore actif.
+            # Si le watchdog l'a déjà passé en failed (+ remboursé), on ne livre pas
+            # par-dessus — sinon l'utilisateur aurait la vidéo ET le remboursement.
+            completion = get_supabase().table("video_jobs").update({
                 "status": "completed",
                 "video_url": final_url,
                 "progress": 100,
-                "completed_at": "now()",
-            }).eq("id", job_id).execute()
-            
-            print(f"✅ Job {job_id} COMPLETED! URL: {final_url}")
-        
-        else:
-            # ===== MODE SORA 2 (OpenAI Videos API) - Parallel Advanced Scripting =====
-            use_pro_model = (ai_model == "sora-2-pro")
-            model_variant = "PRO" if use_pro_model else "STANDARD"
-            print(f"🎥 Using Sora 2 API ({model_variant} mode) with Parallel Advanced Scripting")
-            print(f"🎨 User tier: {user_tier} - {'TikTok/Shorts optimized' if user_tier == 'creator' else 'Professional ads optimized'}")
+                "completed_at": datetime.now(timezone.utc).isoformat(),  # F-20
+                "metadata": current_meta,
+            }).eq("id", job_id).in_("status", ["pending", "generating"]).execute()
 
-            def quality_to_sora_params(q: str):
-                # Map simple: basic => default, pro_720p => size 1280x720, pro_1080p => size 1920x1080
-                if q == "pro_1080p":
-                    return "1920x1080"
-                if q == "pro_720p":
-                    return "1280x720"
-                return None
-
-            size = quality_to_sora_params(quality)
-
-            # 1. Calculate Segments (10s blocks for Sora)
-            num_segments = (duration + 9) // 10
-            
-            # For Creator tier: simpler structure (1-3 images for scene changes)
-            # For Professional tier: complex sequences with multiple shots
-            images_per_segment = 1 if user_tier == "creator" else 3
-            
-            # 2. Generate Script using Gemini with tier-specific prompt enrichment
-            print(f"📜 Generating {user_tier.upper()} script for {duration}s video ({num_segments} segments)...")
-            script = get_gemini().generate_video_script(
-                prompt=custom_prompt or generate_prompt(niche),
-                duration=duration,
-                num_segments=num_segments,
-                user_images=image_urls,
-                segment_duration=10,  # Sora uses 10s segments
-                user_tier=user_tier,
-                images_per_segment=images_per_segment
-            )
-            
-            # 3. Download user images if provided (now supports up to 18 images)
-            user_pil_images = []
-            if image_urls:
-                import httpx
-                from PIL import Image
-                for img_url in image_urls[:18]:  # Support up to 18 images
-                    try:
-                        print(f"📥 Downloading user image: {img_url[:50]}...")
-                        resp = httpx.get(img_url, timeout=30)
-                        user_pil_images.append(Image.open(BytesIO(resp.content)))
-                    except Exception as e:
-                        print(f"⚠️ Failed to download image: {e}")
-            
-            import asyncio
-            from concurrent.futures import ThreadPoolExecutor
-            
-            # Determine aspect ratio based on tier for Sora
-            tier_aspect_ratio = get_aspect_ratio_for_tier(user_tier)
-            print(f"📐 Aspect ratio for {user_tier.upper()} tier (Sora): {tier_aspect_ratio}")
-            
-            async def process_sora_shot(segment_index, shot_data, user_images_list, tier=user_tier, aspect_ratio=tier_aspect_ratio):
-                """Helper to process a single shot: Image Gen -> Video Gen with Sora 2"""
-                shot_idx = shot_data.get("shot_index", 0)
-                img_prompt = shot_data.get("image_prompt")
-                vid_prompt = shot_data.get("video_prompt")
-                use_user_image_idx = shot_data.get("use_user_image_index")
-                shot_duration = shot_data.get("duration", 10)
-                scene_images = shot_data.get("scene_images", [])  # Additional scene variation prompts
-                
-                print(f"🎬 Processing Seg {segment_index} Shot {shot_idx} ({tier.upper()} tier, {aspect_ratio})...")
-                
-                loop = asyncio.get_running_loop()
-                
-                input_reference = None
-                
-                # Check if we should use a user-provided image
-                if use_user_image_idx is not None and use_user_image_idx < len(user_images_list):
-                    print(f"  🖼️ Using user-provided image {use_user_image_idx} for this shot")
-                    # Save user image to temp file for Sora
-                    import tempfile
-                    with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
-                        user_images_list[use_user_image_idx].save(tmp.name)
-                        input_reference = tmp.name
-                else:
-                    # A. Generate Image with Gemini using enriched prompt and reference images
-                    print(f"  📸 Seg {segment_index} Shot {shot_idx}: Generating Image...")
-                    
-                    # Select reference images based on tier
-                    ref_images_for_generation = None
-                    if tier == "creator" and len(user_images_list) > 0:
-                        # Creator: use first 3 user images as style reference
-                        ref_images_for_generation = user_images_list[:3]
-                    elif tier == "professional" and len(user_images_list) > 0:
-                        # Professional: distribute images across segments for brand consistency
-                        start_idx = (segment_index - 1) * 3 % len(user_images_list)
-                        ref_images_for_generation = user_images_list[start_idx:start_idx + 3]
-                    
-                    # Generate with reference images if available
-                    def generate_with_refs():
-                        return get_gemini().generate_image(
-                            prompt=img_prompt,
-                            reference_images=ref_images_for_generation,
-                            aspect_ratio=aspect_ratio,  # Use tier-specific aspect ratio
-                            resolution="4K"  # 4K quality for both tiers
-                        )
-                    
-                    try:
-                        image_bytes = await loop.run_in_executor(None, generate_with_refs)
-                        
-                        if image_bytes:
-                            # Validate and save generated image for Sora input
-                            import tempfile
-                            from PIL import Image as PILImage
-                            try:
-                                # Validate the image first
-                                test_img = PILImage.open(BytesIO(image_bytes))
-                                test_img.load()  # Force load to verify
-                                
-                                with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
-                                    tmp.write(image_bytes)
-                                    input_reference = tmp.name
-                                print(f"  ✅ Image generated successfully for Seg {segment_index} Shot {shot_idx}")
-                                
-                                # Upload generated image for reference
-                                try:
-                                    await loop.run_in_executor(None, get_uploader().upload_bytes, image_bytes, f"{job_id}_seg{segment_index}_shot{shot_idx}.png")
-                                except Exception as e:
-                                    print(f"  ⚠️ Failed to upload generated image: {e}")
-                            except Exception as pil_err:
-                                print(f"  ⚠️ Image data invalid, proceeding with text-to-video: {pil_err}")
-                                input_reference = None
-                        else:
-                            print(f"  ⚠️ Image generation returned None, proceeding with text-to-video")
-                    except Exception as img_gen_err:
-                        print(f"  ⚠️ Image generation failed, proceeding with text-to-video: {img_gen_err}")
-                        input_reference = None
-
-                # B. Generate Video with Sora 2
-                print(f"  🎥 Seg {segment_index} Shot {shot_idx}: Generating Video with Sora 2...")
-                
-                # Sora accepts 4, 8, or 12 second videos
-                sora_duration = 8  # Default to 8s
-                if shot_duration <= 4:
-                    sora_duration = 4
-                elif shot_duration <= 8:
-                    sora_duration = 8
-                else:
-                    sora_duration = 12
-                
-                local_path = await loop.run_in_executor(
-                    None, 
-                    lambda: get_sora().generate_video_and_wait(
-                        prompt=vid_prompt,
-                        use_pro=use_pro_model,
-                        size=size,
-                        seconds=sora_duration,
-                        input_reference=input_reference,
-                        download_path=f"/tmp/{job_id}_seg{segment_index}_shot{shot_idx}.mp4",
-                    )
-                )
-                
-                # Upload clip
-                with open(local_path, "rb") as f:
-                    data = f.read()
-                url = await loop.run_in_executor(None, get_uploader().upload_bytes, data, f"{job_id}_seg{segment_index}_shot{shot_idx}.mp4")
-                return (segment_index, shot_idx, url)
-
-            all_clip_urls = []
-            
-            if script and "segments" in script:
-                tasks = []
-                total_segments = len(script["segments"])
-                total_shots = 0
-                
-                # Create tasks for ALL shots across ALL segments
-                for segment in script["segments"]:
-                    seg_idx = segment.get("segment_index", 0)
-                    shots = segment.get("shots", [])
-                    total_shots += len(shots)
-                    
-                    for shot in shots:
-                        tasks.append(process_sora_shot(seg_idx, shot, user_pil_images))
-                
-                # Log detailed generation plan
-                expected_duration = total_segments * 10  # Sora uses 10s segments
-                print(f"📊 GENERATION PLAN (Sora):")
-                print(f"   - Requested duration: {duration}s")
-                print(f"   - Segments to generate: {total_segments}")
-                print(f"   - Total shots: {total_shots}")
-                print(f"   - Expected output duration: {expected_duration}s")
-                print(f"🚀 Launching {len(tasks)} parallel generation tasks with enriched prompts...")
-                # Run all tasks in parallel
-                results = await asyncio.gather(*tasks, return_exceptions=True)
-                
-                # Process results
-                valid_results = []
-                for res in results:
-                    if isinstance(res, Exception):
-                        print(f"❌ Task failed: {res}")
-                    else:
-                        valid_results.append(res)
-                
-                # Sort by segment then shot to ensure correct order
-                valid_results.sort(key=lambda x: (x[0], x[1]))
-                all_clip_urls = [r[2] for r in valid_results]
-                
+            if not (completion.data or []):
+                print(f"⚠️ Job {job_id}: terminé mais déjà marqué failed (watchdog) — "
+                      f"vidéo non livrée, remboursement conservé. URL orpheline: {final_url}")
+                try:
+                    notify_event("Job terminé après watchdog (vidéo orpheline)",
+                                 {"job_id": job_id, "url": final_url})
+                except Exception:
+                    pass
             else:
-                # Fallback to simple generation if script generation fails
-                print("⚠️ Script generation failed, falling back to simple generation (Sora).")
-                
-                # Determine aspect ratio based on tier
-                tier_aspect_ratio = get_aspect_ratio_for_tier(user_tier)
-                print(f"📐 Fallback using aspect ratio: {tier_aspect_ratio} for {user_tier.upper()} tier (Sora)")
-                
-                # Generate a single video with the enriched prompt
-                enriched_prompt = get_gemini().enrich_prompt(
-                    custom_prompt or generate_prompt(niche),
-                    segment_context="Single video generation",
-                    user_image_description=None,
-                    user_tier=user_tier  # Pass user tier for proper prompt enrichment
-                )
-                
-                # Use first user image if available
-                input_ref = None
-                if user_pil_images:
-                    import tempfile
-                    print(f"  🖼️ Using first user-provided image in Sora fallback mode")
-                    with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
-                        user_pil_images[0].save(tmp.name)
-                        input_ref = tmp.name
-                
-                # For longer videos (>10s), generate multiple clips even in fallback mode
-                target_clips = max(1, (duration + 9) // 10)
-                print(f"  📹 Generating {target_clips} clip(s) for {duration}s video in Sora fallback mode")
-                
-                fallback_clip_urls = []
-                for clip_idx in range(target_clips):
-                    clip_prompt = enriched_prompt
-                    if target_clips > 1:
-                        clip_prompt = f"{enriched_prompt}, scene {clip_idx + 1} of {target_clips}, continuous narrative flow"
-                    
-                    # Use user image only for first clip
-                    clip_input_ref = input_ref if clip_idx == 0 else None
-                    
-                    local_path = get_sora().generate_video_and_wait(
-                        prompt=clip_prompt,
-                        use_pro=use_pro_model,
-                        size=size,
-                        seconds=10,
-                        input_reference=clip_input_ref,
-                        download_path=f"/tmp/{job_id}_fallback_{clip_idx}.mp4",
-                    )
-                    
-                    with open(local_path, "rb") as f:
-                        data = f.read()
-                    url = get_uploader().upload_bytes(data, f"{job_id}_fallback_{clip_idx}.mp4")
-                    fallback_clip_urls.append(url)
-                    print(f"  ✅ Sora fallback clip {clip_idx + 1}/{target_clips} generated")
-                
-                all_clip_urls = fallback_clip_urls
+                print(f"✅ Job {job_id} COMPLETED! URL: {final_url} "
+                      f"({ok_segments}/{billed_segments} segments)")
 
-            if len(all_clip_urls) == 1:
-                final_url = all_clip_urls[0]
-            elif len(all_clip_urls) > 1:
-                print(f"🎞️ Concatenating {len(all_clip_urls)} Sora clips...")
-                concatenated_data = get_video_editor().concatenate_videos(all_clip_urls, f"{job_id}.mp4")
-                final_url = get_uploader().upload_bytes(concatenated_data, f"{job_id}.mp4")
-            else:
-                raise Exception("No clips generated")
-
-            get_supabase().table("video_jobs").update({
-                "status": "completed",
-                "video_url": final_url,
-                "completed_at": "now()",
-            }).eq("id", job_id).execute()
-
-            print(f"✅ Job {job_id} completed! (credits already deducted)")
-        
     except Exception as e:
         print(f"❌ Error generating video {job_id}: {e}")
         import traceback
         traceback.print_exc()
-        
-        # REFUND CREDITS
-        try:
-            print(f"💰 Refunding credits for job {job_id} due to failure...")
-            # We need to calculate amount to refund. 
-            # We can re-calculate or store cost in metadata. 
-            # For now, re-calculate based on job data if possible, but we don't have it handy easily without query.
-            # Let's assume we can pass it or query it.
-            # Ideally we should have stored 'cost' in video_jobs.
-            # For now, let's just query the job to get duration/quality if needed, or pass it to this function.
-            # We passed duration/quality to this function!
-            cost = calculate_credits_cost(duration, quality, ai_model)
-            get_supabase().rpc("refund_credits", {
-                "p_user_id": user_id,
-                "p_amount": cost
-            }).execute()
-            print(f"✅ Refunded {cost} credits.")
-        except Exception as refund_error:
-            print(f"❌ Error refunding credits: {refund_error}")
-
-        get_supabase().table("video_jobs").update({
-            "status": "failed",
-            "error": str(e)
-        }).eq("id", job_id).execute()
+        # Remboursement du credits_cost STOCKÉ + garde anti-double-remboursement + notification
+        _fail_job_and_refund(job_id, str(e))
 
 # ============= ENDPOINTS =============
 
@@ -1276,102 +1298,147 @@ def root():
 def health():
     return {"status": "ok"}
 
+def _get_profile_or_404(user_id: str) -> dict:
+    """Récupère le profil — PAS de création automatique (le trigger DB crée
+    les profils à l'inscription ; la création explicite vit dans /api/users/sync)."""
+    try:
+        user = get_supabase().table("profiles").select("*").eq("id", user_id).maybe_single().execute()
+        profile = user.data if user else None
+    except Exception as e:
+        print(f"❌ Error checking user: {e}")
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+    if not profile:
+        raise HTTPException(status_code=404, detail="Profil introuvable — reconnectez-vous")
+    return profile
+
+
+def _check_active_job_limit(user_id: str):
+    """429 si l'utilisateur a déjà trop de jobs actifs (pending/generating)."""
+    max_active = int(os.getenv("MAX_ACTIVE_JOBS_PER_USER", "2"))
+    try:
+        res = get_supabase().table("video_jobs").select(
+            "id", count="exact"
+        ).eq("user_id", user_id).in_("status", ["pending", "generating"]).execute()
+        active = res.count if res.count is not None else len(res.data or [])
+    except Exception as e:
+        print(f"⚠️ Unable to count active jobs for {user_id}: {e}")
+        return
+    if active >= max_active:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Trop de générations en cours ({active}). Attendez la fin de vos vidéos avant d'en lancer une nouvelle."
+        )
+
+
+def _decrement_credits_or_raise(user_id: str, amount: int):
+    """Déduit les crédits atomiquement via la RPC.
+
+    - La RPC lève 'INSUFFICIENT_CREDITS' si solde insuffisant → 402.
+    - Elle retourne le solde restant (0 est légitime) → seule data None est une erreur.
+    """
+    try:
+        decrement = get_supabase().rpc("decrement_credits", {
+            "p_user_id": user_id,
+            "p_amount": amount,
+        }).execute()
+    except Exception as e:
+        msg = str(e)
+        if "INSUFFICIENT_CREDITS" in msg or "insufficient credits" in msg.lower():
+            raise HTTPException(
+                status_code=402,
+                detail=f"Crédits insuffisants. {amount} crédit(s) requis."
+            )
+        print(f"❌ Error decrementing credits: {e}")
+        raise HTTPException(status_code=500, detail="Impossible de déduire les crédits")
+
+    # remaining == 0 est un solde légitime : seule une réponse None est anormale
+    if decrement is None or decrement.data is None:
+        print(f"❌ decrement_credits returned no data for user {user_id}")
+        raise HTTPException(status_code=500, detail="Impossible de déduire les crédits")
+
+
+def _insert_job_or_refund(user_id: str, required_credits: int, job_row: dict) -> str:
+    """Insère le job ; si l'insert échoue APRÈS le débit → remboursement avant 500."""
+    try:
+        job = get_supabase().table("video_jobs").insert(job_row).execute()
+        return job.data[0]["id"]
+    except Exception as e:
+        print(f"❌ Error creating job (refunding {required_credits} credits): {e}")
+        _refund_credits(user_id, required_credits)
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+
+def _reject_unsupported_combo(ai_model: str, model_type: str):
+    """400 explicite pour les combos non supportés (au lieu de générer autre chose en silence)."""
+    if model_type == "storyboard" and ai_model not in SORA_MODELS:
+        raise HTTPException(
+            status_code=400,
+            detail="Le mode storyboard n'est pas pris en charge par ce modèle — utilisez Sora (sora-2 ou sora-2-pro)."
+        )
+
+
 @app.post("/api/videos/generate", response_model=VideoResponse)
+@limiter.limit("10/minute")
 async def generate_video(req: VideoRequest, background_tasks: BackgroundTasks, request: Request):
     """
     Endpoint principal : génère une vidéo de durée variable
-    
+
     Handles two user tiers:
-    - CREATOR tier: Fixed duration (8s VEO, 10s Sora), TikTok/Shorts optimized
-    - PROFESSIONAL tier: Variable duration, ad-optimized
+    - CREATOR tier: Fixed duration (8s), TikTok/Shorts optimized (9:16)
+    - PROFESSIONAL tier: Variable duration up to 64s, ad-optimized (16:9)
     """
     # Auth: derive user_id from JWT
     token_user_id = await _get_authenticated_user_id(request)
     # Security: ignore body user_id and use token subject
     req.user_id = token_user_id
-    
-    try:
-        user = get_supabase().table("profiles").select("*").eq("id", req.user_id).execute()
-        
-        if not user.data:
-            print(f"👤 Creating new user: {req.user_id}")
-            get_supabase().table("profiles").insert({
-                "id": req.user_id,
-                "email": f"{req.user_id}@vykso.com",
-                "credits": 10,
-                "plan": "free"
-            }).execute()
-            user = get_supabase().table("profiles").select("*").eq("id", req.user_id).execute()
-        
-        user_data = user.data[0]
-        user_plan = user_data.get("plan", "free")
-        user_tier = get_user_tier(user_plan)
-        print(f"👤 User: {req.user_id}, Credits: {user_data['credits']}, Plan: {user_plan}, Tier: {user_tier}")
-        
-    except Exception as e:
-        print(f"❌ Error checking user: {e}")
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
-    
+
+    # Profil requis (créé par le trigger DB à l'inscription — pas d'auto-création ici)
+    user_data = _get_profile_or_404(req.user_id)
+    user_tier = get_user_tier(user_data)
+    print(f"👤 User: {req.user_id}, Credits: {user_data.get('credits')}, "
+          f"Plan: {user_data.get('plan')}, Tier: {user_tier}")
+
     # For CREATOR tier: Force fixed duration (no choice)
-    if is_creator_plan(user_plan):
+    if user_tier == "creator":
         fixed_duration = get_fixed_duration_for_creator(req.ai_model)
         req.duration = fixed_duration
         print(f"👤 Creator tier detected - forcing duration to {fixed_duration}s")
 
     # Validate model/duration
     _validate_duration_and_model(req.duration, req.ai_model)
-    
+
     if not req.niche and not req.custom_prompt:
         raise HTTPException(status_code=400, detail="Either niche or custom_prompt is required")
-    
-    # Calculate clips based on model (8s for Veo 3.1/fast, 10s for Sora)
-    if req.ai_model in ("veo-3.1-generate-preview", "veo-3.1-fast-generate-preview"):
-        num_clips = (req.duration + 7) // 8
-    else:
-        num_clips = (req.duration + 9) // 10
+
+    # Limite de jobs actifs par utilisateur (avant tout débit)
+    _check_active_job_limit(req.user_id)
+
+    # Segments de 8s pour tous les modèles → facturé == généré
+    num_clips = num_segments_for_duration(req.duration)
     required_credits = calculate_credits_cost(req.duration, req.quality, req.ai_model)
-    
+
     # Deduct credits atomically BEFORE scheduling work (backend source of truth)
-    try:
-        decrement = get_supabase().rpc("decrement_credits", {
-            "p_user_id": req.user_id,
-            "p_amount": required_credits,
-        }).execute()
-        if not decrement.data:
-            raise HTTPException(
-                status_code=402,
-                detail=f"Insufficient credits. Need {required_credits} credits."
-            )
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"❌ Error decrementing credits: {e}")
-        raise HTTPException(status_code=500, detail="Unable to deduct credits")
-    
-    try:
-        job = get_supabase().table("video_jobs").insert({
-            "user_id": req.user_id,
-            "status": "pending",
-            "niche": req.niche or "custom",
-            "duration": req.duration,
-            "quality": req.quality,
-            "prompt": req.custom_prompt or generate_prompt(req.niche),
-            "metadata": json.dumps({
-                "num_clips": num_clips,
-                "target_duration": req.duration,
-                "custom_prompt": req.custom_prompt,
-                "ai_model": req.ai_model,
-                "user_tier": user_tier
-            })
-        }).execute()
-        
-        job_id = job.data[0]["id"]
-        print(f"📋 Job created: {job_id}")
-        
-    except Exception as e:
-        print(f"❌ Error creating job: {e}")
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
-    
+    _decrement_credits_or_raise(req.user_id, required_credits)
+
+    job_id = _insert_job_or_refund(req.user_id, required_credits, {
+        "user_id": req.user_id,
+        "status": "pending",
+        "niche": req.niche or "custom",
+        "duration": req.duration,
+        "quality": req.quality,
+        "progress": 0,
+        "credits_cost": required_credits,
+        "prompt": req.custom_prompt or generate_prompt(req.niche, user_tier=user_tier),
+        "metadata": {
+            "num_clips": num_clips,
+            "target_duration": req.duration,
+            "custom_prompt": req.custom_prompt,
+            "ai_model": req.ai_model,
+            "user_tier": user_tier
+        }
+    })
+    print(f"📋 Job created: {job_id}")
+
     background_tasks.add_task(
         process_video_generation, 
         job_id, 
@@ -1397,40 +1464,28 @@ async def generate_video(req: VideoRequest, background_tasks: BackgroundTasks, r
     )
 
 @app.post("/api/videos/generate-advanced")
+@limiter.limit("10/minute")
 async def generate_video_advanced(req: VideoRequestAdvanced, background_tasks: BackgroundTasks, request: Request):
     """
     Endpoint avancé : supporte storyboard, image-to-video, etc.
-    
+
     Handles two user tiers:
-    - CREATOR tier: Fixed duration (8s VEO, 10s Sora), TikTok/Shorts optimized, 1-3 images
-    - PROFESSIONAL tier: Variable duration, ad-optimized, multiple sequences
+    - CREATOR tier: Fixed duration (8s), TikTok/Shorts optimized, 1-3 images
+    - PROFESSIONAL tier: Variable duration up to 64s, ad-optimized, multiple sequences
     """
     # Auth: derive user_id from JWT
     token_user_id = await _get_authenticated_user_id(request)
     req.user_id = token_user_id
 
-    # Vérifier user pour déterminer le tier
-    try:
-        user = get_supabase().table("profiles").select("*").eq("id", req.user_id).execute()
-        
-        if not user.data:
-            get_supabase().table("profiles").insert({
-                "id": req.user_id,
-                "email": f"{req.user_id}@vykso.com",
-                "credits": 10,
-                "plan": "free"
-            }).execute()
-            user = get_supabase().table("profiles").select("*").eq("id", req.user_id).execute()
-        
-        user_data = user.data[0]
-        user_plan = user_data.get("plan", "free")
-        user_tier = get_user_tier(user_plan)
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
-    
+    # Profil requis (pas d'auto-création — voir /api/users/sync)
+    user_data = _get_profile_or_404(req.user_id)
+    user_tier = get_user_tier(user_data)
+
+    # Combos non supportés → 400 explicite (au lieu d'une génération silencieusement différente)
+    _reject_unsupported_combo(req.ai_model, req.model_type)
+
     # For CREATOR tier: Force fixed duration (no choice)
-    if is_creator_plan(user_plan):
+    if user_tier == "creator":
         fixed_duration = get_fixed_duration_for_creator(req.ai_model)
         req.duration = fixed_duration
         print(f"👤 Creator tier detected - forcing duration to {fixed_duration}s")
@@ -1439,67 +1494,55 @@ async def generate_video_advanced(req: VideoRequestAdvanced, background_tasks: B
     if req.model_type == "storyboard" and req.shots:
         total_duration = sum(shot.duration for shot in req.shots)
         req.duration = int(total_duration)
-    
+
     # Validate model/duration
     _validate_duration_and_model(req.duration, req.ai_model)
-    
+
     if req.model_type != "storyboard":
         if not req.niche and not req.custom_prompt:
             raise HTTPException(status_code=400, detail="Either niche or custom_prompt is required")
-    
+
     # Additional server-side validations - now supports up to 18 images
     _validate_image_urls(req.image_urls, max_images=18)
 
-    # Calculer le coût
+    # Limite de jobs actifs par utilisateur (avant tout débit)
+    _check_active_job_limit(req.user_id)
+
+    # Calculer le coût (segments de 8s pour tous les modèles)
+    num_clips = num_segments_for_duration(req.duration)
     required_credits = calculate_credits_cost(req.duration, req.quality, req.ai_model)
-    
-    try:
-        # Deduct credits BEFORE scheduling generation
-        decrement = get_supabase().rpc("decrement_credits", {
-            "p_user_id": req.user_id,
-            "p_amount": required_credits,
-        }).execute()
-        if not decrement.data:
-            raise HTTPException(status_code=402, detail="Insufficient credits")
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
-    
-    # Créer job
-    try:
-        job = get_supabase().table("video_jobs").insert({
-            "user_id": req.user_id,
-            "status": "pending",
-            "niche": req.niche or ("storyboard" if req.model_type == "storyboard" else "custom"),
-            "duration": req.duration,
-            "quality": req.quality,
-            "prompt": req.custom_prompt or generate_prompt(req.niche),
-            "metadata": json.dumps({
-                "model_type": req.model_type,
-                "has_images": bool(req.image_urls),
-                "num_images": len(req.image_urls) if req.image_urls else 0,
-                "num_shots": len(req.shots) if req.shots else 0,
-                "ai_model": req.ai_model,
-                "user_tier": user_tier
-            })
-        }).execute()
-        
-        job_id = job.data[0]["id"]
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
-    
+
+    # Deduct credits BEFORE scheduling generation
+    _decrement_credits_or_raise(req.user_id, required_credits)
+
+    job_id = _insert_job_or_refund(req.user_id, required_credits, {
+        "user_id": req.user_id,
+        "status": "pending",
+        "niche": req.niche or ("storyboard" if req.model_type == "storyboard" else "custom"),
+        "duration": req.duration,
+        "quality": req.quality,
+        "progress": 0,
+        "credits_cost": required_credits,
+        "prompt": req.custom_prompt or generate_prompt(req.niche, user_tier=user_tier),
+        "metadata": {
+            "model_type": req.model_type,
+            "has_images": bool(req.image_urls),
+            "num_images": len(req.image_urls) if req.image_urls else 0,
+            "num_shots": len(req.shots) if req.shots else 0,
+            "ai_model": req.ai_model,
+            "user_tier": user_tier
+        }
+    })
+
     # Lancer génération with user_tier
     shots_dict = [shot.dict() for shot in req.shots] if req.shots else None
-    
+
     background_tasks.add_task(
-        process_video_generation, 
-        job_id, 
-        req.niche, 
-        req.duration, 
-        req.quality, 
+        process_video_generation,
+        job_id,
+        req.niche,
+        req.duration,
+        req.quality,
         req.user_id,
         req.custom_prompt,
         req.image_urls,
@@ -1508,13 +1551,13 @@ async def generate_video_advanced(req: VideoRequestAdvanced, background_tasks: B
         req.ai_model,
         user_tier  # Pass user tier for differentiated prompts
     )
-    
-    estimated_time = (len(req.shots) if req.shots else 1) * 40
+
+    estimated_time = num_clips * 40
     return VideoResponse(
         job_id=job_id,
         status="pending",
         estimated_time=f"{estimated_time}-{estimated_time + 60}s",
-        num_clips=len(req.shots) if req.shots else 1,
+        num_clips=num_clips,
         total_credits=required_credits
     )
 
@@ -1524,24 +1567,21 @@ async def get_video_status(job_id: str, request: Request):
     try:
         # Require auth and ensure ownership
         token_user_id = await _get_authenticated_user_id(request)
-        job = get_supabase().table("video_jobs").select("*").eq("id", job_id).single().execute()
-        
-        if not job.data:
+        job = get_supabase().table("video_jobs").select("*").eq("id", job_id).maybe_single().execute()
+
+        job_data = job.data if job else None
+        if not job_data:
             raise HTTPException(status_code=404, detail="Job not found")
-        
-        job_data = job.data
 
         if job_data.get("user_id") != token_user_id:
             raise HTTPException(status_code=403, detail="Forbidden")
-        
+
+        # Tolérant aux deux formats de metadata : dict (nouveau) et string JSON (ancien)
         if job_data.get("metadata"):
-            try:
-                job_data["metadata"] = json.loads(job_data["metadata"])
-            except:
-                pass
-        
+            job_data["metadata"] = _parse_job_metadata(job_data["metadata"])
+
         return job_data
-        
+
     except HTTPException:
         raise
     except Exception as e:
@@ -1562,6 +1602,8 @@ async def get_user_videos(user_id: str, request: Request, limit: int = 20, offse
             "total": len(videos.data),
             "videos": videos.data
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -1573,11 +1615,11 @@ async def get_user_info(user_id: str, request: Request):
         token_user_id = await _get_authenticated_user_id(request)
         if token_user_id != user_id:
             raise HTTPException(status_code=403, detail="Forbidden")
-        user = get_supabase().table("profiles").select("*").eq("id", user_id).single().execute()
-        
-        if not user.data:
+        user = get_supabase().table("profiles").select("*").eq("id", user_id).maybe_single().execute()
+
+        if not user or not user.data:
             raise HTTPException(status_code=404, detail="User not found")
-        
+
         return user.data
     except HTTPException:
         raise
@@ -1589,11 +1631,11 @@ async def get_user_info(user_id: str, request: Request):
 async def get_user_tier_info(user_id: str, request: Request):
     """
     Get user tier information for frontend to adapt UI.
-    
-    TIER LOGIC:
-    - Plans: starter, premium, pro, max (and yearly variants) → CREATOR tier (9:16 vertical)
-    - Plans: premium_pro, pro_pro, max_pro (with _pro suffix) → PROFESSIONAL tier (16:9 horizontal)
-    
+
+    TIER LOGIC (source of truth = profiles.plan_family):
+    - plan_family 'creator' (creator_basic/pro/max, free) → CREATOR tier (9:16 vertical)
+    - plan_family 'professional' (professional_starter/pro/max) → PROFESSIONAL tier (16:9 horizontal)
+
     Returns:
         - plan: Current plan name
         - tier: "creator" or "professional"
@@ -1608,24 +1650,24 @@ async def get_user_tier_info(user_id: str, request: Request):
         token_user_id = await _get_authenticated_user_id(request)
         if token_user_id != user_id:
             raise HTTPException(status_code=403, detail="Forbidden")
-        
-        user = get_supabase().table("profiles").select("plan, credits").eq("id", user_id).single().execute()
-        
-        if not user.data:
+
+        user = get_supabase().table("profiles").select("plan, plan_family, credits").eq("id", user_id).maybe_single().execute()
+
+        if not user or not user.data:
             raise HTTPException(status_code=404, detail="User not found")
-        
+
         plan = user.data.get("plan", "free")
         credits = user.data.get("credits", 0)
-        tier = get_user_tier(plan)
-        is_creator = is_creator_plan(plan)
+        tier = get_user_tier(user.data)  # plan_family est la source de vérité
+        is_creator = (tier == "creator")
         aspect_ratio = get_aspect_ratio_for_tier(tier)
-        
+
         # Build tier-specific features
         if is_creator:
             features = {
                 "duration_selection": False,  # Creator tier cannot select duration
                 "fixed_duration_veo": 8,
-                "fixed_duration_sora": 10,
+                "fixed_duration_sora": 8,
                 "aspect_ratio": "9:16",  # Vertical for TikTok/Shorts
                 "orientation": "vertical",
                 "prompt_style": "viral_tiktok_shorts",
@@ -1636,8 +1678,8 @@ async def get_user_tier_info(user_id: str, request: Request):
         else:
             features = {
                 "duration_selection": True,  # Professional can select duration
-                "min_duration": 6,
-                "max_duration": 60,
+                "min_duration": MIN_VIDEO_DURATION,
+                "max_duration": MAX_VIDEO_DURATION,
                 "aspect_ratio": "16:9",  # Horizontal widescreen for ads
                 "orientation": "horizontal",
                 "prompt_style": "professional_advertising",
@@ -1663,47 +1705,77 @@ async def get_user_tier_info(user_id: str, request: Request):
 
 @app.post("/api/users/sync")
 async def sync_user_from_auth(user_data: dict, request: Request):
-    """Synchronise les données utilisateur depuis Supabase Auth (appelé après login OAuth)"""
+    """Synchronise les données utilisateur depuis Supabase Auth (appelé après login OAuth).
+
+    SEUL endroit (hors trigger DB à l'inscription) où un profil peut être créé,
+    et uniquement avec le VRAI email transmis par le frontend depuis la session
+    Supabase Auth (jamais d'email fabriqué '{user_id}@vykso.com').
+    """
     try:
         # Require auth and ensure identity consistency when possible
         token_user_id = await _get_authenticated_user_id(request)
         user_id = user_data.get("id")
-        email = user_data.get("email")
-        first_name = user_data.get("user_metadata", {}).get("first_name") or user_data.get("user_metadata", {}).get("full_name", "").split()[0] if user_data.get("user_metadata", {}).get("full_name") else None
-        last_name = user_data.get("user_metadata", {}).get("last_name") or " ".join(user_data.get("user_metadata", {}).get("full_name", "").split()[1:]) if user_data.get("user_metadata", {}).get("full_name") and len(user_data.get("user_metadata", {}).get("full_name", "").split()) > 1 else None
-        
+        email = (user_data.get("email") or "").strip() or None
+
+        # Parsing explicite du prénom / nom (avec gardes sur les listes vides)
+        user_metadata = user_data.get("user_metadata") or {}
+        full_name = (user_metadata.get("full_name") or "").strip()
+        name_parts = full_name.split() if full_name else []
+
+        first_name = user_metadata.get("first_name")
+        if not first_name and name_parts:
+            first_name = name_parts[0]
+
+        last_name = user_metadata.get("last_name")
+        if not last_name and len(name_parts) > 1:
+            last_name = " ".join(name_parts[1:])
+
         if not user_id:
             raise HTTPException(status_code=400, detail="User ID is required")
 
         if token_user_id and user_id and token_user_id != user_id:
             raise HTTPException(status_code=403, detail="Forbidden")
-        
+
         # Check if user exists
         existing = get_supabase().table("profiles").select("*").eq("id", user_id).execute()
-        
-        update_data = {
-            "email": email or f"{user_id}@vykso.com",
-        }
-        
+
+        update_data = {}
+        if email:
+            update_data["email"] = email
         if first_name:
             update_data["first_name"] = first_name
         if last_name:
             update_data["last_name"] = last_name
-        
+
         if existing.data:
             # Update existing user
-            result = get_supabase().table("profiles").update(update_data).eq("id", user_id).execute()
+            if update_data:
+                result = get_supabase().table("profiles").update(update_data).eq("id", user_id).execute()
+            else:
+                result = existing
         else:
-            # Create new user
+            # Create new user — exige le vrai email (pas d'email fabriqué)
+            if not email:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Email requis pour créer le profil — reconnectez-vous"
+                )
             update_data.update({
                 "id": user_id,
                 "credits": 10,
                 "plan": "free"
             })
             result = get_supabase().table("profiles").insert(update_data).execute()
-        
+
+            # Notification best-effort (ne lève jamais)
+            notify_event("Nouvel utilisateur", {
+                "user_id": user_id,
+                "email": email,
+                "nom": f"{first_name or ''} {last_name or ''}".strip() or "inconnu",
+            })
+
         return {"success": True, "user": result.data[0] if result.data else None}
-        
+
     except HTTPException:
         raise
     except Exception as e:
@@ -1725,18 +1797,17 @@ async def upload_video_to_youtube(job_id: str, request: Request, body: YouTubeUp
     
     Returns YouTube video URL, ID, and scheduled time if applicable.
     """
-    import requests as req_lib
-    
     token_user_id = await _get_authenticated_user_id(request)
-    
+
     # Default body if not provided
     if body is None:
         body = YouTubeUploadRequest()
-    
+
+    temp_video_path = None
     try:
         # 1. Get User YouTube Tokens from profiles table
-        user = get_supabase().table("profiles").select("youtube_tokens").eq("id", token_user_id).single().execute()
-        if not user.data or not user.data.get("youtube_tokens"):
+        user = get_supabase().table("profiles").select("youtube_tokens").eq("id", token_user_id).maybe_single().execute()
+        if not user or not user.data or not user.data.get("youtube_tokens"):
             raise HTTPException(
                 status_code=400, 
                 detail="YouTube account not connected. Please connect your YouTube account first."
@@ -1763,15 +1834,15 @@ async def upload_video_to_youtube(job_id: str, request: Request, body: YouTubeUp
                 detail="Failed to refresh YouTube credentials. Please disconnect and reconnect your YouTube account."
             )
         if refreshed_tokens != tokens:
-            # Update tokens in database
+            # Persist the refreshed credentials (includes new token + expiry)
             get_supabase().table("profiles").update({
                 "youtube_tokens": refreshed_tokens
             }).eq("id", token_user_id).execute()
             tokens = refreshed_tokens
-        
+
         # 2. Get Video Job Data
-        job = get_supabase().table("video_jobs").select("*").eq("id", job_id).single().execute()
-        if not job.data:
+        job = get_supabase().table("video_jobs").select("*").eq("id", job_id).maybe_single().execute()
+        if not job or not job.data:
             raise HTTPException(status_code=404, detail="Job not found")
         
         # Verify ownership
@@ -1825,30 +1896,44 @@ async def upload_video_to_youtube(job_id: str, request: Request, body: YouTubeUp
         print(f"📥 Downloading video for upload...")
         path = _extract_object_path_from_public_url(video_url, VIDEOS_BUCKET)
         if not path:
-            # Try direct download if it's a full URL
-            r = req_lib.get(video_url, timeout=60)
-            video_data = r.content
+            # Try direct download if it's a full URL (async, non bloquant)
+            async with httpx.AsyncClient(timeout=60, follow_redirects=True) as http_client:
+                r = await http_client.get(video_url)
+                r.raise_for_status()
+                video_data = r.content
         else:
             video_data = get_supabase().storage.from_(VIDEOS_BUCKET).download(path)
-        
+
         temp_video_path = f"/tmp/{job_id}_upload.mp4"
         with open(temp_video_path, "wb") as f:
             f.write(video_data)
-        
-        # 6. Generate or download thumbnail
+
+        # 6. Reuse, download or generate thumbnail
         thumbnail_bytes = None
-        thumbnail_path = None
-        
+        current_metadata = _parse_job_metadata(job.data.get("metadata"))
+
         if body.thumbnail_url:
             # Download thumbnail from provided URL
             print(f"📥 Downloading provided thumbnail...")
             try:
-                r = req_lib.get(body.thumbnail_url, timeout=30)
-                if r.status_code == 200:
-                    thumbnail_bytes = r.content
+                async with httpx.AsyncClient(timeout=30, follow_redirects=True) as http_client:
+                    r = await http_client.get(body.thumbnail_url)
+                    if r.status_code == 200:
+                        thumbnail_bytes = r.content
             except Exception as e:
                 print(f"⚠️ Failed to download thumbnail: {e}")
-        
+
+        # F-44 : réutiliser la miniature déjà générée lors d'une tentative précédente
+        if not thumbnail_bytes:
+            previous_thumbnail_path = current_metadata.get("thumbnail_path")
+            if previous_thumbnail_path and os.path.exists(previous_thumbnail_path):
+                try:
+                    with open(previous_thumbnail_path, "rb") as f:
+                        thumbnail_bytes = f.read()
+                    print(f"♻️ Reusing previously generated thumbnail: {previous_thumbnail_path}")
+                except Exception as e:
+                    print(f"⚠️ Failed to reuse previous thumbnail: {e}")
+
         if not thumbnail_bytes:
             # Generate thumbnail with Imagen (optimized for YouTube Shorts 9:16)
             print("🖼️ Generating YouTube Shorts thumbnail with AI...")
@@ -1858,32 +1943,26 @@ async def upload_video_to_youtube(job_id: str, request: Request, body: YouTubeUp
                     description=final_description,
                     original_prompt=original_prompt
                 )
-                
-                # Save thumbnail path to video_jobs metadata
+
+                # Save thumbnail path to video_jobs metadata (dict natif, pas de json.dumps)
                 if thumbnail_path:
                     try:
-                        current_metadata = job.data.get("metadata")
-                        if isinstance(current_metadata, str):
-                            current_metadata = json.loads(current_metadata)
-                        elif current_metadata is None:
-                            current_metadata = {}
-                        
                         current_metadata["thumbnail_path"] = thumbnail_path
-                        
                         get_supabase().table("video_jobs").update({
-                            "metadata": json.dumps(current_metadata)
+                            "metadata": current_metadata
                         }).eq("id", job_id).execute()
                         print(f"💾 Thumbnail path saved to metadata: {thumbnail_path}")
                     except Exception as e:
                         print(f"⚠️ Failed to save thumbnail path to metadata: {e}")
-                        
+
             except Exception as e:
                 print(f"⚠️ Thumbnail generation failed: {e}")
                 # Continue without thumbnail - YouTube will auto-generate one
-        
-        # 7. Upload to YouTube with thumbnail
+
+        # 7. Upload to YouTube with thumbnail (blocking client → executor)
         print(f"🚀 Uploading to YouTube...")
-        result = get_youtube().upload_video_with_thumbnail(
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(None, lambda: get_youtube().upload_video_with_thumbnail(
             file_path=temp_video_path,
             title=final_title,
             description=final_description,
@@ -1892,15 +1971,9 @@ async def upload_video_to_youtube(job_id: str, request: Request, body: YouTubeUp
             tags=final_tags,
             schedule_time=schedule_time_iso,
             thumbnail_bytes=thumbnail_bytes
-        )
-        
-        # 8. Cleanup temp file
-        try:
-            os.remove(temp_video_path)
-        except:
-            pass
-        
-        # 9. Return response
+        ))
+
+        # 8. Return response
         if result.success:
             return YouTubeUploadResponse(
                 success=True,
@@ -1925,53 +1998,59 @@ async def upload_video_to_youtube(job_id: str, request: Request, body: YouTubeUp
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        # Cleanup temp file on success OR failure (F-18)
+        if temp_video_path:
+            try:
+                os.remove(temp_video_path)
+            except Exception:
+                pass
 
 # ============= YOUTUBE AUTH ENDPOINTS =============
 
 @app.get("/api/auth/youtube/url")
 async def get_youtube_auth_url(request: Request):
     token_user_id = await _get_authenticated_user_id(request)
-    url = get_youtube().get_auth_url(user_id=token_user_id)
+    # F-34 : state signé (HMAC + expiration 10 min) — anti-CSRF
+    state = make_oauth_state(token_user_id)
+    url = get_youtube().get_auth_url(user_id=state)
     return {"url": url}
 
 @app.get("/api/auth/youtube/callback")
 async def youtube_auth_callback(code: str, state: str):
     """
-    Callback from Google. 'state' is the user_id we passed.
+    Callback from Google. 'state' is a signed token built by make_oauth_state
+    (F-34: CSRF protection) — verified before any DB write.
     """
+    frontend_url = os.getenv("FRONTEND_URL", "https://vykso.com").rstrip("/")
+
+    # F-34 : vérifier la signature + l'expiration du state
+    user_id = verify_oauth_state(state)
+    if not user_id:
+        raise HTTPException(status_code=400, detail="State OAuth invalide ou expiré — relancez la connexion YouTube")
+
     try:
-        user_id = state
         credentials = get_youtube().get_credentials_from_code(code)
-        
-        # Convert credentials to dict - ensure ALL required fields are saved
-        creds_dict = {
-            'token': credentials.token,
-            'refresh_token': credentials.refresh_token,
-            'token_uri': credentials.token_uri,
-            'client_id': credentials.client_id,
-            'client_secret': credentials.client_secret,
-            'scopes': list(credentials.scopes) if credentials.scopes else []
-        }
-        
+
+        # F-35 : sérialisation via le client (inclut `expiry` pour le refresh proactif)
+        creds_dict = YouTubeClient.credentials_to_dict(credentials)
+
         # Validate that we got a refresh_token (required for long-term access)
         if not creds_dict.get('refresh_token'):
             print("⚠️ Warning: No refresh_token received from Google. User may need to revoke app access and reconnect.")
-        
-        # Log credential fields for debugging (not values, just keys)
+
         print(f"📝 Storing YouTube credentials with fields: {list(creds_dict.keys())}")
-        print(f"📝 Refresh token present: {bool(creds_dict.get('refresh_token'))}")
-        print(f"📝 Token URI: {creds_dict.get('token_uri')}")
-        
+
         # Store in DB
         get_supabase().table("profiles").update({
             "youtube_tokens": creds_dict
         }).eq("id", user_id).execute()
-        
-        return {"status": "success", "message": "YouTube connected successfully"}
-        
+
+        return RedirectResponse(url=f"{frontend_url}/dashboard?youtube=connected")
+
     except Exception as e:
         print(f"❌ YouTube callback error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        return RedirectResponse(url=f"{frontend_url}/dashboard?youtube=error")
 
 
 @app.delete("/api/auth/youtube/disconnect")
@@ -2006,9 +2085,9 @@ async def get_youtube_status(request: Request):
     try:
         token_user_id = await _get_authenticated_user_id(request)
         
-        user = get_supabase().table("profiles").select("youtube_tokens").eq("id", token_user_id).single().execute()
-        
-        if not user.data or not user.data.get("youtube_tokens"):
+        user = get_supabase().table("profiles").select("youtube_tokens").eq("id", token_user_id).maybe_single().execute()
+
+        if not user or not user.data or not user.data.get("youtube_tokens"):
             return {"connected": False, "valid": False, "message": "YouTube not connected"}
         
         tokens = user.data["youtube_tokens"]
@@ -2032,323 +2111,14 @@ async def get_youtube_status(request: Request):
         print(f"❌ YouTube status check error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# ============= STRIPE ENDPOINTS =============
-
-@app.post("/api/stripe/create-checkout")
-async def create_checkout_session(req: CheckoutRequest, request: Request):
-    """
-    Créer une session Stripe Checkout pour abonnement
-    
-    Supports both PROFESSIONAL and CREATOR tier plans with monthly AND yearly billing:
-    
-    PROFESSIONAL plans:
-    - starter: 199€/month or 179€/month yearly (600 credits)
-    - pro: 589€/month or 530€/month yearly (1200 credits)
-    - max: 1199€/month or 1079€/month yearly (1800 credits)
-    
-    CREATOR plans:
-    - creator_basic: 34.99€/month or 31.49€/month yearly (100 credits)
-    - creator_pro: 65.99€/month or 59.39€/month yearly (200 credits)
-    - creator_max: 89.99€/month or 80.99€/month yearly (300 credits)
-    
-    Plan names can include interval suffix: 'creator_basic_yearly', 'pro_annual', etc.
-    """
-    # Auth: derive user_id from JWT and ignore body value
-    token_user_id = await _get_authenticated_user_id(request)
-    req.user_id = token_user_id
-    
-    config = get_stripe_config()
-    
-    # Parse plan name and interval
-    plan_name = req.plan
-    interval = "monthly"
-    
-    # Check for interval suffix
-    if plan_name.endswith("_yearly") or plan_name.endswith("_annual"):
-        interval = "yearly" if plan_name.endswith("_yearly") else "annual"
-        plan_name = plan_name.replace("_yearly", "").replace("_annual", "")
-    
-    # Map plan name to price ID
-    price_id = None
-    
-    # Creator plans (use _YEARLY suffix)
-    if plan_name == "creator_basic":
-        price_id = config.PRICE_BASIC_YEARLY if interval in ["yearly", "annual"] else config.PRICE_BASIC_MONTHLY
-    elif plan_name == "creator_pro":
-        price_id = config.PRICE_PRO_YEARLY if interval in ["yearly", "annual"] else config.PRICE_PRO_MONTHLY
-    elif plan_name == "creator_max":
-        price_id = config.PRICE_MAX_YEARLY if interval in ["yearly", "annual"] else config.PRICE_MAX_MONTHLY
-    # Professional plans (use _ANNUAL suffix)
-    elif plan_name == "starter":
-        price_id = config.PRICE_STARTER_ANNUAL if interval in ["yearly", "annual"] else config.PRICE_STARTER
-    elif plan_name == "pro":
-        price_id = config.PRICE_PRO_ANNUAL if interval in ["yearly", "annual"] else config.PRICE_PRO
-    elif plan_name == "max":
-        price_id = config.PRICE_MAX_ANNUAL if interval in ["yearly", "annual"] else config.PRICE_MAX
-    
-    if not price_id:
-        raise HTTPException(
-            status_code=400, 
-            detail=f"Invalid plan: {req.plan}. Valid plans: creator_basic, creator_pro, creator_max, starter, pro, max (with optional _yearly/_annual suffix)"
-        )
-    
-    # Get plan info from config
-    plan_info = get_plan_type(price_id)
-    if not plan_info:
-        raise HTTPException(status_code=500, detail=f"Price ID {price_id} not configured in Stripe")
-    
-    # Determine tier type for metadata
-    tier_type = plan_info['planFamily']
-    internal_plan_name = config.get_plan_name_from_price_id(price_id)
-    
-    try:
-        session = stripe.checkout.Session.create(
-            payment_method_types=['card'],
-            line_items=[{
-                'price': price_id,
-                'quantity': 1,
-            }],
-            mode='subscription',
-            allow_promotion_codes=True,
-            success_url=f"{os.getenv('FRONTEND_URL', 'https://vykso.lovable.app')}/payment-success?session_id={{CHECKOUT_SESSION_ID}}",
-            cancel_url=f"{os.getenv('FRONTEND_URL', 'https://vykso.lovable.app')}/pricing",
-            client_reference_id=req.user_id,
-            metadata={
-                'user_id': req.user_id,
-                'userId': req.user_id,
-                'plan': internal_plan_name,
-                'tier': plan_info['tier'],
-                'planFamily': tier_type,
-                'interval': plan_info['interval'],
-                'credits': str(plan_info['credits']),
-                'type': 'subscription'
-            },
-            subscription_data={
-                'metadata': {
-                    'user_id': req.user_id,
-                    'userId': req.user_id,
-                    'plan': internal_plan_name,
-                    'tier': plan_info['tier'],
-                    'planFamily': tier_type,
-                    'credits': str(plan_info['credits']),
-                }
-            }
-        )
-        
-        print(f"✅ Checkout session created for {plan_info['name']}")
-        print(f"   Plan: {internal_plan_name} ({tier_type})")
-        print(f"   Interval: {plan_info['interval']}")
-        print(f"   Credits: {plan_info['credits']}")
-        
-        return {"checkout_url": session.url}
-    
-    except Exception as e:
-        print(f"❌ Stripe error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/api/stripe/buy-credits")
-async def buy_credits(req: BuyCreditsRequest, request: Request):
-    """Acheter des crédits ponctuels (pas d'abonnement)"""
-    # Auth required
-    token_user_id = await _get_authenticated_user_id(request)
-    # Security: ignore body user_id, use token subject
-    req.user_id = token_user_id
-
-    # Basic server-side validation for credits/amount
-    if req.credits <= 0 or req.amount <= 0:
-        raise HTTPException(status_code=400, detail="Invalid credits or amount")
-    # Optional: map fixed packs for safety
-    packs = {
-        60: 9,    # example: 60 credits -> 9 EUR
-        120: 15,
-        300: 29,
-    }
-    # If pack exists, enforce price; otherwise allow custom amount (comment to restrict strictly)
-    if req.credits in packs and packs[req.credits] != req.amount:
-        raise HTTPException(status_code=400, detail="Invalid amount for selected credits pack")
-
-    try:
-        session = stripe.checkout.Session.create(
-            payment_method_types=['card'],
-            line_items=[{
-                'price_data': {
-                    'currency': 'eur',
-                    'product_data': {
-                        'name': f'{req.credits} Vykso Credits',
-                        'description': f'{req.credits // 6} videos of 60s'
-                    },
-                    'unit_amount': req.amount * 100
-                },
-                'quantity': 1,
-            }],
-            mode='payment',
-            success_url=f"{os.getenv('FRONTEND_URL', 'https://vykso.lovable.app')}/payment-success?session_id={{CHECKOUT_SESSION_ID}}",
-            cancel_url=f"{os.getenv('FRONTEND_URL', 'https://vykso.lovable.app')}/credits",
-            client_reference_id=req.user_id,
-            metadata={
-                'user_id': req.user_id,
-                'credits': str(req.credits),
-                'type': 'credit_purchase'
-            }
-        )
-        
-        return {"checkout_url": session.url}
-    
-    except Exception as e:
-        print(f"❌ Stripe error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/api/webhooks/stripe-legacy")
-async def stripe_webhook_legacy(request: Request):
-    """
-    Legacy Webhook Stripe endpoint (kept for backward compatibility).
-    
-    The main webhook handler is now in routes/webhook.py
-    This endpoint handles the same events but with the old logic.
-    """
-    
-    payload = await request.body()
-    sig_header = request.headers.get('stripe-signature')
-    
-    try:
-        event = stripe.Webhook.construct_event(
-            payload, sig_header, os.getenv("STRIPE_WEBHOOK_SECRET")
-        )
-    except ValueError as e:
-        print(f"❌ Invalid payload: {e}")
-        raise HTTPException(status_code=400, detail="Invalid payload")
-    except stripe.error.SignatureVerificationError as e:
-        print(f"❌ Invalid signature: {e}")
-        raise HTTPException(status_code=400, detail="Invalid signature")
-    
-    config = get_stripe_config()
-    print(f"📨 Received Stripe webhook (legacy): {event['type']}")
-    
-    if event['type'] == 'checkout.session.completed':
-        session = event['data']['object']
-        metadata = session.get('metadata', {})
-        user_id = metadata.get('user_id') or metadata.get('userId')
-        
-        if metadata.get('type') == 'credit_purchase':
-            credits_to_add = int(metadata.get('credits', 0))
-            
-            print(f"💳 Credit purchase: {credits_to_add} credits for user {user_id}")
-            
-            try:
-                add_credits_to_user(user_id, credits_to_add)
-                print(f"✅ Added {credits_to_add} credits to user {user_id}")
-            except Exception as e:
-                print(f"❌ Error adding credits: {e}")
-        
-        elif metadata.get('type') == 'subscription':
-            subscription_id = session.get('subscription')
-            customer_id = session.get('customer')
-            
-            # Get plan info from metadata or fetch from Stripe
-            plan = metadata.get('plan')
-            tier_type = metadata.get('planFamily') or metadata.get('tier_type', 'professional')
-            credits = int(metadata.get('credits', 0))
-            
-            # If credits not in metadata, get from config
-            if credits == 0:
-                credits = config.get_credits_for_plan(plan)
-            
-            # Fallback to old mapping if still 0
-            if credits == 0:
-                professional_credits_map = {
-                    "starter": 600, "starter_annual": 600,
-                    "pro": 1200, "pro_annual": 1200,
-                    "max": 1800, "max_annual": 1800
-                }
-                creator_credits_map = {
-                    "creator_basic": 100, "creator_basic_yearly": 100,
-                    "creator_pro": 200, "creator_pro_yearly": 200,
-                    "creator_max": 300, "creator_max_yearly": 300
-                }
-                credits_map = {**professional_credits_map, **creator_credits_map}
-                credits = credits_map.get(plan, 100 if tier_type == "creator" else 600)
-            
-            print(f"✅ Subscription {plan} ({tier_type} tier) for user {user_id}")
-            
-            try:
-                update_user_subscription(user_id, {
-                    'plan': plan,
-                    'credits': credits,
-                    'stripe_customer_id': customer_id,
-                    'stripe_subscription_id': subscription_id,
-                    'status': 'active',
-                    'plan_family': tier_type,
-                })
-                
-                print(f"✅ User {user_id} upgraded to {plan} ({tier_type} tier) with {credits} credits")
-            except Exception as e:
-                print(f"❌ Error updating user: {e}")
-    
-    elif event['type'] == 'invoice.payment_succeeded':
-        invoice = event['data']['object']
-        subscription_id = invoice.get('subscription')
-        billing_reason = invoice.get('billing_reason')
-        
-        if subscription_id and billing_reason == 'subscription_cycle':
-            try:
-                user = get_user_by_stripe_subscription(subscription_id)
-                
-                if user:
-                    plan = user.get('plan', 'free')
-                    
-                    # Get credits from config
-                    credits = config.get_credits_for_plan(plan)
-                    
-                    # Fallback to old mapping
-                    if credits == 0:
-                        professional_credits_map = {
-                            "starter": 600, "starter_annual": 600,
-                            "pro": 1200, "pro_annual": 1200,
-                            "max": 1800, "max_annual": 1800
-                        }
-                        creator_credits_map = {
-                            "creator_basic": 100, "creator_basic_yearly": 100,
-                            "creator_pro": 200, "creator_pro_yearly": 200,
-                            "creator_max": 300, "creator_max_yearly": 300
-                        }
-                        credits_map = {**professional_credits_map, **creator_credits_map}
-                        tier_type = "creator" if plan.startswith("creator_") else "professional"
-                        credits = credits_map.get(plan, 100 if tier_type == "creator" else 600)
-                    
-                    update_user_subscription(user['id'], {'credits': credits})
-                    
-                    print(f"✅ Monthly credits recharged for user {user['id']}: {credits} credits")
-            except Exception as e:
-                print(f"❌ Error recharging credits: {e}")
-    
-    elif event['type'] == 'customer.subscription.deleted':
-        subscription = event['data']['object']
-        metadata = subscription.get('metadata', {})
-        user_id = metadata.get('user_id') or metadata.get('userId')
-        
-        if not user_id:
-            user = get_user_by_stripe_subscription(subscription['id'])
-            if user:
-                user_id = user.get('id')
-        
-        if user_id:
-            print(f"🚫 Subscription canceled for user {user_id}")
-            update_user_subscription(user_id, {
-                'status': 'canceled',
-                'credits': 0,
-                'plan': 'free',
-            })
-    
-    return {"status": "success"}
-
 @app.get("/api/videos/{job_id}/download")
 async def download_video(job_id: str, request: Request):
     """Télécharge une vidéo directement depuis la plateforme (proxy + streaming, supporte gros fichiers)."""
     try:
         # Require auth and ensure ownership
         token_user_id = await _get_authenticated_user_id(request)
-        job = get_supabase().table("video_jobs").select("video_url, niche, created_at, user_id").eq("id", job_id).single().execute()
-        if not job.data:
+        job = get_supabase().table("video_jobs").select("video_url, niche, created_at, user_id").eq("id", job_id).maybe_single().execute()
+        if not job or not job.data:
             raise HTTPException(status_code=404, detail="Video not found")
 
         if job.data.get("user_id") != token_user_id:
@@ -2388,8 +2158,8 @@ async def stream_video(job_id: str, request: Request):
     try:
         # Require auth and ensure ownership
         token_user_id = await _get_authenticated_user_id(request)
-        job = get_supabase().table("video_jobs").select("video_url, user_id").eq("id", job_id).single().execute()
-        if not job.data:
+        job = get_supabase().table("video_jobs").select("video_url, user_id").eq("id", job_id).maybe_single().execute()
+        if not job or not job.data:
             raise HTTPException(status_code=404, detail="Video not found")
 
         if job.data.get("user_id") != token_user_id:
@@ -2412,45 +2182,46 @@ async def stream_video(job_id: str, request: Request):
         print(f"❌ Stream error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+# Extension dérivée du content_type validé — jamais du nom de fichier client
+_ALLOWED_IMAGE_TYPES = {
+    "image/jpeg": "jpg",
+    "image/png": "png",
+    "image/webp": "webp",
+}
+
 @app.post("/api/upload-image")
+@limiter.limit("20/minute")
 async def upload_image_to_supabase(request: Request, file: UploadFile = File(...)):
     """Upload une image vers Supabase Storage"""
     try:
         # Require auth
         await _get_authenticated_user_id(request)
-        # Vérifier le type de fichier
-        allowed_types = ["image/jpeg", "image/png", "image/webp"]
-        if file.content_type not in allowed_types:
+        # Vérifier le type de fichier (whitelist jpg/png/webp)
+        if file.content_type not in _ALLOWED_IMAGE_TYPES:
             raise HTTPException(
-                status_code=400, 
-                detail=f"Invalid file type. Allowed: {', '.join(allowed_types)}"
+                status_code=400,
+                detail=f"Invalid file type. Allowed: {', '.join(_ALLOWED_IMAGE_TYPES)}"
             )
-        
+
         # Lire le contenu
         contents = await file.read()
-        
+
         # Vérifier la taille (max 10MB)
         max_size = 10 * 1024 * 1024  # 10MB
         if len(contents) > max_size:
             raise HTTPException(
-                status_code=400, 
+                status_code=400,
                 detail=f"File too large. Max size: {max_size / 1024 / 1024}MB"
             )
-        
-        # Générer un nom unique
-        import uuid
-        file_ext = file.filename.split('.')[-1] if '.' in file.filename else 'jpg'
+
+        # Nom unique — extension issue du content_type validé (pas du filename client)
+        file_ext = _ALLOWED_IMAGE_TYPES[file.content_type]
         filename = f"{uuid.uuid4()}.{file_ext}"
-        
+
         print(f"📤 Uploading image to Supabase: {filename}")
-        
-        # Upload vers Supabase Storage
-        from supabase import create_client
-        supabase_client = create_client(
-            os.getenv("SUPABASE_URL"),
-            os.getenv("SUPABASE_SERVICE_KEY")
-        )
-        
+
+        supabase_client = get_supabase()
+
         supabase_client.storage.from_("video-images").upload(
             filename,
             contents,
@@ -2475,6 +2246,48 @@ async def upload_image_to_supabase(request: Request, file: UploadFile = File(...
     except Exception as e:
         print(f"❌ Upload error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+# ============= STALE JOBS WATCHDOG =============
+# Toutes les 10 min : les jobs pending/generating SANS ACTIVITÉ (updated_at,
+# bumpe à chaque écriture de progress) depuis JOB_STALE_MINUTES sont passés en
+# failed avec remboursement du credits_cost stocké + notification.
+# Staleness sur updated_at (pas created_at) : un job long mais vivant qui
+# écrit sa progression n'est jamais tué.
+
+WATCHDOG_INTERVAL_SECONDS = 600  # 10 minutes
+
+
+async def _watchdog_loop():
+    while True:
+        try:
+            stale_minutes = int(os.getenv("JOB_STALE_MINUTES", "45"))
+            cutoff = (datetime.now(timezone.utc) - timedelta(minutes=stale_minutes)).isoformat()
+            res = get_supabase().table("video_jobs").select("id").in_(
+                "status", ["pending", "generating"]
+            ).lt("updated_at", cutoff).execute()
+            stale_jobs = res.data or []
+            if stale_jobs:
+                print(f"🕰️ Watchdog: {len(stale_jobs)} stale job(s) older than {stale_minutes} min")
+            for row in stale_jobs:
+                try:
+                    _fail_job_and_refund(
+                        row["id"],
+                        "Interrompu (redémarrage serveur ou timeout)",
+                        notify_label="Job vidéo échoué (watchdog)",
+                    )
+                except Exception as job_err:
+                    print(f"❌ Watchdog: error handling job {row.get('id')}: {job_err}")
+        except Exception as e:
+            print(f"❌ Watchdog loop error: {e}")
+        await asyncio.sleep(WATCHDOG_INTERVAL_SECONDS)
+
+
+@app.on_event("startup")
+async def _start_watchdog():
+    asyncio.create_task(_watchdog_loop())
+    print(f"🕰️ Stale-jobs watchdog started (every {WATCHDOG_INTERVAL_SECONDS // 60} min, "
+          f"stale after {os.getenv('JOB_STALE_MINUTES', '45')} min)")
+
 
 if __name__ == "__main__":
     import uvicorn

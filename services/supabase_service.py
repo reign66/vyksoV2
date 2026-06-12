@@ -103,15 +103,18 @@ def update_user_subscription(user_id: str, data: Dict[str, Any]) -> bool:
         
         # Update the profiles table
         result = supabase.table("profiles").update(update_data).eq("id", user_id).execute()
-        
+
         if result.data:
             print(f"✅ Updated subscription for user {user_id}")
             print(f"   Fields updated: {list(update_data.keys())}")
             return True
         else:
-            print(f"⚠️ No user found with ID {user_id}")
+            # CRITICAL: no profile row matched -> the caller MUST treat this
+            # as a hard failure (webhook returns 500 so Stripe retries),
+            # otherwise we get "paid but never credited".
+            print(f"❌ update_user_subscription: no profile row found for user {user_id} — update NOT applied")
             return False
-    
+
     except Exception as e:
         print(f"❌ Error updating subscription for user {user_id}: {e}")
         return False
@@ -119,44 +122,34 @@ def update_user_subscription(user_id: str, data: Dict[str, Any]) -> bool:
 
 def add_credits_to_user(user_id: str, credits: int) -> bool:
     """
-    Add credits to a user's account.
-    
+    Add credits to a user's account ATOMICALLY via the `add_credits` RPC
+    (no read-modify-write race). The RPC also logs the credit_transactions row.
+
     Args:
         user_id: The user's ID
         credits: Number of credits to add
-    
+
     Returns:
         True if successful, False otherwise
     """
     try:
         supabase = get_supabase_service()
-        
-        # First get current credits
-        user = supabase.table("profiles").select("credits").eq("id", user_id).single().execute()
-        
-        if not user.data:
-            print(f"❌ User {user_id} not found")
+
+        # Atomic increment in the database (SECURITY DEFINER function).
+        # add_credits raises / returns NULL if the user does not exist.
+        result = supabase.rpc("add_credits", {
+            "p_user_id": user_id,
+            "p_amount": credits,
+        }).execute()
+
+        new_total = result.data
+        if new_total is None:
+            print(f"❌ add_credits RPC: user {user_id} not found, no credits added")
             return False
-        
-        current_credits = user.data.get('credits', 0)
-        new_credits = current_credits + credits
-        
-        # Update credits
-        result = supabase.table("profiles").update({
-            "credits": new_credits,
-            "updated_at": datetime.utcnow().isoformat()
-        }).eq("id", user_id).execute()
-        
-        if result.data:
-            print(f"✅ Added {credits} credits to user {user_id} (total: {new_credits})")
-            
-            # Log the credit addition
-            log_credit_transaction(user_id, credits, "purchase", f"Credit purchase: +{credits}")
-            
-            return True
-        
-        return False
-    
+
+        print(f"✅ Added {credits} credits to user {user_id} (total: {new_total})")
+        return True
+
     except Exception as e:
         print(f"❌ Error adding credits to user {user_id}: {e}")
         return False
@@ -165,7 +158,9 @@ def add_credits_to_user(user_id: str, credits: int) -> bool:
 def log_credit_transaction(user_id: str, amount: int, transaction_type: str, description: str):
     """
     Log a credit transaction for audit purposes.
-    
+
+    NOTE: the credit_transactions column is `type` (NOT `transaction_type`).
+
     Args:
         user_id: The user's ID
         amount: Amount of credits (positive for add, negative for use)
@@ -174,24 +169,47 @@ def log_credit_transaction(user_id: str, amount: int, transaction_type: str, des
     """
     try:
         supabase = get_supabase_service()
-        
-        # Try to insert into credit_transactions table if it exists
+
         supabase.table("credit_transactions").insert({
             "user_id": user_id,
             "amount": amount,
-            "transaction_type": transaction_type,
+            "type": transaction_type,
             "description": description,
             "created_at": datetime.utcnow().isoformat()
         }).execute()
-        
+
     except Exception as e:
         # Table might not exist, just log the error
-        print(f"ℹ️ Could not log credit transaction (table may not exist): {e}")
+        print(f"ℹ️ Could not log credit transaction: {e}")
 
 
 # =============================================
 # USER LOOKUP
 # =============================================
+
+def get_user_profile(user_id: str) -> Optional[Dict[str, Any]]:
+    """
+    Fetch a user's profile row by id.
+
+    Args:
+        user_id: The user's ID (profiles.id == auth.users.id)
+
+    Returns:
+        Profile dictionary or None if not found.
+    """
+    try:
+        supabase = get_supabase_service()
+
+        result = supabase.table("profiles").select("*").eq("id", user_id).limit(1).execute()
+
+        if result.data:
+            return result.data[0]
+        return None
+
+    except Exception as e:
+        print(f"❌ Error fetching profile for user {user_id}: {e}")
+        return None
+
 
 def get_user_by_stripe_subscription(subscription_id: str) -> Optional[Dict[str, Any]]:
     """
@@ -294,27 +312,113 @@ def notify_payment_failed(
         print(f"   Email: {email}")
         print(f"   Amount: {amount} {currency}")
         print(f"   Invoice URL: {invoice_url}")
-        
-        # TODO: Integrate with email service
-        # Example with SendGrid:
-        # send_email(
-        #     to=email,
-        #     subject="Échec de paiement - Action requise",
-        #     template="payment_failed",
-        #     data={
-        #         "amount": amount,
-        #         "currency": currency,
-        #         "invoice_url": invoice_url
-        #     }
-        # )
-        
+
+        # External notification channel (best effort — never raises)
+        try:
+            from utils.notify import notify_event
+            notify_event("payment_failed", {
+                "user_id": user_id,
+                "email": email,
+                "amount": amount,
+                "currency": currency,
+                "invoice_url": invoice_url,
+            })
+        except ImportError:
+            pass  # utils.notify not deployed yet — in-app notification above still works
+        except Exception as notify_err:
+            print(f"⚠️ notify_event failed (non-blocking): {notify_err}")
+
     except Exception as e:
         print(f"❌ Error sending payment failure notification: {e}")
 
 
 # =============================================
-# WEBHOOK LOGGING
+# WEBHOOK LOGGING / IDEMPOTENCY
 # =============================================
+
+def claim_webhook_event(event_id: str, event_type: str, data: Optional[Dict[str, Any]] = None) -> bool:
+    """
+    Idempotency claim for a Stripe webhook event (insert-first strategy).
+
+    Inserts a row into webhook_logs, which has a UNIQUE index on event_id.
+    - Insert succeeds  -> we own this event, process it (returns True)
+    - Unique violation -> the event was already received, skip (returns False)
+
+    Any other database error is re-raised so the webhook returns 500 and
+    Stripe retries (we must NOT silently process without an idempotency claim).
+
+    Args:
+        event_id: Stripe event ID (evt_...)
+        event_type: Stripe event type
+        data: Optional event data object (summarized for the log)
+
+    Returns:
+        True if the event was claimed (process it), False if duplicate.
+    """
+    supabase = get_supabase_service()
+
+    data = data or {}
+    log_entry = {
+        "event_type": event_type,
+        "event_id": event_id,
+        "timestamp": datetime.utcnow().isoformat(),
+        "data_summary": json.dumps({
+            "id": data.get("id"),
+            "object": data.get("object"),
+            "status": data.get("status"),
+            "customer": data.get("customer"),
+            "subscription": data.get("subscription"),
+        }),
+    }
+
+    try:
+        supabase.table("webhook_logs").insert(log_entry).execute()
+        print(f"📝 Claimed webhook event: {event_type} ({event_id})")
+        return True
+    except Exception as e:
+        # Detect PostgREST unique-violation (PostgreSQL error code 23505)
+        err_code = getattr(e, "code", None)
+        err_text = str(e)
+        if err_code == "23505" or "23505" in err_text or "duplicate key" in err_text.lower():
+            print(f"🔁 Duplicate webhook event, skipping: {event_type} ({event_id})")
+            return False
+        # Real DB error: re-raise so the webhook 500s and Stripe retries
+        raise
+
+
+def release_webhook_event(event_id: str):
+    """
+    Release an idempotency claim after a processing FAILURE so that
+    Stripe's retry of the same event can be claimed and processed again.
+    Best effort — never raises.
+    """
+    try:
+        supabase = get_supabase_service()
+        supabase.table("webhook_logs").delete().eq("event_id", event_id).execute()
+        print(f"↩️ Released webhook claim for {event_id} (processing failed, retry allowed)")
+    except Exception as e:
+        print(f"⚠️ Could not release webhook claim {event_id}: {e}")
+
+
+def set_cancel_at_period_end(user_id: str, value: bool) -> bool:
+    """
+    Best-effort persistence of Stripe's cancel_at_period_end flag.
+    The profiles column may not exist yet — in that case we only log.
+    Never raises.
+    """
+    try:
+        supabase = get_supabase_service()
+        supabase.table("profiles").update({
+            "cancel_at_period_end": value,
+            "updated_at": datetime.utcnow().isoformat(),
+        }).eq("id", user_id).execute()
+        print(f"📝 cancel_at_period_end={value} stored for user {user_id}")
+        return True
+    except Exception as e:
+        print(f"ℹ️ Could not persist cancel_at_period_end for user {user_id} "
+              f"(column may not exist): {e}")
+        return False
+
 
 def log_webhook_event(event_type: str, event_id: str, data: Dict[str, Any]):
     """

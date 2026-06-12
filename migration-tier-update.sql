@@ -1,3 +1,12 @@
+-- ============================================================================
+-- OBSOLÈTE : remplacé par migration-2026-06-audit-fixes.sql — NE PAS EXÉCUTER
+-- ============================================================================
+-- Ce script utilise l'ancienne convention par SUFFIXE `_pro` que le code ne
+-- produit plus. Le trigger qu'il installe écrase le plan_family écrit par le
+-- webhook. La version corrigée (dérivation par PRÉFIXE 'professional_%') est
+-- dans migration-2026-06-audit-fixes.sql. Conservé uniquement pour référence.
+-- ============================================================================
+
 -- ============================================
 -- MIGRATION SCRIPT: Update Tier System
 -- ============================================
