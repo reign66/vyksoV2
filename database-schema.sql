@@ -92,6 +92,7 @@ CREATE TABLE IF NOT EXISTS video_jobs (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id UUID REFERENCES auth.users(id) ON DELETE CASCADE,
     status TEXT DEFAULT 'pending',
+    progress INTEGER DEFAULT 0,  -- Pourcentage de progression (0-100)
     video_url TEXT,
     niche TEXT,
     duration INTEGER,
@@ -105,6 +106,14 @@ CREATE TABLE IF NOT EXISTS video_jobs (
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),  -- bump à chaque update (trigger) ; base du watchdog
     completed_at TIMESTAMP WITH TIME ZONE
 );
+
+-- Migration: Add progress column if it doesn't exist (run on existing databases)
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'video_jobs' AND column_name = 'progress') THEN
+        ALTER TABLE video_jobs ADD COLUMN progress INTEGER DEFAULT 0;
+    END IF;
+END $$;
 
 -- ============================================
 -- TABLE: credit_transactions (optionnel - pour historique)
